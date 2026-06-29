@@ -28,6 +28,7 @@ type RunOpts struct {
 	Env       map[string]string // -e KEY=VALUE
 	Memory    string            // -m (e.g. "6g"); empty uses the runtime default
 	CPUs      string            // -c (e.g. "4"); empty uses the runtime default
+	Rosetta   bool              // --rosetta: x86 translation so amd64 images (e.g. SQL Server) run on arm64
 	Cmd       []string          // command + args appended after the image
 }
 
@@ -45,6 +46,9 @@ func Run(ctx context.Context, o RunOpts) error {
 	}
 	if o.CPUs != "" {
 		args = append(args, "-c", o.CPUs)
+	}
+	if o.Rosetta {
+		args = append(args, "--rosetta")
 	}
 	for _, m := range o.Mounts {
 		v := m.Host + ":" + m.Guest

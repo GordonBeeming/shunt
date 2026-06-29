@@ -107,7 +107,10 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 		// Docker daemon) need real headroom; the runtime default of ~1 GB OOMs.
 		Memory:    "6g",
 		CPUs:      "4",
-		Mounts:    mounts,
+		// Rosetta lets amd64-only images (SQL Server) run on the arm64 guest —
+		// the same x86 translation Docker Desktop uses; qemu segfaults SQL Server.
+		Rosetta: true,
+		Mounts:  mounts,
 		Env:       guestEnv(app),
 		Cmd:       []string{"/bin/sh", "-lc", runCmd},
 	}); err != nil {
