@@ -45,7 +45,7 @@ func newNewCmd() *cobra.Command {
 			}
 
 			fmt.Println("• waiting for the Aspire app to start (first run pulls images)…")
-			if err := siding.WaitStarted(ctx, sd.Container, 6*time.Minute); err != nil {
+			if err := siding.WaitStarted(ctx, sd.Container, 15*time.Minute); err != nil {
 				return err
 			}
 			fmt.Println("• discovering endpoints + bridging to the host…")

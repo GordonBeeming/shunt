@@ -48,6 +48,7 @@ func newAppAddCmd() *cobra.Command {
 				AppHostPath: ct.AppHost,
 				ConfigDir:   loc.ConfigDir,
 				DataVolumes: ct.DataVolumes,
+				Env:         ct.Env,
 				Sidings:     map[string]state.Siding{},
 			}
 

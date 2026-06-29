@@ -21,6 +21,11 @@ RUN apt-get update \
 RUN update-alternatives --set iptables /usr/sbin/iptables-legacy \
  && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
 
+# Node.js for Aspire apps that use AddNpmApp (local-process npm resources).
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1
 

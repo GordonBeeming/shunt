@@ -26,6 +26,8 @@ type RunOpts struct {
 	CapAddAll bool              // --cap-add ALL (dockerd in the guest needs it)
 	Mounts    []Mount           // bind mounts
 	Env       map[string]string // -e KEY=VALUE
+	Memory    string            // -m (e.g. "6g"); empty uses the runtime default
+	CPUs      string            // -c (e.g. "4"); empty uses the runtime default
 	Cmd       []string          // command + args appended after the image
 }
 
@@ -37,6 +39,12 @@ func Run(ctx context.Context, o RunOpts) error {
 	}
 	if o.CapAddAll {
 		args = append(args, "--cap-add", "ALL")
+	}
+	if o.Memory != "" {
+		args = append(args, "-m", o.Memory)
+	}
+	if o.CPUs != "" {
+		args = append(args, "-c", o.CPUs)
 	}
 	for _, m := range o.Mounts {
 		v := m.Host + ":" + m.Guest

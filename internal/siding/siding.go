@@ -42,17 +42,25 @@ func Paths(app state.App, name string) (src, volRoot string) {
 // guestEnv is the proven Aspire-13 launch env: unsecured anonymous dashboard (so
 // shunt can read the resource service without an API key), all endpoints pinned,
 // http transport, in-guest Docker runtime.
-func guestEnv() map[string]string {
-	return map[string]string{
+func guestEnv(app state.App) map[string]string {
+	env := map[string]string{
 		"DOTNET_USE_POLLING_FILE_WATCHER":            "1",
 		"DOTNET_ASPIRE_CONTAINER_RUNTIME":            "docker",
 		"ASPIRE_ALLOW_UNSECURED_TRANSPORT":           "true",
 		"ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS": "true",
-		"ASPNETCORE_URLS":                            fmt.Sprintf("http://0.0.0.0:%d", guestDashboardPort),
-		"ASPIRE_DASHBOARD_OTLP_ENDPOINT_URL":         "http://127.0.0.1:18889",
-		"ASPIRE_DASHBOARD_MCP_ENDPOINT_URL":          "http://127.0.0.1:18891",
-		"ASPIRE_RESOURCE_SERVICE_ENDPOINT_URL":       fmt.Sprintf("http://127.0.0.1:%d", guestRSPort),
+		// Run apps targeting an older .NET (e.g. net9.0) on the base image's
+		// newer runtime instead of requiring every framework version to be present.
+		"DOTNET_ROLL_FORWARD":                  "Major",
+		"ASPNETCORE_URLS":                      fmt.Sprintf("http://0.0.0.0:%d", guestDashboardPort),
+		"ASPIRE_DASHBOARD_OTLP_ENDPOINT_URL":   "http://127.0.0.1:18889",
+		"ASPIRE_DASHBOARD_MCP_ENDPOINT_URL":    "http://127.0.0.1:18891",
+		"ASPIRE_RESOURCE_SERVICE_ENDPOINT_URL": fmt.Sprintf("http://127.0.0.1:%d", guestRSPort),
 	}
+	// App-specific env from the contract (Aspire parameters, secrets) wins.
+	for k, v := range app.Env {
+		env[k] = v
+	}
+	return env
 }
 
 // Spin clones the repo + data volumes and launches the guest. It does not wait
@@ -79,8 +87,12 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 		Image:     config.BaseImageTag(),
 		Init:      true,
 		CapAddAll: true,
+		// Heavy Aspire stacks (SQL Server, Azurite, several projects + the nested
+		// Docker daemon) need real headroom; the runtime default of ~1 GB OOMs.
+		Memory:    "6g",
+		CPUs:      "4",
 		Mounts:    mounts,
-		Env:       guestEnv(),
+		Env:       guestEnv(app),
 		Cmd:       []string{"/bin/sh", "-lc", runCmd},
 	}); err != nil {
 		return state.Siding{}, err
@@ -132,7 +144,7 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 	}
 	// "Distributed application started" fires before every dependency has
 	// published its endpoint URL, so poll until all front-door resources resolve.
-	eps, err := discoverReady(ctx, fmt.Sprintf("%s:%d", ip, rsExtPort), app.FrontDoor, 2*time.Minute)
+	eps, err := discoverReady(ctx, fmt.Sprintf("%s:%d", ip, rsExtPort), app.FrontDoor, 10*time.Minute)
 	if err != nil {
 		return fmt.Errorf("discover endpoints: %w", err)
 	}

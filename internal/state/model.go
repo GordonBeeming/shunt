@@ -35,6 +35,7 @@ type App struct {
 	ConfigDir   string            `json:"configDir"`   // <repos>/.shunt[-ch]/<project>
 	FrontDoor   []Route           `json:"frontDoor"`
 	DataVolumes []DataVolume      `json:"dataVolumes"`
+	Env         map[string]string `json:"env"` // extra guest env (Aspire parameters, secrets)
 	Sidings     map[string]Siding `json:"sidings"`
 	LiveSiding  string            `json:"liveSiding"` // "" = nothing live
 }
