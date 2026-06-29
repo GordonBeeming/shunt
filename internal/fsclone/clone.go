@@ -10,8 +10,11 @@ import (
 	"github.com/gordonbeeming/shunt/internal/proc"
 )
 
-// CloneRepo clones origin into dest. For a local origin path this is fast
-// (git hardlinks objects). branch, if set, is checked out after cloning.
+// CloneRepo makes a working copy of origin at dest. It git-clones (so the siding
+// has full history to commit experiments against), then overlays origin's
+// working tree so UNCOMMITTED and untracked changes are included — shunt runs the
+// code you're currently working on, not just the last commit. Build artifacts and
+// node_modules are excluded (rebuilt in the guest).
 func CloneRepo(ctx context.Context, origin, dest, branch string) error {
 	args := []string{"clone", origin, dest}
 	if branch != "" {
@@ -20,7 +23,20 @@ func CloneRepo(ctx context.Context, origin, dest, branch string) error {
 	if _, err := proc.Run(ctx, "git", args...); err != nil {
 		return fmt.Errorf("git clone %s: %w", origin, err)
 	}
+	// Overlay the live working tree (uncommitted + untracked) onto the clone.
+	if _, err := proc.Run(ctx, "rsync", "-a",
+		"--exclude=.git/", "--exclude=bin/", "--exclude=obj/", "--exclude=node_modules/",
+		ensureTrailingSlash(origin), ensureTrailingSlash(dest)); err != nil {
+		return fmt.Errorf("overlay working tree from %s: %w", origin, err)
+	}
 	return nil
+}
+
+func ensureTrailingSlash(p string) string {
+	if len(p) > 0 && p[len(p)-1] == '/' {
+		return p
+	}
+	return p + "/"
 }
 
 // CloneVolume APFS-clones a baseline data dir to dest (cp -c, copy-on-write —
