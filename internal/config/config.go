@@ -129,3 +129,40 @@ func ProjectConfigDir(repoPath string) (string, error) {
 func ContainerName(app, siding string) string {
 	return fmt.Sprintf("%s_%s_%s", Current().ContainerPrefix, app, siding)
 }
+
+// BaseImageTag is the channel-scoped guest base image name, so a dev rebuild
+// never clobbers the release image mid-change.
+func BaseImageTag() string {
+	if Current().Channel == "release" {
+		return "shunt-base:latest"
+	}
+	return "shunt-base-" + Current().Channel + ":latest"
+}
+
+// BootstrapConfigPath is where shunt writes Caddy's initial config; the
+// LaunchAgent points Caddy at it (with --resume, Caddy prefers its autosave).
+func BootstrapConfigPath() (string, error) {
+	dir, err := GlobalDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "caddy", "bootstrap.json"), nil
+}
+
+// LogDir is the per-channel log directory (Caddy stdout/stderr).
+func LogDir() (string, error) {
+	dir, err := GlobalDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "logs"), nil
+}
+
+// LaunchAgentPlistPath is ~/Library/LaunchAgents/<label>.plist for this channel.
+func LaunchAgentPlistPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", Current().LaunchAgentID+".plist"), nil
+}
