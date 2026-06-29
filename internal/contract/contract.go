@@ -21,7 +21,8 @@ type Contract struct {
 	AppHost     string             `json:"apphost"`   // rel path to the AppHost project dir or csproj
 	FrontDoor   []FrontDoorRoute   `json:"frontDoor"` // stable front-door routes
 	DataVolumes []state.DataVolume `json:"dataVolumes"`
-	Env         map[string]string  `json:"env"` // extra guest env (Aspire parameters, secrets)
+	Env         map[string]string  `json:"env"`    // extra guest env (Aspire parameters, secrets)
+	Mounts      []state.MountSpec  `json:"mounts"` // explicit extra host->guest mounts (e.g. user-secrets)
 }
 
 // FrontDoorRoute is one stable port mapping in the contract.

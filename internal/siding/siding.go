@@ -6,6 +6,7 @@ package siding
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -78,6 +79,15 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 			return state.Siding{}, err
 		}
 		mounts = append(mounts, container.Mount{Host: host, Guest: dv.GuestPath})
+	}
+	// Explicit per-project mounts from the contract (e.g. user-secrets) — shunt
+	// honors these verbatim, no app-specific magic.
+	for _, m := range app.Mounts {
+		host, err := expandHome(m.Host)
+		if err != nil {
+			return state.Siding{}, err
+		}
+		mounts = append(mounts, container.Mount{Host: host, Guest: m.Guest, ReadOnly: m.ReadOnly})
 	}
 
 	guestName := config.ContainerName(app.Name, name)
@@ -238,6 +248,18 @@ func DashboardURL(sd state.Siding) string {
 		return ""
 	}
 	return fmt.Sprintf("http://%s:%d", sd.LastIP, guestDashboardPort)
+}
+
+// expandHome replaces a leading ~ with the user's home dir.
+func expandHome(p string) (string, error) {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("expand ~ in %q: %w", p, err)
+		}
+		return filepath.Join(home, strings.TrimPrefix(p, "~")), nil
+	}
+	return p, nil
 }
 
 // originForClone prefers the local repo path (fast hardlinked clone) over a

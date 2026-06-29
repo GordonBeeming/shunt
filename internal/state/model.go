@@ -35,7 +35,8 @@ type App struct {
 	ConfigDir   string            `json:"configDir"`   // <repos>/.shunt[-ch]/<project>
 	FrontDoor   []Route           `json:"frontDoor"`
 	DataVolumes []DataVolume      `json:"dataVolumes"`
-	Env         map[string]string `json:"env"` // extra guest env (Aspire parameters, secrets)
+	Env         map[string]string `json:"env"`    // extra guest env (Aspire parameters, secrets)
+	Mounts      []MountSpec       `json:"mounts"` // explicit extra host->guest mounts
 	Sidings     map[string]Siding `json:"sidings"`
 	LiveSiding  string            `json:"liveSiding"` // "" = nothing live
 }
@@ -57,6 +58,15 @@ type Route struct {
 type DataVolume struct {
 	Resource  string `json:"resource"`
 	GuestPath string `json:"guestPath"`
+}
+
+// MountSpec is an explicit extra host->guest bind mount declared per project
+// (e.g. the developer's ~/.microsoft/usersecrets so Aspire parameters resolve).
+// shunt honors these verbatim — it never auto-mounts anything app-specific.
+type MountSpec struct {
+	Host     string `json:"host"`     // host path, ~ expanded
+	Guest    string `json:"guest"`    // path inside the guest
+	ReadOnly bool   `json:"readOnly"` // mount read-only
 }
 
 // Siding is one isolated experiment of an app.
