@@ -49,6 +49,12 @@ func guestEnv(app state.App) map[string]string {
 		"DOTNET_ASPIRE_CONTAINER_RUNTIME":            "docker",
 		"ASPIRE_ALLOW_UNSECURED_TRANSPORT":           "true",
 		"ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS": "true",
+		// We run the AppHost with --no-launch-profile, which skips the
+		// launchSettings that normally set Development. Set it explicitly so
+		// .NET loads the dev's user-secrets (where Aspire parameters/secrets like
+		// DB passwords and API keys live) — otherwise params are ValueMissing.
+		"ASPNETCORE_ENVIRONMENT": "Development",
+		"DOTNET_ENVIRONMENT":     "Development",
 		// Run apps targeting an older .NET (e.g. net9.0) on the base image's
 		// newer runtime instead of requiring every framework version to be present.
 		"DOTNET_ROLL_FORWARD":                  "Major",
