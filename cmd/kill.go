@@ -46,7 +46,7 @@ func newKillCmd() *cobra.Command {
 
 func newRmCmd() *cobra.Command {
 	var force bool
-	return &cobra.Command{
+	c := &cobra.Command{
 		Use:   "rm <name>",
 		Short: "Tear down a siding: stop + remove the guest and delete its clone/data",
 		Args:  cobra.ExactArgs(1),
@@ -83,4 +83,6 @@ func newRmCmd() *cobra.Command {
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&force, "force", false, "remove even if the siding is live")
+	return c
 }
