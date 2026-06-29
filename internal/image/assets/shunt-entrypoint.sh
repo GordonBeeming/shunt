@@ -21,5 +21,9 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
+# Generate the ASP.NET Core dev certificate so projects with HTTPS endpoints can
+# bind Kestrel (otherwise they crash: "developer certificate could not be found").
+dotnet dev-certs https >/dev/null 2>&1 || true
+
 echo "shunt-entrypoint: dockerd ready; launching command: $*"
 exec "$@"
