@@ -1,21 +1,27 @@
-# shunt base guest image: Docker-in-guest (proven dind base) + .NET 10 SDK.
-# Each siding runs one of these as an Apple `container` guest; Aspire's AppHost
-# runs inside and brings up its dependency containers via the in-guest dockerd.
-FROM docker:dind
+# shunt base guest image: glibc Linux + .NET 10 SDK + Docker engine.
+#
+# Must be glibc, NOT Alpine/musl: Aspire's DCP orchestrator ships a glibc-linked
+# `dcp` binary (aspire.hosting.orchestration.linux-arm64) that fails on musl with
+# "No such file or directory". The official .NET SDK image is Debian (glibc), so
+# we start there and add the Docker engine for Aspire's in-guest container deps.
+FROM mcr.microsoft.com/dotnet/sdk:10.0
 
-# .NET 10 SDK on Alpine (musl). The runtime deps are the documented set Microsoft
-# lists for Alpine; git is here for any restore/source-control needs inside the guest.
-RUN apk add --no-cache \
-        bash curl git tzdata \
-        icu-libs krb5-libs libgcc libintl libssl3 libstdc++ zlib \
- && curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
- && bash /tmp/dotnet-install.sh --channel 10.0 --install-dir /usr/share/dotnet \
- && ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
- && rm -f /tmp/dotnet-install.sh
+# Docker engine (dockerd + CLI + containerd) via Docker's official install
+# script, plus iptables which dockerd needs for its bridge networking.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl iptables uidmap socat \
+ && curl -fsSL https://get.docker.com | sh \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
 
-ENV DOTNET_ROOT=/usr/share/dotnet \
-    PATH=/usr/share/dotnet:/usr/local/bin:/usr/bin:/bin \
-    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+# dockerd's bridge networking needs the iptables LEGACY backend. The Debian
+# default (nft) can't initialize inside the guest ("nf_tables: Could not fetch
+# rule set generation id"), so dockerd fails to create its NAT chain. The legacy
+# backend works against the guest kernel just as it does in docker:dind.
+RUN update-alternatives --set iptables /usr/sbin/iptables-legacy \
+ && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1
 
 COPY shunt-entrypoint.sh /usr/local/bin/shunt-entrypoint.sh

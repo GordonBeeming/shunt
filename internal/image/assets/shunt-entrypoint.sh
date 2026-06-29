@@ -1,11 +1,10 @@
 #!/bin/sh
 # shunt siding entrypoint: bring up the in-guest Docker daemon, then run whatever
 # command shunt passed (normally the Aspire AppHost). dockerd is what Aspire's
-# orchestrator talks to to start the app's dependency containers inside this guest.
+# DCP orchestrator talks to to start the app's dependency containers in this guest.
 set -e
 
-# Reuse the dind image's own dockerd bootstrap (cgroups/iptables prep), backgrounded.
-dockerd-entrypoint.sh dockerd >/var/log/dockerd.log 2>&1 &
+dockerd >/var/log/dockerd.log 2>&1 &
 
 # Wait for the Docker socket so the AppHost doesn't race the daemon.
 i=0
