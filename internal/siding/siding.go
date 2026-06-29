@@ -130,7 +130,9 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 	if err := container.Bridge(ctx, sd.Container, rsExtPort, guestRSPort); err != nil {
 		return err
 	}
-	eps, err := aspire.Discover(ctx, fmt.Sprintf("%s:%d", ip, rsExtPort), "")
+	// "Distributed application started" fires before every dependency has
+	// published its endpoint URL, so poll until all front-door resources resolve.
+	eps, err := discoverReady(ctx, fmt.Sprintf("%s:%d", ip, rsExtPort), app.FrontDoor, 2*time.Minute)
 	if err != nil {
 		return fmt.Errorf("discover endpoints: %w", err)
 	}
@@ -144,13 +146,52 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 			return fmt.Errorf("route %q: no live endpoint for resource %q (endpoint %q) — discovered: %s",
 				r.Key, r.Resource, r.Endpoint, summarize(eps))
 		}
+		// For container-backed resources, target the real docker-published port
+		// rather than Aspire's DCP proxy port (which doesn't forward through a
+		// bridge). Project/process resources have no container, so keep ep.Port.
+		realPort := ep.Port
+		if dp := container.DockerPort(ctx, sd.Container, ep.Resource); dp > 0 {
+			realPort = dp
+		}
 		ext := routeExtBase + i
-		if err := container.Bridge(ctx, sd.Container, ext, ep.Port); err != nil {
+		if err := container.Bridge(ctx, sd.Container, ext, realPort); err != nil {
 			return err
 		}
 		sd.Bridges[r.Key] = ext
 	}
 	return nil
+}
+
+// discoverReady polls the resource service until every front-door route's
+// resource has resolved, or the timeout passes (returning the last snapshot so
+// the caller can report exactly which route is missing).
+func discoverReady(ctx context.Context, addr string, routes []state.Route, timeout time.Duration) ([]aspire.Endpoint, error) {
+	deadline := time.Now().Add(timeout)
+	var last []aspire.Endpoint
+	for {
+		eps, err := aspire.Discover(ctx, addr, "")
+		if err == nil {
+			last = eps
+			if allResolved(eps, routes) {
+				return eps, nil
+			}
+		} else if time.Now().After(deadline) {
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			return last, nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func allResolved(eps []aspire.Endpoint, routes []state.Route) bool {
+	for _, r := range routes {
+		if _, ok := aspire.Find(eps, r.Resource, r.Endpoint); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // PointCaddy repoints the app's front-door routes at this siding's bridged

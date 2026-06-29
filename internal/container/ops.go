@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
@@ -139,6 +140,32 @@ func ExecDetached(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
+// DockerPort returns the host-published loopback port for a container running in
+// the guest's Docker (via `docker port <name>`). Aspire's resource service
+// reports a DCP proxy port that doesn't forward raw TCP through a bridge, so for
+// container-backed resources shunt targets the real docker-published port. The
+// container name matches the Aspire resource name. Returns 0 if there's no
+// container (e.g. a project/process resource).
+func DockerPort(ctx context.Context, guest, containerName string) int {
+	out, err := Exec(ctx, guest, "docker", "port", containerName)
+	if err != nil {
+		return 0
+	}
+	// Lines look like: "6379/tcp -> 127.0.0.1:32768".
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "127.0.0.1:") {
+			continue
+		}
+		if i := strings.LastIndex(line, ":"); i >= 0 {
+			if p, err := strconv.Atoi(strings.TrimSpace(line[i+1:])); err == nil {
+				return p
+			}
+		}
+	}
+	return 0
+}
+
 // Bridge starts an in-guest socat that exposes a loopback port (intPort) at the
 // guest's external interface (extPort), so the host can reach it at <guest-ip>:<extPort>.
 // Aspire binds the resource service and app/dep endpoints to loopback, so this
@@ -156,8 +183,10 @@ func Stop(ctx context.Context, name string) error {
 	return nil
 }
 
-// Remove force-removes a guest (ignores "not found").
+// Remove tears down a guest. It stops first because `container rm` won't remove
+// a running guest reliably, then removes (ignoring "not found").
 func Remove(ctx context.Context, name string) error {
+	_, _ = proc.Run(ctx, Bin, "stop", name)
 	if _, err := proc.Run(ctx, Bin, "rm", "-f", name); err != nil {
 		return fmt.Errorf("container rm %s: %w", name, err)
 	}
