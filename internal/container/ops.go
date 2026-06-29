@@ -109,6 +109,16 @@ func IP(ctx context.Context, name string) (string, error) {
 	return strings.SplitN(doc.Status.Networks[0].IPv4Address, "/", 2)[0], nil
 }
 
+// Logs returns the guest's combined log output (stdout+stderr of pid 1).
+func Logs(ctx context.Context, name string) (string, error) {
+	res, err := proc.Run(ctx, Bin, "logs", name)
+	if err != nil {
+		// `container logs` writes to stdout; return whatever we got.
+		return res.Stdout + res.Stderr, err
+	}
+	return res.Stdout + res.Stderr, nil
+}
+
 // Exec runs a command in a running guest and returns its stdout.
 func Exec(ctx context.Context, name string, args ...string) (string, error) {
 	full := append([]string{"exec", name}, args...)

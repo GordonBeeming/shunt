@@ -60,6 +60,12 @@ func (a *Admin) Post(ctx context.Context, path string, body []byte) error {
 	return a.do(ctx, http.MethodPost, path, body)
 }
 
+// Put creates a new value at an admin path (PUT), e.g. a new named server. Caddy
+// treats PUT as create; use it when registering a route's server.
+func (a *Admin) Put(ctx context.Context, path string, body []byte) error {
+	return a.do(ctx, http.MethodPut, path, body)
+}
+
 func (a *Admin) do(ctx context.Context, method, path string, body []byte) error {
 	_, err := a.read(ctx, method, path, body)
 	return err

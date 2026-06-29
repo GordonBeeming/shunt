@@ -68,4 +68,7 @@ type Siding struct {
 	RSKey     string `json:"rsKey"`     // resource-service API key shunt set on launch
 	LastIP    string `json:"lastIp"`    // cached guest IP, refreshed on switch
 	Stopped   bool   `json:"stopped"`   // kill keeps the clone/volume but stops the guest
+	// Bridges maps each front-door route key to the guest-external port shunt's
+	// in-guest socat exposes (Aspire binds the real endpoint to loopback).
+	Bridges map[string]int `json:"bridges"`
 }
