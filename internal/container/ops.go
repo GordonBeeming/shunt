@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
 )
@@ -182,9 +183,27 @@ func DockerPort(ctx context.Context, guest, containerName string) int {
 // guest's external interface (extPort), so the host can reach it at <guest-ip>:<extPort>.
 // Aspire binds the resource service and app/dep endpoints to loopback, so this
 // is how shunt makes them reachable for discovery and proxying.
+//
+// On a busy guest (e.g. SQL Server starting under Rosetta) a detached exec can
+// fail to take, so this relaunches socat until the port is actually listening.
 func Bridge(ctx context.Context, name string, extPort, intPort int) error {
 	spec := fmt.Sprintf("socat TCP-LISTEN:%d,fork,reuseaddr TCP:127.0.0.1:%d", extPort, intPort)
-	return ExecDetached(ctx, name, "sh", "-c", spec)
+	listening := fmt.Sprintf("pgrep -f 'TCP-LISTEN:%d,' >/dev/null 2>&1 && echo up", extPort)
+	var lastErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		if out, _ := Exec(ctx, name, "sh", "-c", listening); strings.Contains(out, "up") {
+			return nil
+		}
+		lastErr = ExecDetached(ctx, name, "sh", "-c", spec)
+		time.Sleep(time.Second)
+	}
+	if out, _ := Exec(ctx, name, "sh", "-c", listening); strings.Contains(out, "up") {
+		return nil
+	}
+	if lastErr != nil {
+		return fmt.Errorf("bridge port %d->127.0.0.1:%d never came up: %w", extPort, intPort, lastErr)
+	}
+	return fmt.Errorf("bridge port %d->127.0.0.1:%d never came up", extPort, intPort)
 }
 
 // Stop stops a running guest (ignores "not running").
