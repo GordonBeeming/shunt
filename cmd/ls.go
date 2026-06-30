@@ -7,15 +7,17 @@ import (
 	"text/tabwriter"
 
 	"github.com/gordonbeeming/shunt/internal/container"
+	"github.com/gordonbeeming/shunt/internal/resolve"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 )
 
 func newLsCmd() *cobra.Command {
-	return &cobra.Command{
+	var all bool
+	c := &cobra.Command{
 		Use:   "ls",
-		Short: "List registered apps and their sidings",
+		Short: "List sidings for the current project (use -a for every project on the host)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			reg, err := state.LoadRegistry()
@@ -23,14 +25,27 @@ func newLsCmd() *cobra.Command {
 				return err
 			}
 			if len(reg.Projects) == 0 {
-				fmt.Println("no apps registered yet — run `"+bin()+" app add` in an Aspire repo")
+				fmt.Println("no apps registered yet — run `" + bin() + " app add` in an Aspire repo")
 				return nil
 			}
-			names := make([]string, 0, len(reg.Projects))
-			for n := range reg.Projects {
-				names = append(names, n)
+
+			var names []string
+			if all {
+				for n := range reg.Projects {
+					names = append(names, n)
+				}
+				sort.Strings(names)
+			} else {
+				loc, err := resolve.FromCwd()
+				if err != nil {
+					return err
+				}
+				if _, ok := reg.Projects[loc.Project]; !ok {
+					fmt.Printf("%q isn't a shunt app here — cd into a registered repo, or `%s ls -a` for all projects\n", loc.Project, bin())
+					return nil
+				}
+				names = []string{loc.Project}
 			}
-			sort.Strings(names)
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 			fmt.Fprintln(w, "APP\tSIDING\tLIVE\tGUEST\tIP\tDASHBOARD")
@@ -66,4 +81,6 @@ func newLsCmd() *cobra.Command {
 			return w.Flush()
 		},
 	}
+	c.Flags().BoolVarP(&all, "all", "a", false, "list sidings for every project on the host, not just the current one")
+	return c
 }

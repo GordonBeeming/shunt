@@ -5,7 +5,7 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 | Command | What it does |
 |---|---|
 | `shunt-dev active [--json]` | Is the current dir a shunt app? Lists sidings with `live`, `appRunning`, `guestRunning`, and the `src` edit path. Exits non-zero (plain mode) when it's not a shunt app. |
-| `shunt-dev ls` | All apps + sidings across projects; `*` marks the live one. |
+| `shunt-dev ls [-a]` | Sidings for the **current project**; `*` marks the live one. `-a`/`--all` lists every project on the host. |
 | `shunt-dev new <name>` | Create a siding — a git worktree off your current HEAD + an idle guest. **Fast**: no build, no Aspire. |
 | `shunt-dev up <name>` | Build + start Aspire in the guest, then point the front door at it. Loads the project warm cache first (if any). First cold run is slow; see [iterating](iterating.md). |
 | `shunt-dev warm [--from <siding>]` | Build the project's dependency-image cache from the **host** Docker daemon (the canonical cache): ensure the contract's `prebakeImages` are on the host (pulls only what's missing — the one shared network call), then save them for sidings to load. Offline-friendly when the host already has them. `--from <siding>` captures from a running guest's Docker store instead. |
