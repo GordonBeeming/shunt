@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/config"
@@ -20,6 +22,7 @@ const skillName = "shunt"
 // skills/<name>/ dir. Presence of HomeRel under $HOME means it's installed. Add
 // new agents here as their skills layout is confirmed.
 type agentTarget struct {
+	Key       string // short name for args: claude, codex, opencode
 	Name      string
 	HomeRel   string // existence => installed
 	SkillsRel string // where to write <skillName>/
@@ -27,9 +30,9 @@ type agentTarget struct {
 
 func agentTargets() []agentTarget {
 	return []agentTarget{
-		{"Claude Code", ".claude", ".claude/skills"},
-		{"Codex", ".codex", ".codex/skills"},
-		{"OpenCode", ".config/opencode", ".config/opencode/skills"},
+		{"claude", "Claude Code", ".claude", ".claude/skills"},
+		{"codex", "Codex", ".codex", ".codex/skills"},
+		{"opencode", "OpenCode", ".config/opencode", ".config/opencode/skills"},
 	}
 }
 
@@ -40,11 +43,13 @@ func newSkillCmd() *cobra.Command {
 }
 
 func newSkillInstallCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "install",
-		Short: "Install the bundled skill into every detected agent (Claude Code, Codex, …)",
-		Long: "Deploys the skill embedded in this binary to each installed agent's skills/<name>/ dir. " +
-			"Re-run after upgrading shunt to refresh it. This is the deploy path — the skill is no longer copied by hand.",
+	var all bool
+	c := &cobra.Command{
+		Use:   "install [agent...]",
+		Short: "Install the bundled skill into installed agents (interactive, or name them)",
+		Long: "With no args, lists the detected agents (Claude Code, Codex, OpenCode) and asks which to install " +
+			"into. Pass agent keys (claude/codex/opencode) to skip discovery and the prompt, or --all for every " +
+			"detected agent. The skill is embedded in this binary, so this is the deploy path — not a hand copy.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			home, err := os.UserHomeDir()
 			if err != nil {
@@ -52,27 +57,93 @@ func newSkillInstallCmd() *cobra.Command {
 			}
 			bin := config.Current().BinaryName
 
-			var installed []string
+			var detected []agentTarget
 			for _, t := range agentTargets() {
-				if _, err := os.Stat(filepath.Join(home, t.HomeRel)); err != nil {
-					continue // agent not installed
+				if _, statErr := os.Stat(filepath.Join(home, t.HomeRel)); statErr == nil {
+					detected = append(detected, t)
 				}
+			}
+
+			selected, err := chooseAgents(args, detected, all)
+			if err != nil {
+				return err
+			}
+			if len(selected) == 0 {
+				fmt.Println("nothing selected.")
+				return nil
+			}
+
+			fmt.Printf("✓ installed the %q skill:\n", skillName)
+			for _, t := range selected {
 				dest := filepath.Join(home, t.SkillsRel, skillName)
 				if err := writeSkill(dest, bin); err != nil {
 					return fmt.Errorf("install to %s: %w", t.Name, err)
 				}
-				installed = append(installed, fmt.Sprintf("%-12s %s", t.Name, dest))
-			}
-			if len(installed) == 0 {
-				return fmt.Errorf("no supported agents detected (looked for ~/.claude, ~/.codex, ~/.config/opencode)")
-			}
-			fmt.Printf("✓ installed the %q skill to %d agent(s):\n", skillName, len(installed))
-			for _, l := range installed {
-				fmt.Printf("    %s\n", l)
+				fmt.Printf("    %-12s %s\n", t.Name, dest)
 			}
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&all, "all", false, "install to all detected agents without prompting")
+	return c
+}
+
+// chooseAgents resolves which agents to install to: explicit names (any known
+// agent, detected or not), --all (every detected), or an interactive pick.
+func chooseAgents(args []string, detected []agentTarget, all bool) ([]agentTarget, error) {
+	if len(args) > 0 {
+		byKey := map[string]agentTarget{}
+		for _, t := range agentTargets() {
+			byKey[t.Key] = t
+		}
+		var out []agentTarget
+		for _, a := range args {
+			t, ok := byKey[strings.ToLower(a)]
+			if !ok {
+				return nil, fmt.Errorf("unknown agent %q (known: claude, codex, opencode)", a)
+			}
+			out = append(out, t)
+		}
+		return out, nil
+	}
+	if len(detected) == 0 {
+		return nil, fmt.Errorf("no agents detected (looked for ~/.claude, ~/.codex, ~/.config/opencode); name one explicitly to install anyway")
+	}
+	if all {
+		return detected, nil
+	}
+	return pickAgents(detected)
+}
+
+// pickAgents lists detected agents and reads a comma/space-separated choice from
+// stdin; empty or "all" selects everything.
+func pickAgents(detected []agentTarget) ([]agentTarget, error) {
+	fmt.Println("Detected agents — which to install the skill into? (e.g. 1,3 — empty or 'all' = every one)")
+	for i, t := range detected {
+		fmt.Printf("  %d) %s\n", i+1, t.Name)
+	}
+	fmt.Print("> ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("read selection: %w", err)
+	}
+	line = strings.TrimSpace(line)
+	if line == "" || strings.EqualFold(line, "all") {
+		return detected, nil
+	}
+	var out []agentTarget
+	seen := map[int]bool{}
+	for _, tok := range strings.FieldsFunc(line, func(r rune) bool { return r == ',' || r == ' ' }) {
+		idx, convErr := strconv.Atoi(strings.TrimSpace(tok))
+		if convErr != nil || idx < 1 || idx > len(detected) {
+			return nil, fmt.Errorf("invalid selection %q", tok)
+		}
+		if !seen[idx] {
+			seen[idx] = true
+			out = append(out, detected[idx-1])
+		}
+	}
+	return out, nil
 }
 
 // writeSkill walks the embedded skill tree into dest, replacing the dev binary
