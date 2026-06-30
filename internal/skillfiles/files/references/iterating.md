@@ -4,15 +4,15 @@
 
 A siding's guest starts with an empty Docker store. So the first `up` rebuilds any custom dependency images (a SQL+FTS image can be ~6 GB) and re-pulls everything from scratch — that's the ~20–30 min. A native `aspire start` only feels fast because the host's Docker already has those images cached from an earlier run; a genuinely clean native run is just as slow.
 
-The fix is `shunt warm`:
+The fix is `shunt warm` — it treats the **host** Docker daemon as the canonical cache:
 
 ```bash
-shunt-dev up <one-siding>     # pay the cold tax once
-shunt-dev warm                # capture that siding's built/pulled images into a project cache
-shunt-dev new exp2 && shunt-dev up exp2   # loads the cache → skips the rebuild + pulls
+# declare the dependency images once in .shunt.app.json (prebakeImages), then:
+shunt-dev warm                            # ensure they're on the host (pull only what's missing), save to the project cache
+shunt-dev new exp1 && shunt-dev up exp1   # the guest docker-loads the cache → no rebuild, no pull
 ```
 
-`warm` writes `<repos>/.shunt-dev/<project>/base/images.tar`; every later `up` `docker load`s it instead of rebuilding. Re-run `warm` when the app's dependencies change.
+`warm` writes `<repos>/.shunt-dev/<project>/base/images.tar`; every `up` `docker load`s it instead of rebuilding/pulling. When the host already has the images (e.g. you've run the app natively), `warm` touches the network zero times — so a cold siding works even offline. Re-run `warm` when the app's dependencies change. (`--from <siding>` captures from a running guest instead, useful before `prebakeImages` are declared.)
 
 ## Three tiers — never drop the whole environment to see a change
 

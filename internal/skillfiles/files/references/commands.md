@@ -8,7 +8,7 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 | `shunt-dev ls` | All apps + sidings across projects; `*` marks the live one. |
 | `shunt-dev new <name>` | Create a siding — a git worktree off your current HEAD + an idle guest. **Fast**: no build, no Aspire. |
 | `shunt-dev up <name>` | Build + start Aspire in the guest, then point the front door at it. Loads the project warm cache first (if any). First cold run is slow; see [iterating](iterating.md). |
-| `shunt-dev warm [--from <siding>]` | Capture a running siding's built/pulled dependency images into a per-project cache so future sidings skip the rebuild/pull. Run `up` on one siding first, then `warm`. |
+| `shunt-dev warm [--from <siding>]` | Build the project's dependency-image cache from the **host** Docker daemon (the canonical cache): ensure the contract's `prebakeImages` are on the host (pulls only what's missing — the one shared network call), then save them for sidings to load. Offline-friendly when the host already has them. `--from <siding>` captures from a running guest's Docker store instead. |
 | `shunt-dev restart <name>` | Kill only the AppHost and rebuild it, keeping the guest + dockerd + dependency containers + data running. Use when `dotnet watch` misses a change. |
 | `shunt-dev switch <name>` | Point the stable front-door ports at a running siding (live, no restart). |
 | `shunt-dev kill <name>` | Stop a siding's guest, keeping its worktree + data to restart later. |
@@ -27,10 +27,15 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
   ],
   "mounts": [
     { "host": "~/.microsoft/usersecrets", "guest": "/root/.microsoft/usersecrets", "readOnly": true }
+  ],
+  "prebakeImages": [
+    "mcr.microsoft.com/mssql/server:2022-latest",
+    "mcr.microsoft.com/azure-storage/azurite:3.35.0"
   ]
 }
 ```
 
 - `frontDoor` maps Aspire resources/endpoints to stable local ports (the host:port you and Entra always hit). `kind` is `http` (web) or `layer4` (raw TCP, e.g. SQL).
 - `mounts` carries per-project host paths into the guest — typically the dev's user-secrets so Aspire parameters resolve.
+- `prebakeImages` lists the dependency container images Aspire brings up. `shunt warm` keeps these in the host Docker cache and copies them into each siding, so guests never pull from the network. Re-run `app add` after editing the contract to apply changes.
 - shunt has no app-specific logic; this file is the only per-repo config.
