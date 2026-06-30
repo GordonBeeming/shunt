@@ -246,7 +246,18 @@ for hex in ` + aspirePortHex + `; do
     done
   done
 done
-sleep 1; true`
+# kill -9 releases the listen socket asynchronously, so wait until the Aspire
+# ports are actually free before returning — otherwise the next StartApp races
+# onto a port that's still mid-release and aborts with "address already in use".
+for i in $(seq 1 15); do
+  busy=
+  for hex in ` + aspirePortHex + `; do
+    cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '{print $2}' | grep -iq ":$hex" && busy=1
+  done
+  [ -z "$busy" ] && break
+  sleep 1
+done
+true`
 	_, err := container.Exec(ctx, sd.Container, "sh", "-c", script)
 	return err
 }

@@ -26,8 +26,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Aspire CLI for `aspire start`/`stop`/`ps` — the supported way to run an AppHost
+# in the background, so shunt can manage its lifecycle cleanly rather than
+# hand-rolling `dotnet run` + process killing.
+RUN dotnet tool install --global aspire.cli --version 13.4.6
+
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
-    DOTNET_NOLOGO=1
+    DOTNET_NOLOGO=1 \
+    PATH="/root/.dotnet/tools:${PATH}"
 
 COPY shunt-entrypoint.sh /usr/local/bin/shunt-entrypoint.sh
 RUN chmod +x /usr/local/bin/shunt-entrypoint.sh
