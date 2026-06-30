@@ -1,2 +1,0 @@
-[      64ms] [ERROR] Failed to load resource: the server responded with a status of 404 () @ https://localhost:2220/favicon.ico:0
-[  168417ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ https://localhost:2220/api/state:0
