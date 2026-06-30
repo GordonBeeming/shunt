@@ -93,7 +93,7 @@ func guestEnv(app state.App) map[string]string {
 // for the app to be ready (see Activate).
 func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding, error) {
 	src, volRoot := Paths(app, name)
-	wtBranch := "shunt/" + name
+	wtBranch := config.BranchPrefix() + name
 	if err := fsclone.AddWorktree(ctx, app.RepoPath, src, wtBranch, branch); err != nil {
 		return state.Siding{}, err
 	}
@@ -649,4 +649,42 @@ func CreateBindVolumes(ctx context.Context, app state.App, sd state.Siding) erro
 		fmt.Printf("  data volume %q backed by host copy-on-write clone\n", vol)
 	}
 	return nil
+}
+
+// Switch points the front door at a siding: it activates it (bridges) if not yet
+// done, repoints Caddy, marks it live, and persists. This is the fast path — a
+// Caddy rebind, no app restart — and assumes the siding is running on its ports.
+// Shared by `shunt switch` and the dashboard.
+func Switch(ctx context.Context, app *state.App, name string) error {
+	sd, ok := app.Sidings[name]
+	if !ok {
+		return fmt.Errorf("no siding %q", name)
+	}
+	if len(sd.Bridges) == 0 {
+		if err := Activate(ctx, *app, &sd); err != nil {
+			return err
+		}
+	}
+	if err := PointCaddy(ctx, *app, &sd); err != nil {
+		return err
+	}
+	app.LiveSiding = name
+	app.Sidings[name] = sd
+	return state.SaveApp(*app)
+}
+
+// Restart stops the app in the guest and starts it again (the configured stop +
+// start), keeping the guest, dockerd, deps, and data up, then waits for it to be
+// ready. This is the "bring a down route back up" path. Shared by `shunt restart`
+// and the dashboard.
+func Restart(ctx context.Context, app state.App, sd state.Siding) error {
+	if err := StopApp(ctx, app, sd); err != nil {
+		return err
+	}
+	// Clear the old start marker so WaitReady waits for the fresh run.
+	_, _ = container.Exec(ctx, sd.Container, "sh", "-c", "> "+appLogPath)
+	if err := StartApp(ctx, app, sd); err != nil {
+		return err
+	}
+	return WaitReady(ctx, app, sd, 15*time.Minute)
 }

@@ -20,6 +20,7 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 | `shunt-dev app switch <app>` | Make `<app>` active on its (fixed) front-door ports, parking any app that conflicts — without stopping the parked app's siding. For apps that share ports (e.g. Vite on the same port). |
 | `shunt-dev init` | One-time machine setup: builds Caddy + the base image, starts the proxy. |
 | `shunt-dev cert install` | Export the host's dotnet dev cert and load it into Caddy (front door serves HTTPS with the cert you already trust — no extra CA). |
+| `shunt-dev config branchPrefix [value]` | Get/set the prefix for siding worktree branches (default `shunt/`). Set e.g. `gb/shunt/` so siding branches follow your branch convention and are push/PR-ready as-is. Applies to sidings created after; stored per channel in `<global-dir>/config.json`. |
 
 ## The `.shunt.app.json` contract (one per repo)
 

@@ -6,10 +6,67 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 )
+
+// DefaultBranchPrefix is the siding worktree branch prefix when the user hasn't
+// set one. Override it (e.g. to "gb/shunt/") so siding branches already follow
+// your branch convention and don't need renaming before push.
+const DefaultBranchPrefix = "shunt/"
+
+// UserConfig holds per-user shunt preferences at <GlobalDir>/config.json.
+type UserConfig struct {
+	BranchPrefix string `json:"branchPrefix"`
+}
+
+// UserConfigPath is <GlobalDir>/config.json for this channel.
+func UserConfigPath() (string, error) {
+	dir, err := GlobalDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "config.json"), nil
+}
+
+// LoadUserConfig reads the user config, falling back to defaults.
+func LoadUserConfig() UserConfig {
+	uc := UserConfig{BranchPrefix: DefaultBranchPrefix}
+	path, err := UserConfigPath()
+	if err != nil {
+		return uc
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return uc
+	}
+	_ = json.Unmarshal(data, &uc)
+	if uc.BranchPrefix == "" {
+		uc.BranchPrefix = DefaultBranchPrefix
+	}
+	return uc
+}
+
+// SaveUserConfig writes the user config (creating the dir).
+func SaveUserConfig(uc UserConfig) error {
+	path, err := UserConfigPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(uc, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+// BranchPrefix is the configured siding-branch prefix (default "shunt/").
+func BranchPrefix() string { return LoadUserConfig().BranchPrefix }
 
 // Channel is set at build time via:
 //
@@ -26,6 +83,7 @@ type Identity struct {
 	GlobalDirName   string // .shunt | .shunt-beta | .shunt-dev (under $HOME)
 	ProjectDirName  string // same name, used as the sibling project-local dir
 	AdminPort       int    // Caddy admin API port for this channel
+	DashboardPort   int    // shunt dashboard web UI port for this channel
 	PortOffset      int    // added to each .shunt.app.json listenPort
 	LaunchAgentID   string // launchd label
 	ContainerPrefix string // prefix for guest container names
@@ -42,6 +100,7 @@ func known(channel string) Identity {
 			GlobalDirName:   ".shunt",
 			ProjectDirName:  ".shunt",
 			AdminPort:       2019,
+			DashboardPort:   2020,
 			PortOffset:      0,
 			LaunchAgentID:   "com.gordonbeeming.shunt.caddy",
 			ContainerPrefix: "shunt",
@@ -53,6 +112,7 @@ func known(channel string) Identity {
 			GlobalDirName:   ".shunt-beta",
 			ProjectDirName:  ".shunt-beta",
 			AdminPort:       2119,
+			DashboardPort:   2120,
 			PortOffset:      100,
 			LaunchAgentID:   "com.gordonbeeming.shunt-beta.caddy",
 			ContainerPrefix: "shuntbeta",
@@ -64,6 +124,7 @@ func known(channel string) Identity {
 			GlobalDirName:   ".shunt-dev",
 			ProjectDirName:  ".shunt-dev",
 			AdminPort:       2219,
+			DashboardPort:   2220,
 			PortOffset:      200,
 			LaunchAgentID:   "com.gordonbeeming.shunt-dev.caddy",
 			ContainerPrefix: "shuntdev",
@@ -87,6 +148,11 @@ func GlobalDir() (string, error) {
 // AdminAddr is the loopback host:port of this channel's Caddy admin API.
 func AdminAddr() string {
 	return fmt.Sprintf("127.0.0.1:%d", Current().AdminPort)
+}
+
+// DashboardAddr is the loopback host:port of this channel's dashboard web UI.
+func DashboardAddr() string {
+	return fmt.Sprintf("127.0.0.1:%d", Current().DashboardPort)
 }
 
 // AdminBaseURL is the admin API base URL, e.g. http://127.0.0.1:2019.
