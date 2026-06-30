@@ -32,3 +32,41 @@ func Install(ctx context.Context, caddyBin, bootstrapPath string) error {
 	}
 	return nil
 }
+
+// InstallDashboard writes + loads the per-channel dashboard LaunchAgent so the
+// web UI stays up (KeepAlive) like Caddy. binPath is the shunt binary to run
+// `dashboard` from (usually os.Executable()).
+func InstallDashboard(ctx context.Context, binPath string) error {
+	plistPath, err := config.DashboardPlistPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepathDir(plistPath), 0o755); err != nil {
+		return fmt.Errorf("create LaunchAgents dir: %w", err)
+	}
+	content, err := renderDashboard(binPath)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(plistPath, []byte(content), 0o644); err != nil {
+		return fmt.Errorf("write dashboard plist: %w", err)
+	}
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	label := config.Current().DashboardLaunchAgentID
+	_, _ = proc.Run(ctx, "launchctl", "bootout", domain, plistPath)
+	if _, err := proc.Run(ctx, "launchctl", "bootstrap", domain, plistPath); err != nil {
+		return fmt.Errorf("launchctl bootstrap dashboard: %w", err)
+	}
+	_, _ = proc.Run(ctx, "launchctl", "enable", domain+"/"+label)
+	_, _ = proc.Run(ctx, "launchctl", "kickstart", "-k", domain+"/"+label)
+	return nil
+}
+
+func filepathDir(p string) string {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '/' {
+			return p[:i]
+		}
+	}
+	return "."
+}

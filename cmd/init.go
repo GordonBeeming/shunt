@@ -62,6 +62,13 @@ func newInitCmd() *cobra.Command {
 				return err
 			}
 
+			fmt.Println("• installing the dashboard LaunchAgent…")
+			if exe, err := os.Executable(); err == nil {
+				if err := launchagent.InstallDashboard(ctx, exe); err != nil {
+					fmt.Printf("  (dashboard agent install failed: %v — run `%s dashboard --install`)\n", err, bin())
+				}
+			}
+
 			fmt.Println("• starting container runtime…")
 			if err := container.EnsureSystemStarted(ctx); err != nil {
 				return err

@@ -96,15 +96,16 @@ var Channel = "dev"
 
 // Identity is the fully-resolved, channel-scoped set of names/ports/paths.
 type Identity struct {
-	Channel         string // "release" | "beta" | "dev"
-	BinaryName      string // shunt | shunt-beta | shunt-dev
-	GlobalDirName   string // .shunt | .shunt-beta | .shunt-dev (under $HOME)
-	ProjectDirName  string // same name, used as the sibling project-local dir
-	AdminPort       int    // Caddy admin API port for this channel
-	DashboardPort   int    // shunt dashboard web UI port for this channel
-	PortOffset      int    // added to each .shunt.app.json listenPort
-	LaunchAgentID   string // launchd label
-	ContainerPrefix string // prefix for guest container names
+	Channel                string // "release" | "beta" | "dev"
+	BinaryName             string // shunt | shunt-beta | shunt-dev
+	GlobalDirName          string // .shunt | .shunt-beta | .shunt-dev (under $HOME)
+	ProjectDirName         string // same name, used as the sibling project-local dir
+	AdminPort              int    // Caddy admin API port for this channel
+	DashboardPort          int    // shunt dashboard web UI port for this channel
+	PortOffset             int    // added to each .shunt.app.json listenPort
+	LaunchAgentID          string // launchd label
+	DashboardLaunchAgentID string // launchd label for the dashboard agent
+	ContainerPrefix        string // prefix for guest container names
 }
 
 // known returns the identity table. Unknown channel values fall back to dev so a
@@ -113,39 +114,42 @@ func known(channel string) Identity {
 	switch channel {
 	case "release":
 		return Identity{
-			Channel:         "release",
-			BinaryName:      "shunt",
-			GlobalDirName:   ".shunt",
-			ProjectDirName:  ".shunt",
-			AdminPort:       2019,
-			DashboardPort:   2020,
-			PortOffset:      0,
-			LaunchAgentID:   "com.gordonbeeming.shunt.caddy",
-			ContainerPrefix: "shunt",
+			Channel:                "release",
+			BinaryName:             "shunt",
+			GlobalDirName:          ".shunt",
+			ProjectDirName:         ".shunt",
+			AdminPort:              2019,
+			DashboardPort:          2020,
+			PortOffset:             0,
+			LaunchAgentID:          "com.gordonbeeming.shunt.caddy",
+			DashboardLaunchAgentID: "com.gordonbeeming.shunt.dashboard",
+			ContainerPrefix:        "shunt",
 		}
 	case "beta":
 		return Identity{
-			Channel:         "beta",
-			BinaryName:      "shunt-beta",
-			GlobalDirName:   ".shunt-beta",
-			ProjectDirName:  ".shunt-beta",
-			AdminPort:       2119,
-			DashboardPort:   2120,
-			PortOffset:      100,
-			LaunchAgentID:   "com.gordonbeeming.shunt-beta.caddy",
-			ContainerPrefix: "shuntbeta",
+			Channel:                "beta",
+			BinaryName:             "shunt-beta",
+			GlobalDirName:          ".shunt-beta",
+			ProjectDirName:         ".shunt-beta",
+			AdminPort:              2119,
+			DashboardPort:          2120,
+			PortOffset:             100,
+			LaunchAgentID:          "com.gordonbeeming.shunt-beta.caddy",
+			DashboardLaunchAgentID: "com.gordonbeeming.shunt-beta.dashboard",
+			ContainerPrefix:        "shuntbeta",
 		}
 	default:
 		return Identity{
-			Channel:         "dev",
-			BinaryName:      "shunt-dev",
-			GlobalDirName:   ".shunt-dev",
-			ProjectDirName:  ".shunt-dev",
-			AdminPort:       2219,
-			DashboardPort:   2220,
-			PortOffset:      200,
-			LaunchAgentID:   "com.gordonbeeming.shunt-dev.caddy",
-			ContainerPrefix: "shuntdev",
+			Channel:                "dev",
+			BinaryName:             "shunt-dev",
+			GlobalDirName:          ".shunt-dev",
+			ProjectDirName:         ".shunt-dev",
+			AdminPort:              2219,
+			DashboardPort:          2220,
+			PortOffset:             200,
+			LaunchAgentID:          "com.gordonbeeming.shunt-dev.caddy",
+			DashboardLaunchAgentID: "com.gordonbeeming.shunt-dev.dashboard",
+			ContainerPrefix:        "shuntdev",
 		}
 	}
 }
@@ -249,4 +253,13 @@ func LaunchAgentPlistPath() (string, error) {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
 	return filepath.Join(home, "Library", "LaunchAgents", Current().LaunchAgentID+".plist"), nil
+}
+
+// DashboardPlistPath is ~/Library/LaunchAgents/<dashboard-label>.plist.
+func DashboardPlistPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", Current().DashboardLaunchAgentID+".plist"), nil
 }

@@ -81,3 +81,43 @@ func writePlist(caddyBin, bootstrapPath string) (string, error) {
 	}
 	return plistPath, nil
 }
+
+// dashboardPlistTemplate runs `<shunt> dashboard` with KeepAlive so the web UI
+// stays up like Caddy.
+const dashboardPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>%s</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>%s</string>
+    <string>dashboard</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>%s</string>
+  <key>StandardErrorPath</key><string>%s</string>
+  <key>WorkingDirectory</key><string>%s</string>
+</dict>
+</plist>
+`
+
+func renderDashboard(binPath string) (string, error) {
+	id := config.Current()
+	globalDir, err := config.GlobalDir()
+	if err != nil {
+		return "", err
+	}
+	logDir, err := config.LogDir()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(dashboardPlistTemplate,
+		id.DashboardLaunchAgentID,
+		binPath,
+		filepath.Join(logDir, "dashboard.out.log"),
+		filepath.Join(logDir, "dashboard.err.log"),
+		globalDir,
+	), nil
+}
