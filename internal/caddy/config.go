@@ -15,18 +15,30 @@ import (
 // DevCertPath / DevCertKeyPath are where shunt exports the host's dotnet HTTPS
 // dev certificate (PEM) for Caddy to serve — the cert the host already trusts,
 // so no new root CA is introduced.
-func DevCertPath() string    { return filepath.Join(config.GlobalDir(), "caddy", "devcert.pem") }
-func DevCertKeyPath() string { return filepath.Join(config.GlobalDir(), "caddy", "devcert.key") }
+func DevCertPath() (string, error)    { return devCertFile("devcert.pem") }
+func DevCertKeyPath() (string, error) { return devCertFile("devcert.key") }
+
+func devCertFile(name string) (string, error) {
+	dir, err := config.GlobalDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "caddy", name), nil
+}
 
 // ExportDevCert writes the host's dotnet dev cert to PEM for Caddy. `dotnet
 // dev-certs https` creates the cert if it doesn't exist; the host should have
 // trusted it once with `dotnet dev-certs https --trust`.
 func ExportDevCert(ctx context.Context) error {
-	if err := os.MkdirAll(filepath.Dir(DevCertPath()), 0o755); err != nil {
+	cert, err := DevCertPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(cert), 0o755); err != nil {
 		return err
 	}
 	if _, err := proc.Run(ctx, "dotnet", "dev-certs", "https",
-		"--export-path", DevCertPath(), "--format", "PEM", "--no-password"); err != nil {
+		"--export-path", cert, "--format", "PEM", "--no-password"); err != nil {
 		return fmt.Errorf("export dotnet dev cert (run `dotnet dev-certs https --trust` once): %w", err)
 	}
 	return nil
@@ -47,6 +59,14 @@ func ServerName(app, key string) string {
 // endpoint plus empty http and layer4 apps that `app add` later fills with one
 // server per stable front-door port.
 func Bootstrap() ([]byte, error) {
+	certPath, err := DevCertPath()
+	if err != nil {
+		return nil, err
+	}
+	keyPath, err := DevCertKeyPath()
+	if err != nil {
+		return nil, err
+	}
 	doc := map[string]any{
 		"admin": map[string]any{"listen": config.AdminAddr()},
 		"apps": map[string]any{
@@ -59,8 +79,8 @@ func Bootstrap() ([]byte, error) {
 			"tls": map[string]any{
 				"certificates": map[string]any{
 					"load_files": []any{map[string]any{
-						"certificate": DevCertPath(),
-						"key":         DevCertKeyPath(),
+						"certificate": certPath,
+						"key":         keyPath,
 					}},
 				},
 			},
