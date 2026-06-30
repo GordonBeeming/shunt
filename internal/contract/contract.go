@@ -18,7 +18,14 @@ const FileName = ".shunt.app.json"
 
 // Contract is the parsed .shunt.app.json.
 type Contract struct {
-	AppHost     string             `json:"apphost"`   // rel path to the AppHost project dir or csproj
+	// Runner selects how the app starts (aspire | dotnet | node | custom).
+	// Empty = auto-detect at `app add`. Aspire keeps gRPC discovery; the others
+	// use Start + a declared per-route guestPort.
+	Runner  string `json:"runner"`
+	Start   string `json:"start"`   // start command for dotnet/node/custom (run in Workdir)
+	Workdir string `json:"workdir"` // dir to run Start in, relative to the repo (default repo root)
+
+	AppHost     string             `json:"apphost"`   // aspire only: rel path to the AppHost project/csproj
 	FrontDoor   []FrontDoorRoute   `json:"frontDoor"` // stable front-door routes
 	DataVolumes []state.DataVolume `json:"dataVolumes"`
 	Env         map[string]string  `json:"env"`    // extra guest env (Aspire parameters, secrets)
@@ -38,8 +45,9 @@ type FrontDoorRoute struct {
 	Key        string `json:"key"`        // logical name: frontend | api | db
 	Kind       string `json:"kind"`       // http | layer4
 	ListenPort int    `json:"listenPort"` // stable host port (before channel offset)
-	Resource   string `json:"resource"`   // Aspire resource name to proxy
-	Endpoint   string `json:"endpoint"`   // endpoint name within that resource (optional)
+	Resource   string `json:"resource"`   // aspire: resource name to proxy
+	Endpoint   string `json:"endpoint"`   // aspire: endpoint name within that resource (optional)
+	GuestPort  int    `json:"guestPort"`  // non-aspire: the in-guest port the app binds (no discovery)
 	TLS        bool   `json:"tls"`        // terminate TLS at the front door
 }
 

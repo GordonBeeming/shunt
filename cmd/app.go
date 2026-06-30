@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"os"
 
+	"bufio"
+	"strings"
+
 	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/contract"
 	"github.com/gordonbeeming/shunt/internal/resolve"
+	"github.com/gordonbeeming/shunt/internal/runner"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 	"net"
@@ -42,10 +46,34 @@ func newAppAddCmd() *cobra.Command {
 				return err
 			}
 
+			// Determine the runner: the contract wins; otherwise detect from the
+			// repo; if still unknown, ask for the start command.
+			runnerKind, startCmd, workdir := ct.Runner, ct.Start, ct.Workdir
+			if runnerKind == "" {
+				det := runner.Detect(cwd)
+				runnerKind = det.Kind
+				if startCmd == "" {
+					startCmd = det.Start
+				}
+				if workdir == "" {
+					workdir = det.Workdir
+				}
+			}
+			if runnerKind != runner.Aspire && startCmd == "" {
+				startCmd, err = promptStartCommand(loc.Project)
+				if err != nil {
+					return err
+				}
+				runnerKind = runner.Custom
+			}
+
 			app := state.App{
 				Name:          loc.Project,
 				RepoPath:      cwd,
 				RepoOrigin:    gitOrigin(ctx, cwd),
+				Runner:        runnerKind,
+				Start:         startCmd,
+				Workdir:       workdir,
 				AppHostPath:   ct.AppHost,
 				ConfigDir:     loc.ConfigDir,
 				DataVolumes:   ct.DataVolumes,
@@ -88,6 +116,7 @@ func newAppAddCmd() *cobra.Command {
 					ListenPort: port,
 					Resource:   r.Resource,
 					Endpoint:   r.Endpoint,
+					GuestPort:  r.GuestPort,
 					// HTTP front-door routes serve HTTPS by default (Caddy terminates
 					// TLS with its internal CA); layer4/TCP routes stay raw.
 					TLS:     r.TLS || r.Kind == state.KindHTTP,
@@ -126,7 +155,7 @@ func newAppAddCmd() *cobra.Command {
 			if ct.FixedPorts {
 				ports = "fixed ports"
 			}
-			fmt.Printf("✓ %s %s (%d front-door routes, %s)\n", verb, app.Name, len(app.FrontDoor), ports)
+			fmt.Printf("✓ %s %s (runner: %s, %d front-door routes, %s)\n", verb, app.Name, app.Runner, len(app.FrontDoor), ports)
 			for _, r := range app.FrontDoor {
 				fmt.Printf("  %-10s %-6s localhost:%d  ->  %s/%s\n", r.Key, r.Kind, r.ListenPort, r.Resource, r.Endpoint)
 			}
@@ -161,4 +190,22 @@ func existingRoutePort(app state.App, key, kind string) int {
 		}
 	}
 	return 0
+}
+
+// promptStartCommand asks (interactively) how to start an app shunt couldn't
+// classify; errors in non-interactive mode so CI declares it in the contract.
+func promptStartCommand(project string) (string, error) {
+	if fi, _ := os.Stdout.Stat(); fi == nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return "", fmt.Errorf("could not detect how to start %q — set `runner` + `start` in .shunt.app.json", project)
+	}
+	fmt.Printf("shunt couldn't detect how to start %q.\nWhat command starts it (run from the repo root)?\n> ", project)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	cmd := strings.TrimSpace(line)
+	if cmd == "" {
+		return "", fmt.Errorf("no start command given — set `runner` + `start` in .shunt.app.json")
+	}
+	return cmd, nil
 }

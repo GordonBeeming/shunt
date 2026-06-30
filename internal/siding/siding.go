@@ -16,6 +16,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/fsclone"
+	"github.com/gordonbeeming/shunt/internal/runner"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/gordonbeeming/shunt/internal/ui"
 )
@@ -61,26 +62,26 @@ func IsWarmed(app state.App) bool {
 // shunt can read the resource service without an API key), all endpoints pinned,
 // http transport, in-guest Docker runtime.
 func guestEnv(app state.App) map[string]string {
+	// Base env for any .NET app (harmless for node): Development so user-secrets
+	// load, polling watcher to cross the VM boundary, roll-forward for older TFMs.
 	env := map[string]string{
-		"DOTNET_USE_POLLING_FILE_WATCHER":            "1",
-		"DOTNET_ASPIRE_CONTAINER_RUNTIME":            "docker",
-		"ASPIRE_ALLOW_UNSECURED_TRANSPORT":           "true",
-		"ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS": "true",
-		// We run the AppHost with --no-launch-profile, which skips the
-		// launchSettings that normally set Development. Set it explicitly so
-		// .NET loads the dev's user-secrets (where Aspire parameters/secrets like
-		// DB passwords and API keys live) — otherwise params are ValueMissing.
-		"ASPNETCORE_ENVIRONMENT": "Development",
-		"DOTNET_ENVIRONMENT":     "Development",
-		// Run apps targeting an older .NET (e.g. net9.0) on the base image's
-		// newer runtime instead of requiring every framework version to be present.
-		"DOTNET_ROLL_FORWARD":                  "Major",
-		"ASPNETCORE_URLS":                      fmt.Sprintf("http://0.0.0.0:%d", guestDashboardPort),
-		"ASPIRE_DASHBOARD_OTLP_ENDPOINT_URL":   "http://127.0.0.1:18889",
-		"ASPIRE_DASHBOARD_MCP_ENDPOINT_URL":    "http://127.0.0.1:18891",
-		"ASPIRE_RESOURCE_SERVICE_ENDPOINT_URL": fmt.Sprintf("http://127.0.0.1:%d", guestRSPort),
+		"DOTNET_USE_POLLING_FILE_WATCHER": "1",
+		"ASPNETCORE_ENVIRONMENT":          "Development",
+		"DOTNET_ENVIRONMENT":              "Development",
+		"DOTNET_ROLL_FORWARD":             "Major",
 	}
-	// App-specific env from the contract (Aspire parameters, secrets) wins.
+	// Aspire-only: pin the dashboard/resource-service endpoints shunt discovers
+	// against, allow the unsecured anonymous dashboard, use in-guest Docker.
+	if app.Runner == "" || app.Runner == runner.Aspire {
+		env["DOTNET_ASPIRE_CONTAINER_RUNTIME"] = "docker"
+		env["ASPIRE_ALLOW_UNSECURED_TRANSPORT"] = "true"
+		env["ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS"] = "true"
+		env["ASPNETCORE_URLS"] = fmt.Sprintf("http://0.0.0.0:%d", guestDashboardPort)
+		env["ASPIRE_DASHBOARD_OTLP_ENDPOINT_URL"] = "http://127.0.0.1:18889"
+		env["ASPIRE_DASHBOARD_MCP_ENDPOINT_URL"] = "http://127.0.0.1:18891"
+		env["ASPIRE_RESOURCE_SERVICE_ENDPOINT_URL"] = fmt.Sprintf("http://127.0.0.1:%d", guestRSPort)
+	}
+	// App-specific env from the contract (parameters, secrets) wins.
 	for k, v := range app.Env {
 		env[k] = v
 	}
@@ -197,8 +198,17 @@ func EnsureDockerd(ctx context.Context, sd state.Siding) error {
 // projects from starting). `shunt restart` (StopApp + StartApp) is the rebuild
 // path — it keeps the guest + dockerd + dependency containers + data running.
 func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
-	runCmd := fmt.Sprintf("cd /workspace && dotnet run --no-launch-profile --project %s > %s 2>&1",
-		app.AppHostPath, appLogPath)
+	var runCmd string
+	if app.Runner == "" || app.Runner == runner.Aspire {
+		runCmd = fmt.Sprintf("cd /workspace && dotnet run --no-launch-profile --project %s > %s 2>&1",
+			app.AppHostPath, appLogPath)
+	} else {
+		wd := "/workspace"
+		if app.Workdir != "" {
+			wd = "/workspace/" + app.Workdir
+		}
+		runCmd = fmt.Sprintf("cd %s && %s > %s 2>&1", wd, app.Start, appLogPath)
+	}
 	return container.ExecDetached(ctx, sd.Container, "/bin/sh", "-lc", runCmd)
 }
 

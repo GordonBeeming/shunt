@@ -30,9 +30,12 @@ type Registry struct {
 type App struct {
 	Name        string            `json:"name"`
 	RepoOrigin  string            `json:"repoOrigin"`
-	RepoPath    string            `json:"repoPath"`    // the original repo on disk
-	AppHostPath string            `json:"appHostPath"` // rel path to the AppHost project
-	ConfigDir   string            `json:"configDir"`   // <repos>/.shunt[-ch]/<project>
+	RepoPath    string            `json:"repoPath"`          // the original repo on disk
+	Runner      string            `json:"runner"`            // aspire | dotnet | node | custom
+	Start       string            `json:"start,omitempty"`   // start command (non-aspire)
+	Workdir     string            `json:"workdir,omitempty"` // dir to run Start in (non-aspire)
+	AppHostPath string            `json:"appHostPath"`       // aspire: rel path to the AppHost project
+	ConfigDir   string            `json:"configDir"`         // <repos>/.shunt[-ch]/<project>
 	FrontDoor   []Route           `json:"frontDoor"`
 	DataVolumes []DataVolume      `json:"dataVolumes"`
 	Env         map[string]string `json:"env"`    // extra guest env (Aspire parameters, secrets)
@@ -47,13 +50,14 @@ type App struct {
 // Route is a stable front-door entry. The upstream target is NOT stored — it's
 // discovered live from the running Aspire app on each switch.
 type Route struct {
-	Key        string `json:"key"`        // logical name: frontend | api | db
-	Kind       string `json:"kind"`       // KindHTTP | KindLayer4
-	ListenPort int    `json:"listenPort"` // stable host port Caddy listens on (offset applied)
-	Resource   string `json:"resource"`   // Aspire resource name to proxy
-	Endpoint   string `json:"endpoint"`   // Aspire endpoint name within that resource
-	TLS        bool   `json:"tls"`        // terminate TLS at the front door (https redirect)
-	CaddyID    string `json:"caddyId"`    // @id, e.g. app_myapp_http_frontend
+	Key        string `json:"key"`                 // logical name: frontend | api | db
+	Kind       string `json:"kind"`                // KindHTTP | KindLayer4
+	ListenPort int    `json:"listenPort"`          // stable host port Caddy listens on (offset applied)
+	Resource   string `json:"resource"`            // aspire: resource name to proxy
+	Endpoint   string `json:"endpoint"`            // aspire: endpoint name within that resource
+	GuestPort  int    `json:"guestPort,omitempty"` // non-aspire: in-guest port the app binds
+	TLS        bool   `json:"tls"`                 // terminate TLS at the front door (https redirect)
+	CaddyID    string `json:"caddyId"`             // @id, e.g. app_myapp_http_frontend
 }
 
 // DataVolume is a reusable data dir cloned per siding and bind-mounted into the
