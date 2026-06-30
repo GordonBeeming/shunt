@@ -145,10 +145,25 @@ const appLogPath = "/var/log/apphost.log"
 // + dependency image pulls happen here). It's detached and its output goes to
 // appLogPath. The guest's env (Development, Aspire endpoints) was set at Spin
 // time and is inherited by the exec.
+//
+// It runs under `dotnet watch` so host edits hot-reload across the VM boundary
+// (DOTNET_USE_POLLING_FILE_WATCHER is set at Spin time). Watch is best-effort —
+// `shunt restart` (StopApp + StartApp) is the reliable full-rebuild path that
+// keeps the guest + dockerd + dependency containers + their data running.
 func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
-	runCmd := fmt.Sprintf("cd /workspace && dotnet run --no-launch-profile --project %s > %s 2>&1",
+	runCmd := fmt.Sprintf("cd /workspace && dotnet watch --non-interactive --project %s run --no-launch-profile > %s 2>&1",
 		app.AppHostPath, appLogPath)
 	return container.ExecDetached(ctx, sd.Container, "/bin/sh", "-lc", runCmd)
+}
+
+// StopApp kills the AppHost (dotnet watch/run) process inside the guest WITHOUT
+// touching the guest, dockerd, or the dependency containers — so a rebuild can
+// happen while SQL etc. and their data stay up. The docker-managed dependency
+// containers are a separate process tree, unaffected by these kills.
+func StopApp(ctx context.Context, sd state.Siding) error {
+	_, err := container.Exec(ctx, sd.Container, "sh", "-c",
+		"pkill -f 'dotnet watch' 2>/dev/null; pkill -f 'dotnet.*run' 2>/dev/null; true")
+	return err
 }
 
 // WaitStarted blocks until the AppHost log says the app started, the guest exits,
