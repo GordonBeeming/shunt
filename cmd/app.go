@@ -15,6 +15,7 @@ import (
 func newAppCmd() *cobra.Command {
 	c := &cobra.Command{Use: "app", Short: "Manage registered apps"}
 	c.AddCommand(newAppAddCmd())
+	c.AddCommand(newAppSwitchCmd())
 	return c
 }
 

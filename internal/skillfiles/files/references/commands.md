@@ -14,7 +14,8 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 | `shunt-dev switch <name>` | Point the stable front-door ports at a running siding (live, no restart). |
 | `shunt-dev kill <name>` | Stop a siding's guest, keeping its worktree + data to restart later. |
 | `shunt-dev rm <name> [--force]` | Tear down a siding: remove the guest, its worktree + branch, and its data. `--force` if it's live. |
-| `shunt-dev app add` | Register an Aspire repo with shunt (reads `.shunt.app.json`). One-time per repo. |
+| `shunt-dev app add` | Register an Aspire repo with shunt (reads `.shunt.app.json`). Front-door ports are random+free by default (no collisions); `fixedPorts:true` pins them. Re-run to apply contract changes. |
+| `shunt-dev app switch <app>` | Make `<app>` active on its (fixed) front-door ports, parking any app that conflicts — without stopping the parked app's siding. For apps that share ports (e.g. Vite on the same port). |
 | `shunt-dev init` | One-time machine setup: builds Caddy + the base image, starts the proxy. |
 | `shunt-dev cert install` | Export the host's dotnet dev cert and load it into Caddy (front door serves HTTPS with the cert you already trust — no extra CA). |
 
