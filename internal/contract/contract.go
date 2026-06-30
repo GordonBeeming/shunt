@@ -27,6 +27,10 @@ type Contract struct {
 	// keeps these in the host Docker cache and copies them into each siding, so
 	// siding guests never pull from the network. `shunt warm` uses this list.
 	PrebakeImages []string `json:"prebakeImages"`
+	// FixedPorts pins the front door to the exact listenPort values (no channel
+	// offset). Use when the app's config + Entra redirect URIs point at specific
+	// ports. Only one channel can run the app at a time on those ports.
+	FixedPorts bool `json:"fixedPorts"`
 }
 
 // FrontDoorRoute is one stable port mapping in the contract.

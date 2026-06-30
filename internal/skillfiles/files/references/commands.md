@@ -33,11 +33,13 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
   "prebakeImages": [
     "mcr.microsoft.com/mssql/server:2022-latest",
     "mcr.microsoft.com/azure-storage/azurite:3.35.0"
-  ]
+  ],
+  "fixedPorts": true
 }
 ```
 
 - `frontDoor` maps Aspire resources/endpoints to stable local ports (the host:port you and Entra always hit). `kind` is `http` (web) or `layer4` (raw TCP, e.g. SQL). **HTTP routes serve HTTPS** at the front door via Caddy's internal CA (trusted on the host); the proxy reaches the app over TLS with skip-verify. `layer4` routes stay raw TCP.
 - `mounts` carries per-project host paths into the guest — typically the dev's user-secrets so Aspire parameters resolve.
+- `fixedPorts: true` pins the front door to the exact `listenPort` values (no channel offset) — use when the app's config + Entra redirect URIs point at specific ports. Default (omit it) lets the channel offset apply so channels coexist.
 - `prebakeImages` lists the dependency container images Aspire brings up. `shunt warm` keeps these in the host Docker cache and copies them into each siding, so guests never pull from the network. Re-run `app add` after editing the contract to apply changes.
 - shunt has no app-specific logic; this file is the only per-repo config.

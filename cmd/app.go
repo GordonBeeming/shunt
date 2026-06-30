@@ -41,7 +41,12 @@ func newAppAddCmd() *cobra.Command {
 				return err
 			}
 
+			// Fixed-port apps use the exact declared ports (Entra/config point at
+			// them); otherwise apply the channel offset so channels coexist.
 			offset := config.Current().PortOffset
+			if ct.FixedPorts {
+				offset = 0
+			}
 			app := state.App{
 				Name:          loc.Project,
 				RepoPath:      cwd,
