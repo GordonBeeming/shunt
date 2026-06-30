@@ -17,6 +17,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/fsclone"
 	"github.com/gordonbeeming/shunt/internal/state"
+	"github.com/gordonbeeming/shunt/internal/ui"
 )
 
 const (
@@ -206,72 +207,53 @@ func LoadWarm(ctx context.Context, app state.App, sd state.Siding) (bool, error)
 }
 
 // WaitStarted blocks until the AppHost log says the app started, the guest exits,
-// or the deadline passes. It streams new log lines as they appear so a long
-// build/restore isn't a silent wait, with a heartbeat when the log goes quiet.
+// or the deadline passes. It renders progress in a compact live region that
+// collapses to a one-line summary on success and stays visible (last few lines)
+// on failure, with the full log available via `shunt logs`.
 func WaitStarted(ctx context.Context, guestName string, timeout time.Duration) error {
+	tail := ui.NewLiveTail(5)
+	logHint := fmt.Sprintf("see `%s logs %s` for the full log", config.Current().BinaryName, guestNameToSiding(guestName))
 	deadline := time.Now().Add(timeout)
 	start := time.Now()
 	shown := 0
-	lastOutput := time.Now()
 	for time.Now().Before(deadline) {
 		st, err := container.State(ctx, guestName)
 		if err == nil && st != "running" {
-			return fmt.Errorf("guest %s exited (state=%s) before the app started", guestName, st)
+			tail.Freeze()
+			return fmt.Errorf("guest exited (state=%s) before the app started — %s", st, logHint)
 		}
 		out, _ := container.Exec(ctx, guestName, "sh", "-c", "cat "+appLogPath+" 2>/dev/null")
 		lines := strings.Split(out, "\n")
+		var fresh []string
 		if len(lines) > shown {
-			if printProgress(lines[shown:]) {
-				lastOutput = time.Now()
-			}
+			fresh = lines[shown:]
 			shown = len(lines)
 		}
+		tail.Update(fmt.Sprintf("⏳ starting Aspire… (%s)", time.Since(start).Round(time.Second)), fresh)
 
 		if strings.Contains(out, startedMarker) {
-			fmt.Printf("    ✓ started (%s)\n", time.Since(start).Round(time.Second))
+			tail.Stop(fmt.Sprintf("✓ Aspire started (%s)", time.Since(start).Round(time.Second)))
 			return nil
 		}
-		if strings.Contains(out, "Unhandled exception") || strings.Contains(out, "Hosting failed") {
-			return fmt.Errorf("guest %s: Aspire app failed to start (see `container logs %s`)", guestName, guestName)
-		}
-		if time.Since(lastOutput) > 20*time.Second {
-			fmt.Printf("    … still going (%s elapsed)\n", time.Since(start).Round(time.Second))
-			lastOutput = time.Now()
+		if strings.Contains(out, "Unhandled exception") || strings.Contains(out, "Hosting failed") ||
+			strings.Contains(out, "Exited with error code") {
+			tail.Freeze()
+			return fmt.Errorf("Aspire app failed to start — %s", logHint)
 		}
 		time.Sleep(2 * time.Second)
 	}
-	return fmt.Errorf("timed out waiting for %s to start", guestName)
+	tail.Freeze()
+	return fmt.Errorf("timed out after %s waiting for the app to start — %s", timeout, logHint)
 }
 
-// printProgress streams new, non-empty log lines (dimmed with a │ gutter, capped
-// to the last few per tick and truncated) so the wait shows real activity.
-// Returns true if it printed anything.
-func printProgress(newLines []string) bool {
-	var keep []string
-	for _, ln := range newLines {
-		if t := strings.TrimSpace(ln); t != "" {
-			keep = append(keep, t)
-		}
+// guestNameToSiding strips the channel/app prefix from a container name back to
+// the siding name, for user-facing hints (best-effort; falls back to the full
+// name). Container names are "<prefix>_<app>_<siding>".
+func guestNameToSiding(guestName string) string {
+	if i := strings.LastIndex(guestName, "_"); i >= 0 && i+1 < len(guestName) {
+		return guestName[i+1:]
 	}
-	if len(keep) == 0 {
-		return false
-	}
-	const maxShow = 6
-	extra := 0
-	if len(keep) > maxShow {
-		extra = len(keep) - maxShow
-		keep = keep[len(keep)-maxShow:]
-	}
-	for _, ln := range keep {
-		if len(ln) > 160 {
-			ln = ln[:159] + "…"
-		}
-		fmt.Printf("    │ %s\n", ln)
-	}
-	if extra > 0 {
-		fmt.Printf("    │ (+%d earlier lines)\n", extra)
-	}
-	return true
+	return guestName
 }
 
 // Activate sets up the loopback->guest-IP bridges and discovers the app's

@@ -10,6 +10,7 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 | `shunt-dev up <name>` | Build + start Aspire in the guest, then point the front door at it. Loads the project warm cache first (if any). First cold run is slow; see [iterating](iterating.md). |
 | `shunt-dev warm [--from <siding>]` | Build the project's dependency-image cache from the **host** Docker daemon (the canonical cache): ensure the contract's `prebakeImages` are on the host (pulls only what's missing — the one shared network call), then save them for sidings to load. Offline-friendly when the host already has them. `--from <siding>` captures from a running guest's Docker store instead. |
 | `shunt-dev restart <name>` | Kill only the AppHost and rebuild it, keeping the guest + dockerd + dependency containers + data running. Use when `dotnet watch` misses a change. |
+| `shunt-dev logs <name> [-n N]` | Print the siding's AppHost log (build + startup + crash output) from inside the guest. Use to diagnose a failed `up`. |
 | `shunt-dev switch <name>` | Point the stable front-door ports at a running siding (live, no restart). |
 | `shunt-dev kill <name>` | Stop a siding's guest, keeping its worktree + data to restart later. |
 | `shunt-dev rm <name> [--force]` | Tear down a siding: remove the guest, its worktree + branch, and its data. `--force` if it's live. |
