@@ -23,7 +23,10 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 
 ```json
 {
-  "apphost": "src/App.AppHost/App.AppHost.csproj",
+  "runner": "aspire",                      // aspire | dotnet | node | custom (omit = auto-detect at app add)
+  "apphost": "src/App.AppHost/App.AppHost.csproj",  // aspire only
+  "start": "pnpm dev",                     // non-aspire: command to start the app
+  "workdir": "src/web",                    // non-aspire: dir to run start in (relative)
   "frontDoor": [
     { "key": "web", "kind": "http",   "listenPort": 8080,  "resource": "<aspire-resource>", "endpoint": "http" },
     { "key": "db",  "kind": "layer4", "listenPort": 11433, "resource": "<sql-resource>",     "endpoint": "tcp" }
@@ -39,6 +42,7 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 }
 ```
 
+- `runner` is how the app starts. **aspire** keeps gRPC discovery; **dotnet**/**node**/**custom** use `start` + a per-route `guestPort` (the in-guest port the app binds — no discovery, shunt waits for it to listen). `app add` auto-detects (AppHost→aspire, package.json→node, .csproj→dotnet) and asks if it can't.
 - `frontDoor` maps Aspire resources/endpoints to stable local ports (the host:port you and Entra always hit). `kind` is `http` (web) or `layer4` (raw TCP, e.g. SQL). **HTTP routes serve HTTPS** at the front door via Caddy's internal CA (trusted on the host); the proxy reaches the app over TLS with skip-verify. `layer4` routes stay raw TCP.
 - `mounts` carries per-project host paths into the guest — typically the dev's user-secrets so Aspire parameters resolve.
 - `fixedPorts: true` pins the front door to the exact `listenPort` values (no channel offset) — use when the app's config + Entra redirect URIs point at specific ports. Default (omit it) lets the channel offset apply so channels coexist.

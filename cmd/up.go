@@ -84,7 +84,7 @@ func newUpCmd() *cobra.Command {
 					return err
 				}
 				fmt.Println("• waiting for the app to start…")
-				if err := siding.WaitStarted(ctx, sd.Container, 25*time.Minute); err != nil {
+				if err := siding.WaitReady(ctx, app, sd, 25*time.Minute); err != nil {
 					return err
 				}
 			} else {

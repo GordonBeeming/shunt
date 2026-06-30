@@ -330,6 +330,25 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 		return err
 	}
 	sd.LastIP = ip
+	if sd.Bridges == nil {
+		sd.Bridges = map[string]int{}
+	}
+
+	// Non-aspire runners have no gRPC resource service — bridge each route's
+	// declared in-guest port straight to the front door (no discovery).
+	if app.Runner != "" && app.Runner != runner.Aspire {
+		for i, r := range app.FrontDoor {
+			if r.GuestPort == 0 {
+				return fmt.Errorf("route %q: a non-aspire app needs `guestPort` in .shunt.app.json", r.Key)
+			}
+			ext := routeExtBase + i
+			if err := container.Bridge(ctx, sd.Container, ext, r.GuestPort); err != nil {
+				return err
+			}
+			sd.Bridges[r.Key] = ext
+		}
+		return nil
+	}
 
 	// Bridge the resource service so shunt can discover from the host.
 	if err := container.Bridge(ctx, sd.Container, rsExtPort, guestRSPort); err != nil {
@@ -460,4 +479,54 @@ func summarize(eps []aspire.Endpoint) string {
 		parts = append(parts, fmt.Sprintf("%s/%s=%s:%d", e.Resource, e.Name, e.Host, e.Port))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// WaitReady blocks until the app is ready: Aspire waits for the "started"
+// marker, other runners poll until every front-door route's guestPort listens.
+func WaitReady(ctx context.Context, app state.App, sd state.Siding, timeout time.Duration) error {
+	if app.Runner == "" || app.Runner == runner.Aspire {
+		return WaitStarted(ctx, sd.Container, timeout)
+	}
+	tail := ui.NewLiveTail(5)
+	deadline := time.Now().Add(timeout)
+	start := time.Now()
+	shown := 0
+	logHint := fmt.Sprintf("see `%s logs %s`", config.Current().BinaryName, guestNameToSiding(sd.Container))
+	for time.Now().Before(deadline) {
+		if st, err := container.State(ctx, sd.Container); err == nil && st != "running" {
+			tail.Freeze()
+			return fmt.Errorf("guest exited (state=%s) before the app started — %s", st, logHint)
+		}
+		out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "cat "+appLogPath+" 2>/dev/null")
+		lines := strings.Split(out, "\n")
+		var fresh []string
+		if len(lines) > shown {
+			fresh = lines[shown:]
+			shown = len(lines)
+		}
+		tail.Update(fmt.Sprintf("⏳ waiting for %s to listen… (%s)", app.Runner, time.Since(start).Round(time.Second)), fresh)
+		if allPortsListening(ctx, app, sd) {
+			tail.Stop(fmt.Sprintf("✓ %s up (%s)", app.Runner, time.Since(start).Round(time.Second)))
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	tail.Freeze()
+	return fmt.Errorf("timed out waiting for %s to listen — %s", app.Runner, logHint)
+}
+
+// allPortsListening reports whether every front-door route's guestPort accepts a
+// connection inside the guest (socat is in the base image; sh has no /dev/tcp).
+func allPortsListening(ctx context.Context, app state.App, sd state.Siding) bool {
+	for _, r := range app.FrontDoor {
+		if r.GuestPort == 0 {
+			return false
+		}
+		out, _ := container.Exec(ctx, sd.Container, "sh", "-c",
+			fmt.Sprintf("socat -T1 /dev/null TCP:127.0.0.1:%d 2>/dev/null && echo up", r.GuestPort))
+		if !strings.Contains(out, "up") {
+			return false
+		}
+	}
+	return true
 }
