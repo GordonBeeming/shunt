@@ -136,14 +136,14 @@ func pickSidingInteractive(app state.App, names []string, fd int) (string, error
 		case b == 3 || b == 'q': // Ctrl-C / q
 			fmt.Fprint(os.Stdout, "\r\n")
 			return "", fmt.Errorf("cancelled")
-		case b == 0x1b: // escape — arrow key, or Esc to cancel
-			if in.Buffered() == 0 {
-				fmt.Fprint(os.Stdout, "\r\n")
-				return "", fmt.Errorf("cancelled")
-			}
+		case b == 0x1b: // escape sequence — arrow keys: ESC [ A/B or ESC O A/B
+			// (application-cursor mode). Read the next two bytes unconditionally;
+			// a bare Esc is rare here (q / Ctrl-C cancel), and the old
+			// Buffered()==0 guard mis-fired on arrows whose bytes weren't yet
+			// buffered (e.g. under tmux/cmux), bailing instead of moving.
 			b2, _ := in.ReadByte()
 			b3, _ := in.ReadByte()
-			if b2 == '[' {
+			if b2 == '[' || b2 == 'O' {
 				if b3 == 'A' && sel > 0 {
 					sel--
 				} else if b3 == 'B' && sel < len(names)-1 {
