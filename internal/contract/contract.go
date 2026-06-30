@@ -43,6 +43,11 @@ type Contract struct {
 	// offset). Use when the app's config + Entra redirect URIs point at specific
 	// ports. Only one channel can run the app at a time on those ports.
 	FixedPorts bool `json:"fixedPorts"`
+	// Memory caps each siding guest's RAM (Apple `container -m`, e.g. "16g").
+	// Heavy stacks (SQL + several services) need headroom; empty uses shunt's
+	// default. CPUs similarly caps cores (e.g. "4"); empty uses the default.
+	Memory string `json:"memory"`
+	CPUs   string `json:"cpus"`
 }
 
 // FrontDoorRoute is one stable port mapping in the contract.

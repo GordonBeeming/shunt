@@ -8,37 +8,42 @@ import (
 )
 
 // newConfigCmd groups shunt user-config commands. Config is per channel, stored
-// at <global-dir>/config.json.
+// at <global-dir>/config.json; a project's .shunt.app.json can override per app.
 func newConfigCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "config",
-		Short: "Get/set shunt user config",
+		Short: "Get/set shunt user config (defaults the contract can override per app)",
 	}
-	c.AddCommand(newConfigBranchPrefixCmd())
+	c.AddCommand(
+		configField("branchPrefix", "siding worktree branch prefix, e.g. gb/shunt/",
+			func(u *config.UserConfig) *string { return &u.BranchPrefix }, config.BranchPrefix),
+		configField("memory", "default per-guest RAM cap, e.g. 4g (bump heavy apps in their contract)",
+			func(u *config.UserConfig) *string { return &u.Memory }, config.GuestMemory),
+		configField("cpus", "default per-guest CPU cap, e.g. 4",
+			func(u *config.UserConfig) *string { return &u.CPUs }, config.GuestCPUs),
+	)
 	return c
 }
 
-// newConfigBranchPrefixCmd gets or sets the siding worktree branch prefix.
-func newConfigBranchPrefixCmd() *cobra.Command {
+// configField builds a `shunt config <name> [value]` get/set command for one
+// string field; `effective` prints the value-in-effect (with default applied).
+func configField(name, desc string, field func(*config.UserConfig) *string, effective func() string) *cobra.Command {
 	return &cobra.Command{
-		Use:   "branchPrefix [value]",
-		Short: "Get or set the siding worktree branch prefix (default \"shunt/\")",
-		Long: "With no value, prints the current prefix. With a value, sets it — e.g.\n" +
-			"`gb/shunt/` so siding branches already follow your branch convention and\n" +
-			"don't need renaming before push.",
-		Args: cobra.MaximumNArgs(1),
+		Use:   name + " [value]",
+		Short: "Get or set the " + desc,
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				fmt.Println(config.BranchPrefix())
+				fmt.Println(effective())
 				return nil
 			}
 			uc := config.LoadUserConfig()
-			uc.BranchPrefix = args[0]
+			*field(&uc) = args[0]
 			if err := config.SaveUserConfig(uc); err != nil {
 				return err
 			}
-			fmt.Printf("✓ branchPrefix = %q\n", uc.BranchPrefix)
-			fmt.Println("  applies to sidings created from now on; existing ones keep their branch")
+			fmt.Printf("✓ %s = %q\n", name, args[0])
+			fmt.Println("  applies to sidings created from now on")
 			return nil
 		},
 	}

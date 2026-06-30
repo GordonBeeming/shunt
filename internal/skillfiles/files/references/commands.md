@@ -22,7 +22,7 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 | `shunt-dev app switch <app>` | Make `<app>` active on its (fixed) front-door ports, parking any app that conflicts — without stopping the parked app's siding. For apps that share ports (e.g. Vite on the same port). |
 | `shunt-dev init` | One-time machine setup: builds Caddy + the base image, starts the proxy. |
 | `shunt-dev cert install` | Export the host's dotnet dev cert and load it into Caddy (front door serves HTTPS with the cert you already trust — no extra CA). |
-| `shunt-dev config branchPrefix [value]` | Get/set the prefix for siding worktree branches (default `shunt/`). Set e.g. `gb/shunt/` so siding branches follow your branch convention and are push/PR-ready as-is. Applies to sidings created after; stored per channel in `<global-dir>/config.json`. |
+| `shunt-dev config <branchPrefix|memory|cpus> [value]` | Get/set user-config defaults: `branchPrefix` (e.g. `gb/shunt/`), `memory` (per-guest RAM, default `4g`), `cpus` (default `4`). A repo's `.shunt.app.json` `memory`/`cpus` overrides per app. Stored per channel in `<global-dir>/config.json`. |
 
 ## The `.shunt.app.json` contract (one per repo)
 
@@ -56,4 +56,5 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 - `fixedPorts: true` pins the front door to the exact `listenPort` values (no channel offset) — required for host==guest when the app's config + Entra redirect URIs point at specific ports. Default (omit it) lets the channel offset apply so channels coexist (ports won't match the app then).
 - `prebakeImages` lists the dependency container images Aspire brings up. `shunt warm` keeps these in the host Docker cache and copies them into each siding, so guests never pull from the network. Re-run `app add` after editing the contract to apply changes.
 - `dataVolumes` lists the Docker named volumes (the `WithDataVolume` names from the AppHost) to seed each siding with the host's test data. shunt extracts each host volume to an APFS baseline **once** (the only slow step — a big SQL volume is copied a single time), then `cp -c` copy-on-write clones it per siding (instant, shares blocks until written) and points a guest Docker volume at the clone — so every siding starts with your real data, cheaply, and `rm` frees the clone. Omit for a clean per-siding DB.
+- `memory`/`cpus` cap each siding guest (e.g. `"memory": "12g"`) — heavy stacks (SQL + several services) need headroom; omit to use the `shunt config` default (`4g`/`4`). Changing them needs `shunt reapply <siding>` (caps are fixed at guest creation).
 - shunt has no app-specific logic; this file is the only per-repo config.

@@ -46,7 +46,10 @@ type App struct {
 	PrebakeImages []string          `json:"prebakeImages,omitempty"`
 	// Docker named volumes cloned from the host's Docker into each siding's guest
 	// Docker on `new`, so sidings start with the host's test data.
-	Volumes []string          `json:"volumes,omitempty"`
+	Volumes []string `json:"volumes,omitempty"`
+	// Per-guest resource caps (Apple `container`); empty uses shunt's defaults.
+	Memory  string            `json:"memory,omitempty"`
+	CPUs    string            `json:"cpus,omitempty"`
 	Sidings map[string]Siding `json:"sidings"`
 	LiveSiding    string            `json:"liveSiding"` // "" = nothing live
 }

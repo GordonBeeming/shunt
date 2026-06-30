@@ -12,14 +12,22 @@ import (
 	"path/filepath"
 )
 
-// DefaultBranchPrefix is the siding worktree branch prefix when the user hasn't
-// set one. Override it (e.g. to "gb/shunt/") so siding branches already follow
-// your branch convention and don't need renaming before push.
-const DefaultBranchPrefix = "shunt/"
+// Defaults applied when the user hasn't set a value (and the contract doesn't
+// override). BranchPrefix override (e.g. "gb/shunt/") keeps siding branches on
+// your convention; Memory/CPUs cap each guest — keep the default modest so many
+// sidings coexist, and bump heavy apps via the contract or `shunt config`.
+const (
+	DefaultBranchPrefix = "shunt/"
+	DefaultGuestMemory  = "4g"
+	DefaultGuestCPUs    = "4"
+)
 
-// UserConfig holds per-user shunt preferences at <GlobalDir>/config.json.
+// UserConfig holds per-user shunt preferences at <GlobalDir>/config.json. Empty
+// fields fall back to the defaults above (via the accessors).
 type UserConfig struct {
-	BranchPrefix string `json:"branchPrefix"`
+	BranchPrefix string `json:"branchPrefix,omitempty"`
+	Memory       string `json:"memory,omitempty"`
+	CPUs         string `json:"cpus,omitempty"`
 }
 
 // UserConfigPath is <GlobalDir>/config.json for this channel.
@@ -31,9 +39,10 @@ func UserConfigPath() (string, error) {
 	return filepath.Join(dir, "config.json"), nil
 }
 
-// LoadUserConfig reads the user config, falling back to defaults.
+// LoadUserConfig reads the raw user config (unset fields stay empty; accessors
+// apply defaults).
 func LoadUserConfig() UserConfig {
-	uc := UserConfig{BranchPrefix: DefaultBranchPrefix}
+	var uc UserConfig
 	path, err := UserConfigPath()
 	if err != nil {
 		return uc
@@ -43,9 +52,6 @@ func LoadUserConfig() UserConfig {
 		return uc
 	}
 	_ = json.Unmarshal(data, &uc)
-	if uc.BranchPrefix == "" {
-		uc.BranchPrefix = DefaultBranchPrefix
-	}
 	return uc
 }
 
@@ -65,8 +71,20 @@ func SaveUserConfig(uc UserConfig) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
 // BranchPrefix is the configured siding-branch prefix (default "shunt/").
-func BranchPrefix() string { return LoadUserConfig().BranchPrefix }
+func BranchPrefix() string { return orDefault(LoadUserConfig().BranchPrefix, DefaultBranchPrefix) }
+
+// GuestMemory / GuestCPUs are the user-configured per-guest defaults (the contract
+// can override per app); they fall back to the package defaults.
+func GuestMemory() string { return orDefault(LoadUserConfig().Memory, DefaultGuestMemory) }
+func GuestCPUs() string   { return orDefault(LoadUserConfig().CPUs, DefaultGuestCPUs) }
 
 // Channel is set at build time via:
 //

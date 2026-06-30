@@ -146,10 +146,11 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 		Image:     config.BaseImageTag(),
 		Init:      true,
 		CapAddAll: true,
-		// Heavy Aspire stacks (SQL Server, Azurite, several projects + the nested
-		// Docker daemon) need real headroom; the runtime default of ~1 GB OOMs.
-		Memory: "6g",
-		CPUs:   "4",
+		// Per-guest caps: the contract wins (heavy stacks like SQL + several
+		// projects + nested Docker need headroom), else the user-config default,
+		// else shunt's default. The runtime's own ~1 GB default OOMs Aspire.
+		Memory: orDefaultStr(app.Memory, config.GuestMemory()),
+		CPUs:   orDefaultStr(app.CPUs, config.GuestCPUs()),
 		// Rosetta lets amd64-only images (SQL Server) run on the arm64 guest —
 		// the same x86 translation Docker Desktop uses; qemu segfaults SQL Server.
 		Rosetta: true,
@@ -687,4 +688,62 @@ func Restart(ctx context.Context, app state.App, sd state.Siding) error {
 		return err
 	}
 	return WaitReady(ctx, app, sd, 15*time.Minute)
+}
+
+// orDefaultStr returns v if non-empty, else def.
+func orDefaultStr(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+// Recreate rebuilds a siding's guest with the current app config (memory, cpus,
+// mounts, env) — for "reapply config to an existing siding". It keeps the
+// worktree, branch, and data (the on-disk src + cp -c volume clones), replacing
+// only the container, so guest-creation settings take effect. Run `up` after to
+// start the app (the guest's Docker is fresh, so bind volumes + bridges rebuild).
+func Recreate(ctx context.Context, app state.App, sd state.Siding) (state.Siding, error) {
+	src, volRoot := Paths(app, sd.Name)
+	mounts := []container.Mount{{Host: src, Guest: "/workspace"}}
+	for _, vol := range app.Volumes {
+		host := filepath.Join(volRoot, vol)
+		if _, err := os.Stat(host); err == nil {
+			mounts = append(mounts, container.Mount{Host: host, Guest: "/mnt/dvol/" + vol})
+		}
+	}
+	for _, m := range app.Mounts {
+		host, err := expandHome(m.Host)
+		if err != nil {
+			return sd, err
+		}
+		mounts = append(mounts, container.Mount{Host: host, Guest: m.Guest, ReadOnly: m.ReadOnly})
+	}
+	if nugetHost, err := expandHome("~/.nuget/packages"); err == nil {
+		if _, statErr := os.Stat(nugetHost); statErr == nil {
+			mounts = append(mounts, container.Mount{Host: nugetHost, Guest: "/root/.nuget/packages"})
+		}
+	}
+	if IsWarmed(app) {
+		mounts = append(mounts, container.Mount{Host: WarmTarPath(app), Guest: guestWarmTar, ReadOnly: true})
+	}
+	if err := container.Remove(ctx, sd.Container); err != nil {
+		return sd, err
+	}
+	if err := container.Run(ctx, container.RunOpts{
+		Name:      sd.Container,
+		Image:     config.BaseImageTag(),
+		Init:      true,
+		CapAddAll: true,
+		Memory:    orDefaultStr(app.Memory, config.GuestMemory()),
+		CPUs:      orDefaultStr(app.CPUs, config.GuestCPUs()),
+		Rosetta:   true,
+		Mounts:    mounts,
+		Env:       guestEnv(app),
+		Cmd:       []string{"/bin/sh", "-lc", "exec sleep infinity"},
+	}); err != nil {
+		return sd, err
+	}
+	sd.Bridges = map[string]int{} // fresh guest Docker — rebuild bind volumes + bridges on next up
+	return sd, nil
 }

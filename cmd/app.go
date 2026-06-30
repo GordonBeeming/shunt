@@ -81,6 +81,8 @@ func newAppAddCmd() *cobra.Command {
 				Mounts:        ct.Mounts,
 				PrebakeImages: ct.PrebakeImages,
 				Volumes:       ct.Volumes,
+				Memory:        ct.Memory,
+				CPUs:          ct.CPUs,
 				Sidings:       map[string]state.Siding{},
 			}
 			if updating {
