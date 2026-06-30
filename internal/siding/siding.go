@@ -34,11 +34,6 @@ const (
 	rsExtPort = 38890
 
 	startedMarker = "Distributed application started"
-
-	// volumeCopyLimitMB caps the full-copy data-volume clone. Above it, a per-
-	// siding byte copy is impractical (e.g. a 50 GB SQL volume) and needs a
-	// copy-on-write clone instead, so CloneVolumes skips it with a warning.
-	volumeCopyLimitMB = 2048
 )
 
 // Paths returns the host src and vol-root paths for a siding under the app's
@@ -104,12 +99,19 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 	}
 
 	mounts := []container.Mount{{Host: src, Guest: "/workspace"}}
-	for _, dv := range app.DataVolumes {
-		host := filepath.Join(volRoot, dv.Resource)
-		if err := fsclone.CloneVolume(ctx, filepath.Join(app.ConfigDir, "baseline", dv.Resource), host); err != nil {
+	// Copy-on-write each declared data volume from the project baseline (cp -c,
+	// instant + shares blocks) and bind-mount it at /mnt/dvol/<vol>; `up` then
+	// points a guest Docker volume at it so Aspire mounts the host's test data.
+	for _, vol := range app.Volumes {
+		base := baselineDir(app, vol)
+		if _, err := os.Stat(base); err != nil {
+			continue // no baseline (host lacked it) — this siding starts empty for it
+		}
+		host := filepath.Join(volRoot, vol)
+		if err := fsclone.CloneVolume(ctx, base, host); err != nil {
 			return state.Siding{}, err
 		}
-		mounts = append(mounts, container.Mount{Host: host, Guest: dv.GuestPath})
+		mounts = append(mounts, container.Mount{Host: host, Guest: "/mnt/dvol/" + vol})
 	}
 	// Explicit per-project mounts from the contract (e.g. user-secrets) — shunt
 	// honors these verbatim, no app-specific magic.
@@ -581,15 +583,18 @@ func AppRunning(ctx context.Context, app state.App, sd state.Siding) bool {
 	return allPortsListening(ctx, app, sd)
 }
 
-// CloneVolumes copies each declared Docker named volume from the host's Docker
-// into the siding guest's Docker, so services start with the host's test data
-// instead of an empty store. It's one-time per siding — a `.shunt-cloned` marker
-// inside the volume guards re-runs so a rebuild never clobbers siding data — and
-// must run before the app starts (so SQL etc. mount the populated volume). It
-// streams a gzip tar host->guest; no shared daemon, registry, or mount. Requires
-// host Docker (online once, to pull the tiny alpine helper) and a running guest
-// dockerd. Non-fatal failures are surfaced by the caller.
-func CloneVolumes(ctx context.Context, app state.App, sd state.Siding) error {
+// baselineDir is where a project's one-time host-volume extraction lives — the
+// APFS source each siding cp -c clones from.
+func baselineDir(app state.App, vol string) string {
+	return filepath.Join(app.ConfigDir, "baseline", vol)
+}
+
+// EnsureVolumeBaselines extracts each declared host Docker named volume to an
+// APFS baseline dir under the project's config (one-time, the only expensive
+// step — e.g. a 50 GB SQL volume copied once), so `new` can cp -c (copy-on-write)
+// an instant per-siding clone from it. Skips volumes already extracted or absent
+// on the host. Requires host Docker (online once for the tiny alpine helper).
+func EnsureVolumeBaselines(ctx context.Context, app state.App) error {
 	if len(app.Volumes) == 0 {
 		return nil
 	}
@@ -598,37 +603,45 @@ func CloneVolumes(ctx context.Context, app state.App, sd state.Siding) error {
 		return nil
 	}
 	for _, vol := range app.Volumes {
-		dst := "/var/lib/docker/volumes/" + vol + "/_data"
-		if out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "test -f "+dst+"/.shunt-cloned && echo done"); strings.Contains(out, "done") {
-			continue // already cloned into this siding
+		base := baselineDir(app, vol)
+		if _, err := os.Stat(base); err == nil {
+			continue // already extracted
 		}
 		if !hostdocker.HasVolume(ctx, vol) {
 			fmt.Printf("  (skip data volume %q — not on host Docker)\n", vol)
 			continue
 		}
-		// Full-copy is fine for small volumes but ruinous for large ones (a 50 GB
-		// SQL volume per siding defeats parallel sidings). Guard it until a COW /
-		// bind-backed clone lands for big DBs.
-		if mb := hostdocker.VolumeSizeMB(ctx, vol); mb > volumeCopyLimitMB {
-			fmt.Printf("  ⚠ skipping data volume %q — %d MB exceeds the %d MB full-copy limit; needs a COW clone (siding starts empty for it)\n",
-				vol, mb, volumeCopyLimitMB)
-			continue
+		fmt.Printf("• extracting data volume %q from host (one-time baseline)…\n", vol)
+		if err := os.MkdirAll(base, 0o755); err != nil {
+			return err
 		}
-		fmt.Printf("• cloning data volume %q from host…\n", vol)
-		tar := filepath.Join(os.TempDir(), "shunt-vol-"+vol+".tgz")
-		if err := hostdocker.ExportVolume(ctx, vol, tar); err != nil {
-			return fmt.Errorf("export host volume %q: %w", vol, err)
+		if err := hostdocker.ExtractVolumeToDir(ctx, vol, base); err != nil {
+			_ = os.RemoveAll(base) // don't leave a half-extracted baseline
+			return fmt.Errorf("extract host volume %q: %w", vol, err)
 		}
-		if _, err := container.Exec(ctx, sd.Container, "docker", "volume", "create", vol); err != nil {
-			_ = os.Remove(tar)
-			return fmt.Errorf("create guest volume %q: %w", vol, err)
+	}
+	return nil
+}
+
+// CreateBindVolumes points a guest Docker named volume at each siding's cp -c
+// clone (bind-mounted at /mnt/dvol/<vol>), so Aspire's WithDataVolume(<vol>)
+// mounts the host's copy-on-write data instead of an empty store. Runs after
+// dockerd is up and before the app starts; idempotent (skips volumes already
+// created, and routes Spin didn't clone because there was no baseline).
+func CreateBindVolumes(ctx context.Context, app state.App, sd state.Siding) error {
+	for _, vol := range app.Volumes {
+		dev := "/mnt/dvol/" + vol
+		if out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "test -d "+dev+" && echo yes"); !strings.Contains(out, "yes") {
+			continue // no cp -c clone mounted for this volume
 		}
-		if err := container.ExecStdinFile(ctx, sd.Container, tar, "tar", "xzpf", "-", "--numeric-owner", "-C", dst); err != nil {
-			_ = os.Remove(tar)
-			return fmt.Errorf("import volume %q into siding: %w", vol, err)
+		if out, _ := container.Exec(ctx, sd.Container, "docker", "volume", "inspect", vol); strings.Contains(out, vol) {
+			continue // already created
 		}
-		_, _ = container.Exec(ctx, sd.Container, "touch", dst+"/.shunt-cloned")
-		_ = os.Remove(tar)
+		if _, err := container.Exec(ctx, sd.Container, "docker", "volume", "create",
+			"--driver", "local", "--opt", "type=none", "--opt", "o=bind", "--opt", "device="+dev, vol); err != nil {
+			return fmt.Errorf("create bind-backed volume %q: %w", vol, err)
+		}
+		fmt.Printf("  data volume %q backed by host copy-on-write clone\n", vol)
 	}
 	return nil
 }

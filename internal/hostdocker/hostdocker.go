@@ -6,7 +6,6 @@ package hostdocker
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
@@ -70,26 +69,17 @@ func HasVolume(ctx context.Context, vol string) bool {
 	return err == nil
 }
 
-// VolumeSizeMB returns the on-disk size of a host Docker named volume in MB
-// (0 on error), so callers can avoid full-copying very large volumes.
-func VolumeSizeMB(ctx context.Context, vol string) int {
-	res, err := proc.Run(ctx, "docker", "run", "--rm", "-v", vol+":/from:ro", "alpine", "du", "-sm", "/from")
+// ExtractVolumeToDir copies a host Docker named volume's contents into a host
+// directory (an APFS baseline shunt later cp -c clones per siding). A throwaway
+// alpine container does the copy because named-volume data isn't reachable from
+// the host filesystem directly; `cp -a` preserves numeric ownership (e.g. mssql's
+// uid) and timestamps so the data lands intact.
+func ExtractVolumeToDir(ctx context.Context, vol, dir string) error {
+	_, err := proc.Run(ctx, "docker", "run", "--rm",
+		"-v", vol+":/from:ro", "-v", dir+":/to",
+		"alpine", "cp", "-a", "/from/.", "/to")
 	if err != nil {
-		return 0
+		return fmt.Errorf("extract volume %s: %w", vol, err)
 	}
-	fields := strings.Fields(res.Stdout)
-	if len(fields) == 0 {
-		return 0
-	}
-	mb, _ := strconv.Atoi(fields[0])
-	return mb
-}
-
-// ExportVolume streams a host Docker named volume's contents to a gzip tar at
-// outPath. A throwaway alpine container reads the volume because named-volume
-// data isn't reachable from the host filesystem directly; --numeric-owner keeps
-// the data's uids/gids so it lands correctly in the siding (e.g. mssql's uid).
-func ExportVolume(ctx context.Context, vol, outPath string) error {
-	return proc.RunToFile(ctx, outPath, "docker", "run", "--rm", "-v", vol+":/from:ro",
-		"alpine", "tar", "czf", "-", "--numeric-owner", "-C", "/from", ".")
+	return nil
 }

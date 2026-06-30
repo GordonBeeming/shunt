@@ -30,6 +30,12 @@ func newNewCmd() *cobra.Command {
 				return err
 			}
 
+			// One-time per project: extract declared host data volumes to APFS
+			// baselines so Spin can cp -c an instant copy-on-write clone per siding.
+			if err := siding.EnsureVolumeBaselines(ctx, app); err != nil {
+				return err
+			}
+
 			fmt.Printf("• creating worktree + launching idle guest for %q…\n", name)
 			sd, err := siding.Spin(ctx, app, name, branch)
 			if err != nil {
