@@ -12,13 +12,16 @@ import (
 )
 
 // AddWorktree creates a git worktree of repoPath at dest, on a fresh branch
-// (newBranch) based on baseBranch (default "main"). A worktree off main keeps the
-// siding independent of GitButler's churn on the workspace branch, and inherits
-// the repo's signing config (no separate signing setup). It is created in the
-// host repo's .git; GitButler ignores extra worktrees on their own branches.
+// (newBranch) based on baseBranch. baseBranch defaults to HEAD — the repo's
+// CURRENT state — which for a GitButler repo is the workspace commit (all applied
+// virtual branches merged), i.e. the code you're actually working on. Basing off
+// a long-lived branch like `main` would run stale code, since GitButler only
+// advances main on integrate/push. The new branch is a frozen snapshot, so
+// GitButler's later workspace rewrites don't affect it; it inherits the repo's
+// signing config, and GitButler ignores extra worktrees on their own branches.
 func AddWorktree(ctx context.Context, repoPath, dest, newBranch, baseBranch string) error {
 	if baseBranch == "" {
-		baseBranch = "main"
+		baseBranch = "HEAD"
 	}
 	// Drop any stale registration from a previous siding at this path.
 	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "prune")
