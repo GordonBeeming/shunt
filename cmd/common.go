@@ -40,3 +40,29 @@ func gitOrigin(ctx context.Context, repoPath string) string {
 	}
 	return strings.TrimSpace(res.Stdout)
 }
+
+// routeURL formats a front-door route as a browsable localhost address (https
+// when the route terminates TLS), so we show localhost rather than guest IPs.
+func routeURL(r state.Route) string {
+	if r.Kind == state.KindHTTP {
+		scheme := "http"
+		if r.TLS {
+			scheme = "https"
+		}
+		return fmt.Sprintf("%s://localhost:%d", scheme, r.ListenPort)
+	}
+	return fmt.Sprintf("localhost:%d (tcp)", r.ListenPort)
+}
+
+// printFrontDoor lists an app's front-door routes as localhost URLs to browse to,
+// flagging any that aren't bridged yet (partial activation).
+func printFrontDoor(app state.App, sd state.Siding) {
+	fmt.Println("  front door (browse to):")
+	for _, r := range app.FrontDoor {
+		note := ""
+		if _, ok := sd.Bridges[r.Key]; !ok {
+			note = "  (pending — not up yet)"
+		}
+		fmt.Printf("    %-8s %s%s\n", r.Key, routeURL(r), note)
+	}
+}

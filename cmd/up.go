@@ -99,13 +99,18 @@ func newUpCmd() *cobra.Command {
 			if err := state.SaveApp(app); err != nil {
 				return err
 			}
-			fmt.Printf("✓ %q is up — dashboard %s\n", name, siding.DashboardURL(sd))
+			fmt.Printf("✓ %q is up\n", name)
 
 			if noSwitch {
 				fmt.Printf("  run `"+bin()+" switch %s` to point the stable ports at it\n", name)
 				return nil
 			}
-			return switchTo(ctx, &app, name)
+			if err := switchTo(ctx, &app, name); err != nil {
+				return err
+			}
+			printFrontDoor(app, app.Sidings[name])
+			fmt.Printf("  dashboard (guest): %s\n", siding.DashboardURL(sd))
+			return nil
 		},
 	}
 	c.Flags().BoolVar(&noSwitch, "no-switch", false, "start it but don't point the front door at it")
