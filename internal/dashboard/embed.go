@@ -20,5 +20,8 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Don't let the browser cache the page — a stale copy loaded over http would
+	// keep polling http against the https-only server and read as "unreachable".
+	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(data)
 }
