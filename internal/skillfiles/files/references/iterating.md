@@ -2,7 +2,7 @@
 
 ## Why the first run is slow (and how to fix it)
 
-A siding's guest starts with an empty Docker store. So the first `up` rebuilds any custom dependency images (a SQL+FTS image can be ~6 GB) and re-pulls everything from scratch — that's the ~20–30 min. A native `aspire start` only feels fast because the host's Docker already has those images cached from an earlier run; a genuinely clean native run is just as slow.
+A siding's guest starts with an empty Docker store. So the first `up` rebuilds any custom dependency images (a SQL+FTS image can be ~6 GB) and re-pulls everything from scratch — that's the ~20–30 min. A native run only feels fast because the host's Docker already has those images cached from an earlier run; a genuinely clean native run is just as slow.
 
 The fix is `shunt warm` — it treats the **host** Docker daemon as the canonical cache:
 
@@ -16,10 +16,10 @@ shunt-dev new exp1 && shunt-dev up exp1   # the guest docker-loads the cache →
 
 ## Three tiers — never drop the whole environment to see a change
 
-The guest, its Docker daemon, and the dependency containers (SQL etc.) are separate from the AppHost process. Touch only what you need:
+The guest, its Docker daemon, and the dependency containers (SQL etc.) are separate from the app process. Touch only what you need:
 
-1. **Edit → hot reload.** `up` runs the AppHost under `dotnet watch`, so most code edits reload live (it's mounted from the host). Watch is best-effort — it won't catch everything.
-2. **`shunt restart <name>` → full rebuild, env preserved.** When watch misses a change or you want a clean build: this kills only the AppHost and re-runs it, leaving the guest, dockerd, dependency containers, and their data up. No pull, no data loss.
+1. **Edit → hot reload.** `up` runs the app with hot reload where the runner supports it (e.g. .NET `dotnet watch`), so most code edits reload live (it's mounted from the host). Watch is best-effort — it won't catch everything.
+2. **`shunt restart <name>` → full rebuild, env preserved.** When watch misses a change or you want a clean build: this kills only the app process and re-runs it, leaving the guest, dockerd, dependency containers, and their data up. No pull, no data loss.
 3. **`shunt up` → cold start.** Only `rm` + `new` is a real teardown (fresh worktree + data).
 
 So the loop is: `up` once, then edit-and-hot-reload, and reach for `restart` when watch falls short. You should rarely pay the cold start again on a warmed project.

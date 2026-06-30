@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Print shunt status for the current repo and the recommended next command.
-# Run from inside an Aspire repo (or a siding). Override the binary with SHUNT_BIN.
+# Run from inside a shunt repo (or a siding). Override the binary with SHUNT_BIN.
 set -euo pipefail
 BIN="${SHUNT_BIN:-shunt-dev}"
 
