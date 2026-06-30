@@ -91,6 +91,7 @@ func RunStdin(ctx context.Context, stdinPath, name string, args ...string) error
 	defer f.Close()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdin = f
+	cmd.Stdout = os.Stdout // surface progress (e.g. `docker load` "Loaded image:" lines)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
