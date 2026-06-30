@@ -23,7 +23,12 @@ func AddWorktree(ctx context.Context, repoPath, dest, newBranch, baseBranch stri
 	if baseBranch == "" {
 		baseBranch = "HEAD"
 	}
-	// Drop any stale registration from a previous siding at this path.
+	// Clear any existing worktree at this path first — a previous siding of this
+	// name, or a half-finished `new` that failed after creating the worktree,
+	// leaves it checked out on newBranch, and `-B` can't force-update a branch
+	// still in use by a live worktree. Remove + prune frees the branch so the add
+	// below succeeds on retry.
+	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "remove", "--force", dest)
 	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "prune")
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return fmt.Errorf("create siding dir: %w", err)
