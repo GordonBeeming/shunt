@@ -199,7 +199,10 @@ func DockerPort(ctx context.Context, guest, containerName string) int {
 // fail to take, so this relaunches socat until the port is actually listening.
 func Bridge(ctx context.Context, name string, extPort, intPort int) error {
 	spec := fmt.Sprintf("socat TCP-LISTEN:%d,fork,reuseaddr TCP:127.0.0.1:%d", extPort, intPort)
-	listening := fmt.Sprintf("pgrep -f 'TCP-LISTEN:%d,' >/dev/null 2>&1 && echo up", extPort)
+	// Confirm the bridge by actually connecting to it — not by pgrep, which
+	// matches the launching `sh -c 'socat …'` wrapper before socat has bound the
+	// port (a false positive that left discovery dialing a dead bridge).
+	listening := fmt.Sprintf("socat -T1 /dev/null TCP:127.0.0.1:%d 2>/dev/null && echo up", extPort)
 	var lastErr error
 	for attempt := 0; attempt < 10; attempt++ {
 		if out, _ := Exec(ctx, name, "sh", "-c", listening); strings.Contains(out, "up") {
