@@ -34,6 +34,11 @@ const (
 	rsExtPort = 38890
 
 	startedMarker = "Distributed application started"
+
+	// volumeCopyLimitMB caps the full-copy data-volume clone. Above it, a per-
+	// siding byte copy is impractical (e.g. a 50 GB SQL volume) and needs a
+	// copy-on-write clone instead, so CloneVolumes skips it with a warning.
+	volumeCopyLimitMB = 2048
 )
 
 // Paths returns the host src and vol-root paths for a siding under the app's
@@ -599,6 +604,14 @@ func CloneVolumes(ctx context.Context, app state.App, sd state.Siding) error {
 		}
 		if !hostdocker.HasVolume(ctx, vol) {
 			fmt.Printf("  (skip data volume %q — not on host Docker)\n", vol)
+			continue
+		}
+		// Full-copy is fine for small volumes but ruinous for large ones (a 50 GB
+		// SQL volume per siding defeats parallel sidings). Guard it until a COW /
+		// bind-backed clone lands for big DBs.
+		if mb := hostdocker.VolumeSizeMB(ctx, vol); mb > volumeCopyLimitMB {
+			fmt.Printf("  ⚠ skipping data volume %q — %d MB exceeds the %d MB full-copy limit; needs a COW clone (siding starts empty for it)\n",
+				vol, mb, volumeCopyLimitMB)
 			continue
 		}
 		fmt.Printf("• cloning data volume %q from host…\n", vol)

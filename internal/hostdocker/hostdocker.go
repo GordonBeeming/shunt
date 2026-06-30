@@ -6,6 +6,7 @@ package hostdocker
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
@@ -67,6 +68,21 @@ func Save(ctx context.Context, images []string, outPath string) error {
 func HasVolume(ctx context.Context, vol string) bool {
 	_, err := proc.Run(ctx, "docker", "volume", "inspect", vol)
 	return err == nil
+}
+
+// VolumeSizeMB returns the on-disk size of a host Docker named volume in MB
+// (0 on error), so callers can avoid full-copying very large volumes.
+func VolumeSizeMB(ctx context.Context, vol string) int {
+	res, err := proc.Run(ctx, "docker", "run", "--rm", "-v", vol+":/from:ro", "alpine", "du", "-sm", "/from")
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(res.Stdout)
+	if len(fields) == 0 {
+		return 0
+	}
+	mb, _ := strconv.Atoi(fields[0])
+	return mb
 }
 
 // ExportVolume streams a host Docker named volume's contents to a gzip tar at
