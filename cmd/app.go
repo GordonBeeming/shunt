@@ -160,7 +160,7 @@ func newAppAddCmd() *cobra.Command {
 			for _, r := range app.FrontDoor {
 				fmt.Printf("  %-10s %-6s localhost:%d  ->  %s/%s\n", r.Key, r.Kind, r.ListenPort, r.Resource, r.Endpoint)
 			}
-			fmt.Printf("next: `" + bin() + " new <name>` to create a siding\n")
+			fmt.Println("next: `" + bin() + " new <name>` to create a siding")
 			return nil
 		},
 	}

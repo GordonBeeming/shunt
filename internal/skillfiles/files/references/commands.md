@@ -29,8 +29,9 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
   "stop": "aspire stop",                   // optional clean-stop command (shunt force-kills as a fallback)
   "workdir": "src/web",                    // non-aspire: dir to run start in (relative)
   "frontDoor": [
-    { "key": "web", "kind": "http",   "listenPort": 8080,  "resource": "<aspire-resource>", "endpoint": "http" },
-    { "key": "db",  "kind": "layer4", "listenPort": 11433, "resource": "<sql-resource>",     "endpoint": "tcp" }
+    // host == guest: listenPort/guestPort = the app's real port (its launchSettings port for aspire)
+    { "key": "web", "kind": "http",   "listenPort": 7011, "guestPort": 7011, "resource": "<aspire-resource>", "endpoint": "https", "tls": true },
+    { "key": "db",  "kind": "layer4", "listenPort": 2100, "guestPort": 2100, "resource": "<sql-resource>",     "endpoint": "tcp" }
   ],
   "mounts": [
     { "host": "~/.microsoft/usersecrets", "guest": "/root/.microsoft/usersecrets", "readOnly": true }
@@ -44,8 +45,9 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 ```
 
 - `runner` is how the app starts. **aspire** keeps gRPC discovery; **dotnet**/**node**/**custom** use `start` + a per-route `guestPort` (the in-guest port the app binds — no discovery, shunt waits for it to listen). `app add` auto-detects (AppHost→aspire, package.json→node, .csproj→dotnet) and asks if it can't.
-- `frontDoor` maps Aspire resources/endpoints to stable local ports (the host:port you and Entra always hit). `kind` is `http` (web) or `layer4` (raw TCP, e.g. SQL). **HTTP routes serve HTTPS** at the front door via Caddy's internal CA (trusted on the host); the proxy reaches the app over TLS with skip-verify. `layer4` routes stay raw TCP.
+- `frontDoor` maps each service to a stable local port (the host:port you and Entra always hit). `kind` is `http` (web) or `layer4` (raw TCP, e.g. SQL). **HTTP routes serve HTTPS** at the front door using the **.NET dev cert** (run `shunt cert install` once so it's trusted); the proxy reaches the app over TLS with skip-verify. `layer4` routes stay raw TCP.
+- **Ports are host == guest.** Set each route's `listenPort` (and `guestPort`) to the app's *actual* port — for Aspire that's the project's launchSettings port (e.g. `https://localhost:7011` → `7011`), not a made-up number. shunt runs the Aspire AppHost **with** its launch profile so the projects bind those exact ports, then bridges each to the same number on the guest IP, so the front door is `localhost:7011 → guest:7011`. No random bridge ports.
 - `mounts` carries per-project host paths into the guest — typically the dev's user-secrets so Aspire parameters resolve.
-- `fixedPorts: true` pins the front door to the exact `listenPort` values (no channel offset) — use when the app's config + Entra redirect URIs point at specific ports. Default (omit it) lets the channel offset apply so channels coexist.
+- `fixedPorts: true` pins the front door to the exact `listenPort` values (no channel offset) — required for host==guest when the app's config + Entra redirect URIs point at specific ports. Default (omit it) lets the channel offset apply so channels coexist (ports won't match the app then).
 - `prebakeImages` lists the dependency container images Aspire brings up. `shunt warm` keeps these in the host Docker cache and copies them into each siding, so guests never pull from the network. Re-run `app add` after editing the contract to apply changes.
 - shunt has no app-specific logic; this file is the only per-repo config.

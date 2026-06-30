@@ -26,7 +26,7 @@ func newSwitchCmd() *cobra.Command {
 				return err
 			}
 			if len(app.Sidings) == 0 {
-				return fmt.Errorf("no sidings yet — run `"+bin()+" new <name>` first")
+				return fmt.Errorf("no sidings yet — run `%s new <name>` first", bin())
 			}
 			var name string
 			if len(args) == 1 {

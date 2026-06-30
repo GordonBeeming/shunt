@@ -195,14 +195,26 @@ func DockerPort(ctx context.Context, guest, containerName string) int {
 // Aspire binds the resource service and app/dep endpoints to loopback, so this
 // is how shunt makes them reachable for discovery and proxying.
 //
+// bindIP pins socat's listen address. Pass the guest IP so the bridge can reuse
+// the app's exact port number (extPort == intPort, host == guest) without
+// colliding with the app's own 127.0.0.1:<port> — binding the guest IP and
+// loopback are separate addresses. Pass "" to listen on all interfaces (used for
+// shunt-internal bridges like the resource service, where extPort != intPort).
+//
 // On a busy guest (e.g. SQL Server starting under Rosetta) a detached exec can
 // fail to take, so this relaunches socat until the port is actually listening.
-func Bridge(ctx context.Context, name string, extPort, intPort int) error {
-	spec := fmt.Sprintf("socat TCP-LISTEN:%d,fork,reuseaddr TCP:127.0.0.1:%d", extPort, intPort)
+func Bridge(ctx context.Context, name, bindIP string, extPort, intPort int) error {
+	listen := fmt.Sprintf("TCP-LISTEN:%d,fork,reuseaddr", extPort)
+	probe := "127.0.0.1"
+	if bindIP != "" {
+		listen = fmt.Sprintf("TCP-LISTEN:%d,bind=%s,fork,reuseaddr", extPort, bindIP)
+		probe = bindIP
+	}
+	spec := fmt.Sprintf("socat %s TCP:127.0.0.1:%d", listen, intPort)
 	// Confirm the bridge by actually connecting to it — not by pgrep, which
 	// matches the launching `sh -c 'socat …'` wrapper before socat has bound the
 	// port (a false positive that left discovery dialing a dead bridge).
-	listening := fmt.Sprintf("socat -T1 /dev/null TCP:127.0.0.1:%d 2>/dev/null && echo up", extPort)
+	listening := fmt.Sprintf("socat -T1 /dev/null TCP:%s:%d 2>/dev/null && echo up", probe, extPort)
 	var lastErr error
 	for attempt := 0; attempt < 10; attempt++ {
 		if out, _ := Exec(ctx, name, "sh", "-c", listening); strings.Contains(out, "up") {

@@ -27,10 +27,10 @@ const (
 	guestDashboardPort = 18888
 	guestRSPort        = 18890
 
-	// Guest-external (0.0.0.0) ports the in-guest socat bridges listen on. Reused
-	// across guests since each guest has its own IP.
-	rsExtPort    = 38890
-	routeExtBase = 39001
+	// rsExtPort is the guest-external (0.0.0.0) port the in-guest socat bridge for
+	// the resource service listens on. Front-door route bridges instead reuse each
+	// route's own port on the guest IP (host == guest); see Activate.
+	rsExtPort = 38890
 
 	startedMarker = "Distributed application started"
 )
@@ -200,7 +200,12 @@ func EnsureDockerd(ctx context.Context, sd state.Siding) error {
 func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 	var runCmd string
 	if app.Runner == "" || app.Runner == runner.Aspire {
-		runCmd = fmt.Sprintf("cd /workspace && dotnet run --no-launch-profile --project %s > %s 2>&1",
+		// Run WITH the launch profile so each project binds the fixed ports from
+		// its launchSettings (7011, 5001, …) — the ports the contract front-doors
+		// host==guest — instead of Aspire-assigned ones. shunt's pinned dashboard/
+		// resource-service ports come from explicit ASPIRE_* env (not launchSettings),
+		// so discovery still connects on 18888/18890.
+		runCmd = fmt.Sprintf("cd /workspace && dotnet run --project %s > %s 2>&1",
 			app.AppHostPath, appLogPath)
 	} else {
 		wd := "/workspace"
@@ -356,12 +361,14 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 	// Non-aspire runners have no gRPC resource service — bridge each route's
 	// declared in-guest port straight to the front door (no discovery).
 	if app.Runner != "" && app.Runner != runner.Aspire {
-		for i, r := range app.FrontDoor {
+		for _, r := range app.FrontDoor {
 			if r.GuestPort == 0 {
 				return fmt.Errorf("route %q: a non-aspire app needs `guestPort` in .shunt.app.json", r.Key)
 			}
-			ext := routeExtBase + i
-			if err := container.Bridge(ctx, sd.Container, ext, r.GuestPort); err != nil {
+			// host == guest: expose the app's port at the same number on the guest
+			// IP, so the front door is localhost:<port> -> guest:<port>.
+			ext := r.ListenPort
+			if err := container.Bridge(ctx, sd.Container, ip, ext, r.GuestPort); err != nil {
 				return err
 			}
 			sd.Bridges[r.Key] = ext
@@ -369,8 +376,9 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 		return nil
 	}
 
-	// Bridge the resource service so shunt can discover from the host.
-	if err := container.Bridge(ctx, sd.Container, rsExtPort, guestRSPort); err != nil {
+	// Bridge the resource service so shunt can discover from the host (internal,
+	// all interfaces — extPort != intPort, so no host==guest reuse needed).
+	if err := container.Bridge(ctx, sd.Container, "", rsExtPort, guestRSPort); err != nil {
 		return err
 	}
 	// Give endpoints a short grace to publish after start, then bridge whatever
@@ -386,7 +394,7 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 		sd.Bridges = map[string]int{}
 	}
 	var pending []string
-	for i, r := range app.FrontDoor {
+	for _, r := range app.FrontDoor {
 		ep, ok := aspire.Find(eps, r.Resource, r.Endpoint)
 		if !ok {
 			pending = append(pending, fmt.Sprintf("%s (%s)", r.Key, r.Resource))
@@ -399,8 +407,10 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 		if dp := container.DockerPort(ctx, sd.Container, ep.Resource); dp > 0 {
 			realPort = dp
 		}
-		ext := routeExtBase + i
-		if err := container.Bridge(ctx, sd.Container, ext, realPort); err != nil {
+		// host == guest: expose at the same number on the guest IP, so the front
+		// door is localhost:<listenPort> -> guest:<listenPort>.
+		ext := r.ListenPort
+		if err := container.Bridge(ctx, sd.Container, ip, ext, realPort); err != nil {
 			return err
 		}
 		sd.Bridges[r.Key] = ext
