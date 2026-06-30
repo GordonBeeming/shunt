@@ -39,9 +39,9 @@ func newCertInstallCmd() *cobra.Command {
 				return err
 			}
 			fmt.Println("• loading it into the running Caddy…")
-			// Delete-then-put so re-running replaces the existing tls app cleanly.
-			_ = admin.Delete(ctx, "/config/apps/tls")
-			if err := admin.Put(ctx, "/config/apps/tls", body); err != nil {
+			// POST replaces the value in place; PUT 409s if tls already exists and
+			// DELETE+PUT stalls Caddy while it's serving HTTPS.
+			if err := admin.Post(ctx, "/config/apps/tls", body); err != nil {
 				return fmt.Errorf("load cert into Caddy: %w", err)
 			}
 
