@@ -108,6 +108,11 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 			continue // no baseline (host lacked it) — this siding starts empty for it
 		}
 		host := filepath.Join(volRoot, vol)
+		// cp -c needs the dest's parent to exist (the worktree clone creates src/,
+		// not vol/).
+		if err := os.MkdirAll(volRoot, 0o755); err != nil {
+			return state.Siding{}, err
+		}
 		if err := fsclone.CloneVolume(ctx, base, host); err != nil {
 			return state.Siding{}, err
 		}
