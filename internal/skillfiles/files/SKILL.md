@@ -11,11 +11,18 @@ CLI: **`shunt-dev`**. Full command list and the `.shunt.app.json` contract are i
 
 ## When you start a substantial dev task
 
-1. Run `bash scripts/status.sh` (or `shunt-dev active --json`) from the repo.
-   - Not a shunt app → work normally in the main repo, or offer `shunt-dev app add` if a `.shunt.app.json` exists.
-   - It is a shunt app → do **not** start editing the main repo. Go to step 2.
-2. Pick the siding — **ask the user**. Use an existing one from the status output, or create a fresh one: `shunt-dev new <name>` (fast — a worktree off HEAD + idle guest, no build).
-3. Make every code change under that siding's `src` path. Never edit the main repo for this task — the guest mounts that `src` and runs whatever's on disk.
+1. Run `bash scripts/status.sh` (or `shunt-dev active --json`) from the repo to see whether it's a shunt app and list any existing sidings.
+2. **Ask the user how to work — always, using your agent's question/choice tool (e.g. AskUserQuestion); never assume.** It's a multi-level choice:
+   - **Level 1** — present three options:
+     - **Use the main repo** — work in the main working copy, no siding.
+     - **Use an existing siding** — an isolated instance that already exists.
+     - **Create a new siding** — a fresh isolated instance.
+   - **Level 2** — based on the answer:
+     - *existing* → ask **which siding** (list the names from the status output).
+     - *new* → ask for a **siding name**, then `shunt-dev new <name>` (fast — a worktree off HEAD + idle guest, no build).
+     - *main repo* → nothing more; proceed in the main repo.
+   - If it isn't a shunt app and there's no `.shunt.app.json`, skip the prompt and just work in the main repo (offer `shunt-dev app add` only if a contract exists).
+3. If they picked a siding, make every code change under that siding's `src` path. Never edit the main repo for that task — the guest mounts `src` and runs whatever's on disk.
 4. Run it via shunt, never started locally (the app runs in the guest). The status script prints the right next command — usually `shunt-dev up <name>`; after edits, hot reload covers most changes and `shunt-dev restart <name>` does a full rebuild without dropping the env. See [iterating](references/iterating.md).
 
 ## Rules
