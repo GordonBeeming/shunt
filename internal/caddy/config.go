@@ -123,17 +123,22 @@ func ServerForRoute(app string, r state.Route) (path string, body []byte, err er
 		handler["handler"] = "reverse_proxy"
 		handler["upstreams"] = []any{map[string]any{"dial": state.PlaceholderDial}}
 		if r.TLS {
-			// Serve HTTPS at the edge with Caddy's internal CA (host match makes
-			// automatic HTTPS provision the localhost cert), and proxy to the app
-			// over TLS without verifying its dev cert (self-signed in the guest).
+			// Serve HTTPS at the edge (host match makes automatic HTTPS provision
+			// the localhost cert).
 			server["tls_connection_policies"] = []any{map[string]any{}}
 			server["routes"] = []any{map[string]any{
 				"match":  []any{map[string]any{"host": []string{"localhost", "127.0.0.1"}}},
 				"handle": []any{handler},
 			}}
-			handler["transport"] = map[string]any{
-				"protocol": "http",
-				"tls":      map[string]any{"insecure_skip_verify": true},
+			// Dial the upstream over TLS only when it actually serves https
+			// (endpoint != "http"), skipping verification of its self-signed dev
+			// cert. An http upstream (e.g. the Aspire dashboard) is dialed plain
+			// http, so a TLS front door can still front a plain-http app.
+			if r.Endpoint != "http" {
+				handler["transport"] = map[string]any{
+					"protocol": "http",
+					"tls":      map[string]any{"insecure_skip_verify": true},
+				}
 			}
 		}
 		body, err = json.Marshal(server)

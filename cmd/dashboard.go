@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/dashboard"
@@ -34,6 +36,13 @@ func newDashboardCmd() *cobra.Command {
 				return nil
 			}
 			addr := config.DashboardAddr()
+			// Graceful: if it's already being served (usually the always-on
+			// LaunchAgent), don't crash with "address in use" — just say so.
+			if conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond); err == nil {
+				_ = conn.Close()
+				fmt.Printf("• dashboard already running at http://%s (LaunchAgent) — `%s dashboard --install` to (re)install it\n", addr, bin())
+				return nil
+			}
 			srv := &http.Server{Addr: addr, Handler: dashboard.NewServer().Handler()}
 			fmt.Printf("• shunt dashboard: http://%s  (%s channel · Ctrl-C to stop)\n", addr, config.Current().Channel)
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
