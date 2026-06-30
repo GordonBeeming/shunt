@@ -117,7 +117,7 @@ func newUpCmd() *cobra.Command {
 					return err
 				}
 				fmt.Printf("✓ %q started in the guest — not bridged to the host (front door untouched)\n", name)
-				if u := siding.DashboardURL(sd); u != "" {
+				if u := siding.DashboardURL(app, sd); u != "" {
 					fmt.Printf("  check it on the guest's Aspire dashboard: %s\n", u)
 				}
 				fmt.Printf("  when it looks good: `%s up %s` to bridge + go live (or `%s switch %s`)\n", bin(), name, bin(), name)
@@ -142,7 +142,7 @@ func newUpCmd() *cobra.Command {
 				return err
 			}
 			printFrontDoor(app, app.Sidings[name])
-			fmt.Printf("  dashboard (guest): %s\n", siding.DashboardURL(sd))
+			fmt.Printf("  dashboard (guest): %s\n", siding.DashboardURL(app, sd))
 			return nil
 		},
 	}

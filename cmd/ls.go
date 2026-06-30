@@ -13,8 +13,22 @@ import (
 	"github.com/spf13/cobra"
 )
 
+type lsSiding struct {
+	Name      string `json:"name"`
+	Live      bool   `json:"live"`
+	Guest     string `json:"guest"`
+	IP        string `json:"ip,omitempty"`
+	Dashboard string `json:"dashboard,omitempty"`
+	Src       string `json:"src,omitempty"`
+}
+
+type lsApp struct {
+	Name    string     `json:"name"`
+	Sidings []lsSiding `json:"sidings"`
+}
+
 func newLsCmd() *cobra.Command {
-	var all bool
+	var all, asJSON bool
 	c := &cobra.Command{
 		Use:   "ls",
 		Short: "List sidings for the current project (use -a for every project on the host)",
@@ -25,6 +39,9 @@ func newLsCmd() *cobra.Command {
 				return err
 			}
 			if len(reg.Projects) == 0 {
+				if asJSON {
+					return printJSON([]lsApp{})
+				}
 				fmt.Println("no apps registered yet — run `" + bin() + " app add` in a repo")
 				return nil
 			}
@@ -41,24 +58,23 @@ func newLsCmd() *cobra.Command {
 					return err
 				}
 				if _, ok := reg.Projects[loc.Project]; !ok {
+					if asJSON {
+						return printJSON([]lsApp{})
+					}
 					fmt.Printf("%q isn't a shunt app here — cd into a registered repo, or `%s ls -a` for all projects\n", loc.Project, bin())
 					return nil
 				}
 				names = []string{loc.Project}
 			}
 
-			w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-			fmt.Fprintln(w, "APP\tSIDING\tLIVE\tGUEST\tIP\tDASHBOARD")
+			apps := make([]lsApp, 0, len(names))
 			for _, n := range names {
 				app, err := state.LoadApp(reg.Projects[n])
 				if err != nil {
-					fmt.Fprintf(w, "%s\t(unreadable)\t\t\t\t\n", n)
+					apps = append(apps, lsApp{Name: n})
 					continue
 				}
-				if len(app.Sidings) == 0 {
-					fmt.Fprintf(w, "%s\t-\t\t\t\t\n", app.Name)
-					continue
-				}
+				la := lsApp{Name: app.Name, Sidings: []lsSiding{}}
 				sidingNames := make([]string, 0, len(app.Sidings))
 				for sn := range app.Sidings {
 					sidingNames = append(sidingNames, sn)
@@ -66,21 +82,47 @@ func newLsCmd() *cobra.Command {
 				sort.Strings(sidingNames)
 				for _, sn := range sidingNames {
 					s := app.Sidings[sn]
-					live := ""
-					if app.LiveSiding == sn {
-						live = "*"
-					}
 					guestState, err := container.State(ctx, s.Container)
 					if err != nil {
 						guestState = "-"
 					}
+					src, _ := siding.Paths(app, sn)
+					la.Sidings = append(la.Sidings, lsSiding{
+						Name:      sn,
+						Live:      app.LiveSiding == sn,
+						Guest:     guestState,
+						IP:        s.LastIP,
+						Dashboard: siding.DashboardURL(app, s),
+						Src:       src,
+					})
+				}
+				apps = append(apps, la)
+			}
+
+			if asJSON {
+				return printJSON(apps)
+			}
+
+			w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+			fmt.Fprintln(w, "APP\tSIDING\tLIVE\tGUEST\tIP\tDASHBOARD")
+			for _, a := range apps {
+				if len(a.Sidings) == 0 {
+					fmt.Fprintf(w, "%s\t-\t\t\t\t\n", a.Name)
+					continue
+				}
+				for _, s := range a.Sidings {
+					live := ""
+					if s.Live {
+						live = "*"
+					}
 					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-						app.Name, sn, live, guestState, s.LastIP, siding.DashboardURL(s))
+						a.Name, s.Name, live, s.Guest, s.IP, s.Dashboard)
 				}
 			}
 			return w.Flush()
 		},
 	}
 	c.Flags().BoolVarP(&all, "all", "a", false, "list sidings for every project on the host, not just the current one")
+	c.Flags().BoolVar(&asJSON, "json", false, "machine-readable output")
 	return c
 }

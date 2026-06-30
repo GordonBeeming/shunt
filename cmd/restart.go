@@ -50,7 +50,7 @@ func newRestartCmd() *cobra.Command {
 			if err := siding.WaitReady(ctx, app, sd, 15*time.Minute); err != nil {
 				return err
 			}
-			fmt.Printf("✓ %q restarted — dashboard %s\n", name, siding.DashboardURL(sd))
+			fmt.Printf("✓ %q restarted — dashboard %s\n", name, siding.DashboardURL(app, sd))
 			return nil
 		},
 	}

@@ -85,7 +85,7 @@ func newActiveCmd() *cobra.Command {
 					GuestRunning: guestUp,
 					Src:          src,
 					IP:           s.LastIP,
-					Dashboard:    siding.DashboardURL(s),
+					Dashboard:    siding.DashboardURL(app, s),
 				})
 			}
 

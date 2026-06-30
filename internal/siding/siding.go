@@ -465,6 +465,24 @@ func PointCaddy(ctx context.Context, app state.App, sd *state.Siding) error {
 	sd.LastIP = ip
 
 	admin := caddy.NewAdmin()
+	// Switch-as-a-set: repoint every route at this siding, and if any one fails,
+	// roll the already-repointed routes back to their previous dials so the front
+	// door is never left half on the old siding and half on the new one.
+	type patchedRoute struct {
+		r    state.Route
+		prev string // dial before this switch ("" = unknown, skip on rollback)
+	}
+	var done []patchedRoute
+	rollback := func() {
+		for _, p := range done {
+			if p.prev == "" {
+				continue
+			}
+			if path, body, err := caddy.DialPatch(p.r, p.prev); err == nil {
+				_ = admin.Patch(ctx, path, body)
+			}
+		}
+	}
 	for _, r := range app.FrontDoor {
 		ext, ok := sd.Bridges[r.Key]
 		if !ok {
@@ -472,23 +490,38 @@ func PointCaddy(ctx context.Context, app state.App, sd *state.Siding) error {
 			// dial; it gets bound when the resource starts and switch re-runs.
 			continue
 		}
+		prev, _ := caddy.CurrentDial(ctx, admin, r) // best-effort capture for rollback
 		path, body, err := caddy.DialPatch(r, fmt.Sprintf("%s:%d", ip, ext))
 		if err != nil {
+			rollback()
 			return err
 		}
 		if err := admin.Patch(ctx, path, body); err != nil {
-			return fmt.Errorf("repoint route %q: %w", r.Key, err)
+			rollback()
+			return fmt.Errorf("repoint route %q (rolled back %d route(s) to keep the front door coherent): %w", r.Key, len(done), err)
 		}
+		done = append(done, patchedRoute{r, prev})
 	}
 	return nil
 }
 
-// DashboardURL is the guest's directly-reachable Aspire dashboard.
-func DashboardURL(sd state.Siding) string {
+// DashboardURL is the guest's directly-reachable Aspire dashboard. It prefers the
+// port the app actually serves it on (the front-door dashboard route's guestPort,
+// e.g. 15072) and falls back to the shunt default only when the app doesn't
+// declare one.
+func DashboardURL(app state.App, sd state.Siding) string {
 	if sd.LastIP == "" {
 		return ""
 	}
-	return fmt.Sprintf("http://%s:%d", sd.LastIP, guestDashboardPort)
+	port := guestDashboardPort
+	for _, r := range app.FrontDoor {
+		if r.Kind == state.KindHTTP && r.GuestPort != 0 &&
+			(r.Resource == "aspire-dashboard" || r.Key == "aspire-dashboard" || r.Key == "dashboard") {
+			port = r.GuestPort
+			break
+		}
+	}
+	return fmt.Sprintf("http://%s:%d", sd.LastIP, port)
 }
 
 // expandHome replaces a leading ~ with the user's home dir.

@@ -168,6 +168,34 @@ func DialPatch(r state.Route, hostPort string) (path string, body []byte, err er
 	}
 }
 
+// CurrentDial reads a route's live upstream dial from Caddy (e.g. "192.168.64.5:7022"),
+// so a switch can capture it and roll back to it if a later route fails to repoint.
+// Handles both shapes: http reverse_proxy stores `dial` as a string, layer4 proxy
+// as a one-element array.
+func CurrentDial(ctx context.Context, a *Admin, r state.Route) (string, error) {
+	raw, err := a.GetID(ctx, r.CaddyID)
+	if err != nil {
+		return "", err
+	}
+	var h struct {
+		Upstreams []struct {
+			Dial json.RawMessage `json:"dial"`
+		} `json:"upstreams"`
+	}
+	if err := json.Unmarshal(raw, &h); err != nil || len(h.Upstreams) == 0 {
+		return "", fmt.Errorf("no upstream dial for %q", r.CaddyID)
+	}
+	var s string
+	if json.Unmarshal(h.Upstreams[0].Dial, &s) == nil && s != "" {
+		return s, nil
+	}
+	var arr []string
+	if json.Unmarshal(h.Upstreams[0].Dial, &arr) == nil && len(arr) > 0 {
+		return arr[0], nil
+	}
+	return "", fmt.Errorf("unrecognized dial shape for %q", r.CaddyID)
+}
+
 // routeApp recovers the app name from a route's CaddyID (app_<app>_<kind>_<key>).
 // The CaddyID is authoritative, so server names stay consistent with it.
 func routeApp(r state.Route) string {

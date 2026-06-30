@@ -29,6 +29,13 @@ func EnsureSystemStarted(ctx context.Context) error {
 	return nil
 }
 
+// SystemRunning reports whether the container runtime is up (for `shunt status`
+// health checks), without starting it.
+func SystemRunning(ctx context.Context) bool {
+	r, _ := systemRunning(ctx)
+	return r
+}
+
 // systemRunning reports whether the apiserver is up via `container system status`.
 func systemRunning(ctx context.Context) (bool, error) {
 	res, err := proc.Run(ctx, Bin, "system", "status")

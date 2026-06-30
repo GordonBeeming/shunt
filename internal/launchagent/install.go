@@ -9,6 +9,14 @@ import (
 	"github.com/gordonbeeming/shunt/internal/proc"
 )
 
+// Loaded reports whether a launchd agent with the given label is registered in
+// the user's GUI domain (for `shunt status` health checks). `launchctl list
+// <label>` exits non-zero when the label isn't loaded.
+func Loaded(ctx context.Context, label string) bool {
+	_, err := proc.Run(ctx, "launchctl", "list", label)
+	return err == nil
+}
+
 // Install writes the channel's Caddy plist and (re)loads it into the user's
 // launchd domain, leaving Caddy running. caddyBin and bootstrapPath are baked
 // into the agent's launch command.
