@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
+	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/resolve"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
@@ -12,12 +14,16 @@ import (
 )
 
 // activeSiding is the machine-readable view of one siding for tooling/skills.
+// Live = it's the front-door traffic target; AppRunning = Aspire is started in
+// the guest (if false, `shunt up <name>`); GuestRunning = the container is up.
 type activeSiding struct {
-	Name      string `json:"name"`
-	Live      bool   `json:"live"`
-	Src       string `json:"src"`       // where to edit code for this siding
-	IP        string `json:"ip"`        // cached guest IP ("" if not activated)
-	Dashboard string `json:"dashboard"` // Aspire dashboard URL ("" if no IP)
+	Name         string `json:"name"`
+	Live         bool   `json:"live"`         // currently the stable-port traffic target
+	AppRunning   bool   `json:"appRunning"`   // Aspire started in the guest (else: `shunt up`)
+	GuestRunning bool   `json:"guestRunning"` // the container guest is up
+	Src          string `json:"src"`          // where to edit code for this siding
+	IP           string `json:"ip"`           // cached guest IP ("" if not activated)
+	Dashboard    string `json:"dashboard"`    // Aspire dashboard URL ("" if no IP)
 }
 
 type activeResult struct {
@@ -38,6 +44,7 @@ func newActiveCmd() *cobra.Command {
 			"reports its sidings and where to edit each one's code. Designed for scripts/skills: " +
 			"`shunt active --json`. Exits non-zero when the directory is not a shunt app.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
 			loc, err := resolve.FromCwd()
 			if err != nil {
 				return err
@@ -62,12 +69,23 @@ func newActiveCmd() *cobra.Command {
 			res.RepoPath = app.RepoPath
 			for name, s := range app.Sidings {
 				src, _ := siding.Paths(app, name)
+				guestUp := false
+				if st, err := container.State(ctx, s.Container); err == nil {
+					guestUp = st == "running"
+				}
+				appUp := false
+				if guestUp {
+					out, _ := container.Exec(ctx, s.Container, "sh", "-c", "cat /var/log/apphost.log 2>/dev/null")
+					appUp = strings.Contains(out, "Distributed application started")
+				}
 				res.Sidings = append(res.Sidings, activeSiding{
-					Name:      name,
-					Live:      app.LiveSiding == name,
-					Src:       src,
-					IP:        s.LastIP,
-					Dashboard: siding.DashboardURL(s),
+					Name:         name,
+					Live:         app.LiveSiding == name,
+					AppRunning:   appUp,
+					GuestRunning: guestUp,
+					Src:          src,
+					IP:           s.LastIP,
+					Dashboard:    siding.DashboardURL(s),
 				})
 			}
 

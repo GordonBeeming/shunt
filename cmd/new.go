@@ -12,10 +12,9 @@ import (
 
 func newNewCmd() *cobra.Command {
 	var branch string
-	var doSwitch bool
 	c := &cobra.Command{
 		Use:   "new <name>",
-		Short: "Create a new siding: clone the repo and run the app in a guest",
+		Short: "Create a siding: a worktree + an idle guest (does NOT start Aspire — use `shunt up`)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -31,41 +30,24 @@ func newNewCmd() *cobra.Command {
 				return err
 			}
 
-			fmt.Printf("• cloning repo + launching guest for %q…\n", name)
+			fmt.Printf("• creating worktree + launching idle guest for %q…\n", name)
 			sd, err := siding.Spin(ctx, app, name, branch)
 			if err != nil {
 				return err
 			}
 			sd.CreatedAt = time.Now().Format(time.RFC3339)
-			// Record the siding before the (slow) wait so a failure still leaves a
-			// trace for `shunt ls` / `shunt rm`.
 			app.Sidings[name] = sd
 			if err := state.SaveApp(app); err != nil {
 				return err
 			}
 
-			fmt.Println("• waiting for the Aspire app to start (first run pulls images)…")
-			if err := siding.WaitStarted(ctx, sd.Container, 15*time.Minute); err != nil {
-				return err
-			}
-			fmt.Println("• discovering endpoints + bridging to the host…")
-			if err := siding.Activate(ctx, app, &sd); err != nil {
-				return err
-			}
-			app.Sidings[name] = sd
-			if err := state.SaveApp(app); err != nil {
-				return err
-			}
-			fmt.Printf("✓ siding %q ready — dashboard %s\n", name, siding.DashboardURL(sd))
-
-			if doSwitch || app.LiveSiding == "" {
-				return switchTo(ctx, &app, name)
-			}
-			fmt.Printf("  run `shunt switch %s` to make it live\n", name)
+			src, _ := siding.Paths(app, name)
+			fmt.Printf("✓ siding %q ready — guest is up, Aspire is NOT started yet.\n", name)
+			fmt.Printf("  edit code here:  %s\n", src)
+			fmt.Printf("  run it:          shunt up %s   (builds + starts Aspire, then points the front door at it)\n", name)
 			return nil
 		},
 	}
-	c.Flags().StringVar(&branch, "branch", "", "branch to check out in the clone")
-	c.Flags().BoolVar(&doSwitch, "switch", false, "switch to this siding once it's ready")
+	c.Flags().StringVar(&branch, "branch", "", "base branch/commit for the worktree (default: current HEAD)")
 	return c
 }

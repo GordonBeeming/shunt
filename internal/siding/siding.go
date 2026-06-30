@@ -96,9 +96,15 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 		}
 		mounts = append(mounts, container.Mount{Host: host, Guest: m.Guest, ReadOnly: m.ReadOnly})
 	}
+	// Reuse the host's NuGet package cache so `dotnet restore` doesn't re-download
+	// every package for every siding — the single biggest first-run speedup.
+	if nugetHost, err := expandHome("~/.nuget/packages"); err == nil {
+		if _, statErr := os.Stat(nugetHost); statErr == nil {
+			mounts = append(mounts, container.Mount{Host: nugetHost, Guest: "/root/.nuget/packages"})
+		}
+	}
 
 	guestName := config.ContainerName(app.Name, name)
-	runCmd := fmt.Sprintf("cd /workspace && dotnet run --no-launch-profile --project %s", app.AppHostPath)
 	if err := container.Run(ctx, container.RunOpts{
 		Name:      guestName,
 		Image:     config.BaseImageTag(),
@@ -112,8 +118,11 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 		// the same x86 translation Docker Desktop uses; qemu segfaults SQL Server.
 		Rosetta: true,
 		Mounts:  mounts,
-		Env:       guestEnv(app),
-		Cmd:       []string{"/bin/sh", "-lc", runCmd},
+		Env:     guestEnv(app),
+		// Idle keep-alive: the entrypoint starts dockerd + the dev cert, then this
+		// holds the guest open WITHOUT running Aspire. Run the app later with `up`,
+		// so `new` is fast and you can edit code first.
+		Cmd: []string{"/bin/sh", "-lc", "exec sleep infinity"},
 	}); err != nil {
 		return state.Siding{}, err
 	}
@@ -127,8 +136,23 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 	}, nil
 }
 
-// WaitStarted blocks until the guest logs that the Aspire app started, the guest
-// exits, or the deadline passes.
+// appLogPath is where StartApp redirects the AppHost output inside the guest, so
+// WaitStarted can read it (the AppHost runs as a detached exec, not pid 1, so it
+// doesn't show up in `container logs`).
+const appLogPath = "/var/log/apphost.log"
+
+// StartApp runs the Aspire AppHost inside an already-running siding guest (build
+// + dependency image pulls happen here). It's detached and its output goes to
+// appLogPath. The guest's env (Development, Aspire endpoints) was set at Spin
+// time and is inherited by the exec.
+func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
+	runCmd := fmt.Sprintf("cd /workspace && dotnet run --no-launch-profile --project %s > %s 2>&1",
+		app.AppHostPath, appLogPath)
+	return container.ExecDetached(ctx, sd.Container, "/bin/sh", "-lc", runCmd)
+}
+
+// WaitStarted blocks until the AppHost log says the app started, the guest exits,
+// or the deadline passes.
 func WaitStarted(ctx context.Context, guestName string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -136,7 +160,7 @@ func WaitStarted(ctx context.Context, guestName string, timeout time.Duration) e
 		if err == nil && st != "running" {
 			return fmt.Errorf("guest %s exited (state=%s) before the app started", guestName, st)
 		}
-		out, _ := container.Logs(ctx, guestName)
+		out, _ := container.Exec(ctx, guestName, "sh", "-c", "cat "+appLogPath+" 2>/dev/null")
 		if strings.Contains(out, startedMarker) {
 			return nil
 		}
