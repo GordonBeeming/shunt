@@ -44,7 +44,10 @@ type App struct {
 	// Dependency images kept in the host Docker cache and copied into sidings so
 	// guests never pull from the network (see `shunt warm`).
 	PrebakeImages []string          `json:"prebakeImages,omitempty"`
-	Sidings       map[string]Siding `json:"sidings"`
+	// Docker named volumes cloned from the host's Docker into each siding's guest
+	// Docker on `new`, so sidings start with the host's test data.
+	Volumes []string          `json:"volumes,omitempty"`
+	Sidings map[string]Siding `json:"sidings"`
 	LiveSiding    string            `json:"liveSiding"` // "" = nothing live
 }
 

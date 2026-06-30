@@ -16,6 +16,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/fsclone"
+	"github.com/gordonbeeming/shunt/internal/hostdocker"
 	"github.com/gordonbeeming/shunt/internal/runner"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/gordonbeeming/shunt/internal/ui"
@@ -573,4 +574,48 @@ func AppRunning(ctx context.Context, app state.App, sd state.Siding) bool {
 		return strings.Contains(out, "up")
 	}
 	return allPortsListening(ctx, app, sd)
+}
+
+// CloneVolumes copies each declared Docker named volume from the host's Docker
+// into the siding guest's Docker, so services start with the host's test data
+// instead of an empty store. It's one-time per siding — a `.shunt-cloned` marker
+// inside the volume guards re-runs so a rebuild never clobbers siding data — and
+// must run before the app starts (so SQL etc. mount the populated volume). It
+// streams a gzip tar host->guest; no shared daemon, registry, or mount. Requires
+// host Docker (online once, to pull the tiny alpine helper) and a running guest
+// dockerd. Non-fatal failures are surfaced by the caller.
+func CloneVolumes(ctx context.Context, app state.App, sd state.Siding) error {
+	if len(app.Volumes) == 0 {
+		return nil
+	}
+	if !hostdocker.Available(ctx) {
+		fmt.Println("• host Docker unavailable — sidings start with empty data volumes")
+		return nil
+	}
+	for _, vol := range app.Volumes {
+		dst := "/var/lib/docker/volumes/" + vol + "/_data"
+		if out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "test -f "+dst+"/.shunt-cloned && echo done"); strings.Contains(out, "done") {
+			continue // already cloned into this siding
+		}
+		if !hostdocker.HasVolume(ctx, vol) {
+			fmt.Printf("  (skip data volume %q — not on host Docker)\n", vol)
+			continue
+		}
+		fmt.Printf("• cloning data volume %q from host…\n", vol)
+		tar := filepath.Join(os.TempDir(), "shunt-vol-"+vol+".tgz")
+		if err := hostdocker.ExportVolume(ctx, vol, tar); err != nil {
+			return fmt.Errorf("export host volume %q: %w", vol, err)
+		}
+		if _, err := container.Exec(ctx, sd.Container, "docker", "volume", "create", vol); err != nil {
+			_ = os.Remove(tar)
+			return fmt.Errorf("create guest volume %q: %w", vol, err)
+		}
+		if err := container.ExecStdinFile(ctx, sd.Container, tar, "tar", "xzpf", "-", "--numeric-owner", "-C", dst); err != nil {
+			_ = os.Remove(tar)
+			return fmt.Errorf("import volume %q into siding: %w", vol, err)
+		}
+		_, _ = container.Exec(ctx, sd.Container, "touch", dst+"/.shunt-cloned")
+		_ = os.Remove(tar)
+	}
+	return nil
 }

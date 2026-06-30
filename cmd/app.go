@@ -77,10 +77,10 @@ func newAppAddCmd() *cobra.Command {
 				Workdir:       workdir,
 				AppHostPath:   ct.AppHost,
 				ConfigDir:     loc.ConfigDir,
-				DataVolumes:   ct.DataVolumes,
 				Env:           ct.Env,
 				Mounts:        ct.Mounts,
 				PrebakeImages: ct.PrebakeImages,
+				Volumes:       ct.Volumes,
 				Sidings:       map[string]state.Siding{},
 			}
 			if updating {

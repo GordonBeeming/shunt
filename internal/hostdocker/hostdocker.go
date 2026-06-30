@@ -62,3 +62,18 @@ func Save(ctx context.Context, images []string, outPath string) error {
 	}
 	return nil
 }
+
+// HasVolume reports whether the host Docker has a named volume.
+func HasVolume(ctx context.Context, vol string) bool {
+	_, err := proc.Run(ctx, "docker", "volume", "inspect", vol)
+	return err == nil
+}
+
+// ExportVolume streams a host Docker named volume's contents to a gzip tar at
+// outPath. A throwaway alpine container reads the volume because named-volume
+// data isn't reachable from the host filesystem directly; --numeric-owner keeps
+// the data's uids/gids so it lands correctly in the siding (e.g. mssql's uid).
+func ExportVolume(ctx context.Context, vol, outPath string) error {
+	return proc.RunToFile(ctx, outPath, "docker", "run", "--rm", "-v", vol+":/from:ro",
+		"alpine", "tar", "czf", "-", "--numeric-owner", "-C", "/from", ".")
+}

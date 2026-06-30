@@ -53,6 +53,13 @@ func newUpCmd() *cobra.Command {
 					return fmt.Errorf("%w — try a fresh guest: `%s rm %s && %s new %s`", e, bin(), name, bin(), name)
 				}
 
+				// Clone the host's declared data volumes into this siding (one-time)
+				// so SQL/Azurite/etc. start with the host's test data — must happen
+				// before the app starts so Aspire mounts the populated volumes.
+				if e := siding.CloneVolumes(ctx, app, sd); e != nil {
+					fmt.Printf("  (data volume clone failed: %v — continuing with empty volumes)\n", e)
+				}
+
 				// Keep the host as the canonical cache: if dependency images are
 				// declared and the project cache is missing, build it from the host
 				// (pull only what the host lacks), then load it into this guest — so

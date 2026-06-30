@@ -28,13 +28,17 @@ type Contract struct {
 
 	AppHost     string             `json:"apphost"`   // aspire only: rel path to the AppHost project/csproj
 	FrontDoor   []FrontDoorRoute   `json:"frontDoor"` // stable front-door routes
-	DataVolumes []state.DataVolume `json:"dataVolumes"`
 	Env         map[string]string  `json:"env"`    // extra guest env (Aspire parameters, secrets)
 	Mounts      []state.MountSpec  `json:"mounts"` // explicit extra host->guest mounts (e.g. user-secrets)
 	// Dependency container images Aspire brings up (SQL, Azurite, etc.). shunt
 	// keeps these in the host Docker cache and copies them into each siding, so
 	// siding guests never pull from the network. `shunt warm` uses this list.
 	PrebakeImages []string `json:"prebakeImages"`
+	// Volumes lists Docker named volumes (as named in the AppHost's
+	// WithDataVolume) whose data shunt clones from the host's Docker into each
+	// siding's guest Docker on `new`, so sidings start with the host's test data
+	// instead of an empty DB. Omit for a clean per-siding database.
+	Volumes []string `json:"dataVolumes"`
 	// FixedPorts pins the front door to the exact listenPort values (no channel
 	// offset). Use when the app's config + Entra redirect URIs point at specific
 	// ports. Only one channel can run the app at a time on those ports.

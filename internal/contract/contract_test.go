@@ -22,13 +22,13 @@ func TestLoadValid(t *testing.T) {
         { "key": "frontend", "kind": "http",   "listenPort": 5000, "resource": "web" },
         { "key": "db",       "kind": "layer4", "listenPort": 15432, "resource": "postgres", "endpoint": "tcp" }
       ],
-      "dataVolumes": [ { "resource": "postgres", "guestPath": "/data/pg" } ]
+      "dataVolumes": [ "pg-data" ]
     }`)
 	c, err := Load(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.AppHost == "" || len(c.FrontDoor) != 2 || len(c.DataVolumes) != 1 {
+	if c.AppHost == "" || len(c.FrontDoor) != 2 || len(c.Volumes) != 1 {
 		t.Fatalf("unexpected contract: %+v", c)
 	}
 	if c.FrontDoor[1].Kind != "layer4" || c.FrontDoor[1].ListenPort != 15432 {
