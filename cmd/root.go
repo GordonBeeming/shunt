@@ -14,7 +14,7 @@ func newRootCmd() *cobra.Command {
 	id := config.Current()
 	root := &cobra.Command{
 		Use:           id.BinaryName,
-		Short:         "Run parallel Aspire experiments and switch between them with no teardown",
+		Short:         "Run parallel app experiments and switch between them with no teardown",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -36,6 +36,7 @@ func newRootCmd() *cobra.Command {
 		newLsCmd(),
 		newLogsCmd(),
 		newGitCmd(),
+		newDashboardCmd(),
 		newDebugDiscoverCmd(),
 	)
 	return root

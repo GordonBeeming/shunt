@@ -10,15 +10,18 @@ import (
 func newLogsCmd() *cobra.Command {
 	var lines int
 	c := &cobra.Command{
-		Use:   "logs <name>",
-		Short: "Print a siding's Aspire AppHost log (build + startup output)",
-		Long: "Dumps the AppHost log captured inside the guest (/var/log/apphost.log) — the build, " +
-			"dependency startup, and any crash output. Useful for diagnosing a failed `up`, by hand or by an agent.",
-		Args: cobra.ExactArgs(1),
+		Use:   "logs [name]",
+		Short: "Print a siding's app log (build + startup output)",
+		Long: "Dumps the app's log captured inside the guest (/var/log/apphost.log) — the build, " +
+			"startup, and any crash output. Useful for diagnosing a failed `up`, by hand or by an agent.",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			name := args[0]
 			app, _, err := loadCurrentApp()
+			if err != nil {
+				return err
+			}
+			name, err := sidingArg(app, args)
 			if err != nil {
 				return err
 			}

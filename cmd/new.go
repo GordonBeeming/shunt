@@ -14,7 +14,7 @@ func newNewCmd() *cobra.Command {
 	var branch string
 	c := &cobra.Command{
 		Use:   "new <name>",
-		Short: "Create a siding: a worktree + an idle guest (does NOT start Aspire — use `"+bin()+" up`)",
+		Short: "Create a siding: a worktree + an idle guest (does NOT start the app — use `"+bin()+" up`)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()

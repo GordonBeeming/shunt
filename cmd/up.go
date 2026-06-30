@@ -17,13 +17,16 @@ import (
 func newUpCmd() *cobra.Command {
 	var noSwitch bool
 	c := &cobra.Command{
-		Use:   "up <name>",
-		Short: "Build + start Aspire in a siding's guest, then point the front door at it",
-		Args:  cobra.ExactArgs(1),
+		Use:   "up [name]",
+		Short: "Build + start the app in a siding's guest, then point the front door at it",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			name := args[0]
 			app, _, err := loadCurrentApp()
+			if err != nil {
+				return err
+			}
+			name, err := sidingArg(app, args)
 			if err != nil {
 				return err
 			}
@@ -87,7 +90,7 @@ func newUpCmd() *cobra.Command {
 					fmt.Printf("• no warm cache — declare prebakeImages + run `%s warm`, or it'll build/pull cold\n", bin())
 				}
 
-				fmt.Printf("• starting Aspire in %q…\n", name)
+				fmt.Printf("• starting the app in %q…\n", name)
 				if err := siding.StartApp(ctx, app, sd); err != nil {
 					return err
 				}
@@ -96,7 +99,7 @@ func newUpCmd() *cobra.Command {
 					return err
 				}
 			} else {
-				fmt.Printf("• Aspire is already running in %q\n", name)
+				fmt.Printf("• the app is already running in %q\n", name)
 			}
 
 			fmt.Println("• discovering endpoints + bridging to the host…")

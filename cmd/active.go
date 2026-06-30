@@ -19,11 +19,11 @@ import (
 type activeSiding struct {
 	Name         string `json:"name"`
 	Live         bool   `json:"live"`         // currently the stable-port traffic target
-	AppRunning   bool   `json:"appRunning"`   // Aspire started in the guest (else: `"+bin()+" up`)
+	AppRunning   bool   `json:"appRunning"`   // app started in the guest (else: `"+bin()+" up`)
 	GuestRunning bool   `json:"guestRunning"` // the container guest is up
 	Src          string `json:"src"`          // where to edit code for this siding
 	IP           string `json:"ip"`           // cached guest IP ("" if not activated)
-	Dashboard    string `json:"dashboard"`    // Aspire dashboard URL ("" if no IP)
+	Dashboard    string `json:"dashboard"`    // dashboard URL ("" if no IP)
 }
 
 type activeResult struct {

@@ -26,7 +26,7 @@ func newAppCmd() *cobra.Command {
 func newAppAddCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "add",
-		Short: "Register the Aspire app in the current repo (reads .shunt.app.json)",
+		Short: "Register the app in the current repo (reads .shunt.app.json)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			cwd, err := os.Getwd()

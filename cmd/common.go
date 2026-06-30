@@ -66,3 +66,13 @@ func printFrontDoor(app state.App, sd state.Siding) {
 		fmt.Printf("    %-8s %s%s\n", r.Key, routeURL(r), note)
 	}
 }
+
+// sidingArg resolves the siding name from the first positional arg, or prompts
+// with the interactive picker when none is given (like `switch`). Lets commands
+// that act on a siding be run bare and pick from the list.
+func sidingArg(app state.App, args []string) (string, error) {
+	if len(args) > 0 {
+		return args[0], nil
+	}
+	return pickSiding(app)
+}

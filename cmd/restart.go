@@ -11,16 +11,19 @@ import (
 
 func newRestartCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "restart <name>",
-		Short: "Rebuild + restart the AppHost in place, keeping the guest, deps, and data running",
-		Long: "For when `dotnet watch` doesn't catch a change (it's best-effort) or a clean rebuild " +
-			"is needed. Kills only the AppHost process and re-runs it (full build), leaving the guest, " +
+		Use:   "restart [name]",
+		Short: "Rebuild + restart the app in place, keeping the guest, deps, and data running",
+		Long: "For when a hot-reload misses a change or a clean rebuild " +
+			"is needed. Kills only the app process and re-runs it (full build), leaving the guest, " +
 			"its Docker daemon, the dependency containers (SQL etc.), and their data up — no teardown, no pull.",
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			name := args[0]
 			app, _, err := loadCurrentApp()
+			if err != nil {
+				return err
+			}
+			name, err := sidingArg(app, args)
 			if err != nil {
 				return err
 			}

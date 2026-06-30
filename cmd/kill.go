@@ -14,13 +14,16 @@ import (
 
 func newKillCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "kill <name>",
+		Use:   "kill [name]",
 		Short: "Stop a siding's guest (keeps its clone + data to restart later)",
-		Args:  cobra.ExactArgs(1),
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			name := args[0]
 			app, _, err := loadCurrentApp()
+			if err != nil {
+				return err
+			}
+			name, err := sidingArg(app, args)
 			if err != nil {
 				return err
 			}
@@ -48,13 +51,16 @@ func newKillCmd() *cobra.Command {
 func newRmCmd() *cobra.Command {
 	var force bool
 	c := &cobra.Command{
-		Use:   "rm <name>",
+		Use:   "rm [name]",
 		Short: "Tear down a siding: stop + remove the guest and delete its clone/data",
-		Args:  cobra.ExactArgs(1),
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			name := args[0]
 			app, _, err := loadCurrentApp()
+			if err != nil {
+				return err
+			}
+			name, err := sidingArg(app, args)
 			if err != nil {
 				return err
 			}

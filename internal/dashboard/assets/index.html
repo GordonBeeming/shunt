@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>shunt</title>
+<style>
+  :root {
+    --bg: #F8F9FA; --text: #1A1A1A; --text2: #374151;
+    --primary: #0063B2; --accent: #0075A3; --ui: #E9ECEF;
+    --card: #FFFFFF; --up: #1E7B34; --down: #B42318; --busy: #B45309;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--sans); line-height: 1.45;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 14px;
+    padding: 20px 28px; border-bottom: 1px solid var(--ui);
+  }
+  header h1 { margin: 0; font-size: 22px; letter-spacing: -.5px; }
+  header .sub { color: var(--text2); font-size: 13px; }
+  header .dot-legend { margin-left: auto; color: var(--text2); font-size: 12px; }
+  main { padding: 24px 28px; max-width: 1100px; }
+
+  /* non-prod corner ribbon */
+  #ribbon { position: fixed; top: 0; right: 0; width: 150px; height: 150px; overflow: hidden; z-index: 50; pointer-events: none; display: none; }
+  #ribbon b {
+    position: absolute; top: 34px; right: -40px; transform: rotate(45deg);
+    width: 210px; text-align: center; background: var(--primary); color: #fff;
+    font-weight: 800; letter-spacing: 3px; font-size: 13px; padding: 7px 0;
+    text-transform: uppercase; box-shadow: 0 2px 8px rgba(0,0,0,.3);
+  }
+
+  .app { background: var(--card); border: 1px solid var(--ui); border-radius: 12px; margin-bottom: 22px; overflow: hidden; }
+  .app > h2 { margin: 0; padding: 14px 18px; font-size: 17px; border-bottom: 1px solid var(--ui); display: flex; align-items: center; gap: 10px; }
+  .app > h2 .live { font-size: 12px; font-weight: 600; color: var(--text2); }
+
+  .routes { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; padding: 16px 18px; }
+  .route { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .route .dot { width: 11px; height: 11px; border-radius: 50%; flex: none; box-shadow: 0 0 0 3px rgba(0,0,0,.04); }
+  .dot.up { background: var(--up); } .dot.down { background: var(--down); }
+  .route .key { font-weight: 600; flex: none; }
+  .route a, .route .addr { color: var(--primary); font-family: var(--mono); font-size: 12.5px; text-decoration: none; overflow-wrap: anywhere; }
+  .route a:hover { text-decoration: underline; }
+  .route a:focus-visible, button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+  .sidings { border-top: 1px solid var(--ui); padding: 12px 18px 16px; }
+  .sidings .lbl { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--text2); margin-bottom: 8px; }
+  .siding { display: flex; align-items: center; gap: 12px; padding: 7px 0; border-top: 1px dashed var(--ui); }
+  .siding:first-of-type { border-top: none; }
+  .siding .nm { font-family: var(--mono); font-size: 13px; }
+  .siding .star { color: var(--primary); font-weight: 800; width: 12px; flex: none; }
+  .siding .guest { font-size: 11.5px; color: var(--text2); }
+  .siding .status { font-size: 12px; color: var(--busy); margin-left: 4px; }
+  .siding .spacer { flex: 1; }
+  button {
+    font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+    border: 1px solid var(--primary); color: var(--primary); background: #fff;
+    border-radius: 7px; padding: 4px 12px;
+  }
+  button:hover:not(:disabled) { background: var(--primary); color: #fff; }
+  button.primary { background: var(--primary); color: #fff; }
+  button.primary:hover:not(:disabled) { background: #004e8c; }
+  button:disabled { opacity: .45; cursor: default; }
+  .empty { color: var(--text2); padding: 40px 0; text-align: center; }
+  footer { color: var(--text2); font-size: 12px; padding: 8px 28px 28px; }
+</style>
+</head>
+<body>
+<div id="ribbon"><b id="ribbon-text"></b></div>
+<header>
+  <h1>shunt</h1>
+  <span class="sub" id="sub">front door</span>
+  <span class="dot-legend"><span class="dot up" style="display:inline-block;width:9px;height:9px;border-radius:50%;box-shadow:none"></span> up &nbsp; <span class="dot down" style="display:inline-block;width:9px;height:9px;border-radius:50%;box-shadow:none"></span> down</span>
+</header>
+<main id="apps"><div class="empty">Loading…</div></main>
+<footer>Live status polls every few seconds · switch is an instant Caddy rebind · restart runs the configured stop+start in the guest</footer>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let firstLoad = true;
+
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function post(path, body){
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if(!r.ok){ alert(await r.text()); }
+  return r.ok;
+}
+
+function routeHTML(r){
+  const dot = `<span class="dot ${r.up?'up':'down'}" title="${r.up?'reachable':'not reachable'}"></span>`;
+  const target = r.kind === 'http'
+    ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url)}</a>`
+    : `<span class="addr">${esc(r.url)}</span>`;
+  return `<div class="route">${dot}<span class="key">${esc(r.key)}</span>${target}</div>`;
+}
+
+function sidingHTML(appName, s){
+  const star = s.live ? '<span class="star" title="live">*</span>' : '<span class="star"></span>';
+  const status = s.status ? `<span class="status">${esc(s.status)}</span>` : '';
+  const guest = s.guest ? `<span class="guest">${esc(s.guest)}</span>` : '';
+  const busy = s.status && s.status.indexOf('…') >= 0;
+  const sw = s.live ? '' : `<button onclick="doSwitch('${esc(appName)}','${esc(s.name)}')" ${busy?'disabled':''}>Switch</button>`;
+  return `<div class="siding">${star}<span class="nm">${esc(s.name)}</span> ${guest} ${status}
+    <span class="spacer"></span>${sw}
+    <button class="primary" onclick="doRestart('${esc(appName)}','${esc(s.name)}')" ${busy?'disabled':''}>Restart</button></div>`;
+}
+
+function appHTML(a){
+  const live = a.liveSiding ? `live: <strong>${esc(a.liveSiding)}</strong>` : 'nothing live';
+  const routes = a.routes.length ? a.routes.map(routeHTML).join('') : '<span class="guest">no routes</span>';
+  const sidings = a.sidings.length ? a.sidings.map(s => sidingHTML(a.name, s)).join('') : '<span class="guest">no sidings — `shunt new`</span>';
+  return `<section class="app">
+    <h2>${esc(a.name)} <span class="live">${live}</span></h2>
+    <div class="routes">${routes}</div>
+    <div class="sidings"><div class="lbl">Sidings</div>${sidings}</div>
+  </section>`;
+}
+
+async function doSwitch(app, sd){
+  if(!confirm(`Switch the ${app} front door to "${sd}"?\n\nThis repoints the shared ports away from the current live siding — it can interrupt another session/agent working against it.`)) return;
+  if(await post('/api/switch', {project:app, siding:sd})) refresh();
+}
+async function doRestart(app, sd){
+  if(!confirm(`Restart "${sd}"?\n\nThis stops and rebuilds the app in that siding — it can interrupt anyone using it.`)) return;
+  if(await post('/api/restart', {project:app, siding:sd})) refresh();
+}
+
+function applyChannel(ch){
+  const r = $('#ribbon');
+  if(ch && ch !== 'release'){
+    $('#ribbon-text').textContent = ch;
+    r.style.display = 'block';
+    $('#sub').textContent = 'front door · ' + ch;
+    document.title = 'shunt · ' + ch;
+  } else { r.style.display = 'none'; }
+}
+
+async function refresh(){
+  try {
+    const st = await (await fetch('/api/state')).json();
+    applyChannel(st.channel);
+    $('#apps').innerHTML = st.apps && st.apps.length
+      ? st.apps.map(appHTML).join('')
+      : '<div class="empty">No apps registered yet — run <code>shunt app add</code> in a repo.</div>';
+  } catch(e){
+    if(firstLoad) $('#apps').innerHTML = '<div class="empty">Dashboard server unreachable.</div>';
+  }
+  firstLoad = false;
+}
+
+refresh();
+setInterval(refresh, 2500);
+</script>
+</body>
+</html>
