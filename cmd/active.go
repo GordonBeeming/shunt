@@ -15,11 +15,11 @@ import (
 
 // activeSiding is the machine-readable view of one siding for tooling/skills.
 // Live = it's the front-door traffic target; AppRunning = Aspire is started in
-// the guest (if false, `shunt up <name>`); GuestRunning = the container is up.
+// the guest (if false, `"+bin()+" up <name>`); GuestRunning = the container is up.
 type activeSiding struct {
 	Name         string `json:"name"`
 	Live         bool   `json:"live"`         // currently the stable-port traffic target
-	AppRunning   bool   `json:"appRunning"`   // Aspire started in the guest (else: `shunt up`)
+	AppRunning   bool   `json:"appRunning"`   // Aspire started in the guest (else: `"+bin()+" up`)
 	GuestRunning bool   `json:"guestRunning"` // the container guest is up
 	Src          string `json:"src"`          // where to edit code for this siding
 	IP           string `json:"ip"`           // cached guest IP ("" if not activated)
@@ -120,7 +120,7 @@ func emitInactive(res activeResult, asJSON bool) error {
 	if asJSON {
 		return printJSON(res)
 	}
-	fmt.Printf("%s is not a shunt app (run `shunt app add` to register it)\n", res.Project)
+	fmt.Printf("%s is not a shunt app (run `"+bin()+" app add` to register it)\n", res.Project)
 	os.Exit(1)
 	return nil
 }

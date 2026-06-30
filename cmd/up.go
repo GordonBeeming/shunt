@@ -26,11 +26,11 @@ func newUpCmd() *cobra.Command {
 			}
 			sd, ok := app.Sidings[name]
 			if !ok {
-				return fmt.Errorf("no siding %q — create it with `shunt new %s`", name, name)
+				return fmt.Errorf("no siding %q — create it with `"+bin()+" new %s`", name, name)
 			}
 			st, _ := container.State(ctx, sd.Container)
 			if st != "running" {
-				return fmt.Errorf("the guest for %q isn't running (state=%s); recreate it with `shunt new`", name, st)
+				return fmt.Errorf("the guest for %q isn't running (state=%s); recreate it with `"+bin()+" new`", name, st)
 			}
 
 			// Idempotent: only launch Aspire if it isn't already up in the guest.
@@ -59,7 +59,7 @@ func newUpCmd() *cobra.Command {
 			fmt.Printf("✓ %q is up — dashboard %s\n", name, siding.DashboardURL(sd))
 
 			if noSwitch {
-				fmt.Printf("  run `shunt switch %s` to point the stable ports at it\n", name)
+				fmt.Printf("  run `"+bin()+" switch %s` to point the stable ports at it\n", name)
 				return nil
 			}
 			return switchTo(ctx, &app, name)

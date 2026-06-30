@@ -23,7 +23,7 @@ func newLsCmd() *cobra.Command {
 				return err
 			}
 			if len(reg.Projects) == 0 {
-				fmt.Println("no apps registered yet — run `shunt app add` in an Aspire repo")
+				fmt.Println("no apps registered yet — run `"+bin()+" app add` in an Aspire repo")
 				return nil
 			}
 			names := make([]string, 0, len(reg.Projects))

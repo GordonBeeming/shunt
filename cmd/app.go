@@ -55,7 +55,7 @@ func newAppAddCmd() *cobra.Command {
 
 			admin := caddy.NewAdmin()
 			if err := admin.Ping(ctx); err != nil {
-				return fmt.Errorf("caddy admin API not reachable — run `shunt init` first: %w", err)
+				return fmt.Errorf("caddy admin API not reachable — run `"+bin()+" init` first: %w", err)
 			}
 			for _, r := range ct.FrontDoor {
 				route := state.Route{
@@ -93,7 +93,7 @@ func newAppAddCmd() *cobra.Command {
 			for _, r := range app.FrontDoor {
 				fmt.Printf("  %-10s %-6s localhost:%d  ->  %s/%s\n", r.Key, r.Kind, r.ListenPort, r.Resource, r.Endpoint)
 			}
-			fmt.Printf("next: `shunt new <name>` to create a siding\n")
+			fmt.Printf("next: `"+bin()+" new <name>` to create a siding\n")
 			return nil
 		},
 	}

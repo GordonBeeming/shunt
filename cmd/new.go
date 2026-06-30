@@ -14,7 +14,7 @@ func newNewCmd() *cobra.Command {
 	var branch string
 	c := &cobra.Command{
 		Use:   "new <name>",
-		Short: "Create a siding: a worktree + an idle guest (does NOT start Aspire — use `shunt up`)",
+		Short: "Create a siding: a worktree + an idle guest (does NOT start Aspire — use `"+bin()+" up`)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -44,7 +44,7 @@ func newNewCmd() *cobra.Command {
 			src, _ := siding.Paths(app, name)
 			fmt.Printf("✓ siding %q ready — guest is up, Aspire is NOT started yet.\n", name)
 			fmt.Printf("  edit code here:  %s\n", src)
-			fmt.Printf("  run it:          shunt up %s   (builds + starts Aspire, then points the front door at it)\n", name)
+			fmt.Printf("  run it:          "+bin()+" up %s   (builds + starts Aspire, then points the front door at it)\n", name)
 			return nil
 		},
 	}
