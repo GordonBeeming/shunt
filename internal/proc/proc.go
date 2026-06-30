@@ -80,6 +80,25 @@ func RunToFile(ctx context.Context, outPath, name string, args ...string) error 
 	return nil
 }
 
+// RunStdin runs name with args, feeding the file at stdinPath as stdin — for
+// streaming a large file into a command (e.g. `docker load` of a multi-GB tar)
+// without buffering it. Stderr is captured for a useful error.
+func RunStdin(ctx context.Context, stdinPath, name string, args ...string) error {
+	f, err := os.Open(stdinPath)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", stdinPath, err)
+	}
+	defer f.Close()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdin = f
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("run %s: %w: %s", name, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
 // Look reports whether an executable is on PATH.
 func Look(name string) bool {
 	_, err := exec.LookPath(name)

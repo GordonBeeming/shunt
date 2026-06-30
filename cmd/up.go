@@ -5,7 +5,11 @@ import (
 	"strings"
 	"time"
 
+	"os"
+	"path/filepath"
+
 	"github.com/gordonbeeming/shunt/internal/container"
+	"github.com/gordonbeeming/shunt/internal/hostdocker"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
@@ -36,23 +40,39 @@ func newUpCmd() *cobra.Command {
 			// Idempotent: only launch Aspire if it isn't already up in the guest.
 			out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "cat /var/log/apphost.log 2>/dev/null")
 			if !strings.Contains(out, "Distributed application started") {
-				// Stop any stale AppHost first so we don't start a second one (port
-				// clash), and clear its log so WaitStarted waits for the fresh run.
+				// Stop any stale orchestration first so we don't start a second
+				// AppHost (port clash), and clear its log so WaitStarted waits fresh.
 				_ = siding.StopApp(ctx, sd)
 				_, _ = container.Exec(ctx, sd.Container, "sh", "-c", "> /var/log/apphost.log")
 
-				// Load the project warm cache if it's mounted in this guest, so Aspire
-				// reuses pre-built/pulled images instead of rebuilding/pulling.
-				if siding.IsWarmed(app) {
-					out, _ := container.Exec(ctx, sd.Container, "sh", "-c",
-						"if [ -f /mnt/base/images.tar ]; then docker load -i /mnt/base/images.tar && echo LOADED; fi")
-					if strings.Contains(out, "LOADED") {
-						fmt.Println("• loaded pre-warmed dependency images (no pull)")
-					} else {
-						fmt.Printf("• no warm cache in this guest — recreate it (`%s rm %s && %s new %s`) to use the cache\n", bin(), name, bin(), name)
+				// Keep the host as the canonical cache: if dependency images are
+				// declared and the project cache is missing, build it from the host
+				// (pull only what the host lacks), then load it into this guest — so
+				// the siding never pulls from the network itself.
+				tar := siding.WarmTarPath(app)
+				if len(app.PrebakeImages) > 0 && hostdocker.Available(ctx) {
+					if _, statErr := os.Stat(tar); statErr != nil {
+						fmt.Println("• warming the host image cache (one-time)…")
+						if _, e := hostdocker.Ensure(ctx, app.PrebakeImages); e != nil {
+							return fmt.Errorf("warm host cache: %w", e)
+						}
+						if e := os.MkdirAll(filepath.Dir(tar), 0o755); e != nil {
+							return e
+						}
+						if e := hostdocker.Save(ctx, app.PrebakeImages, tar); e != nil {
+							return e
+						}
 					}
 				}
-				fmt.Printf("• starting Aspire in %q (first run builds + pulls anything not warmed)…\n", name)
+				if loaded, e := siding.LoadWarm(ctx, app, sd); e != nil {
+					fmt.Printf("  (warm load failed: %v)\n", e)
+				} else if loaded {
+					fmt.Println("• loaded dependency images from cache (no pull)")
+				} else {
+					fmt.Printf("• no warm cache — declare prebakeImages + run `%s warm`, or it'll build/pull cold\n", bin())
+				}
+
+				fmt.Printf("• starting Aspire in %q…\n", name)
 				if err := siding.StartApp(ctx, app, sd); err != nil {
 					return err
 				}

@@ -133,8 +133,8 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 		CapAddAll: true,
 		// Heavy Aspire stacks (SQL Server, Azurite, several projects + the nested
 		// Docker daemon) need real headroom; the runtime default of ~1 GB OOMs.
-		Memory:    "6g",
-		CPUs:      "4",
+		Memory: "6g",
+		CPUs:   "4",
 		// Rosetta lets amd64-only images (SQL Server) run on the arm64 guest —
 		// the same x86 translation Docker Desktop uses; qemu segfaults SQL Server.
 		Rosetta: true,
@@ -182,12 +182,27 @@ func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 // happen while SQL etc. and their data stay up. The docker-managed dependency
 // containers are a separate process tree, unaffected by these kills.
 func StopApp(ctx context.Context, sd state.Siding) error {
-	// Target the AppHost runner specifically (its cmdline carries the AppHost
-	// project) plus the watch wrapper. Dependency containers run under dockerd
-	// in their own namespaces and don't match, so they stay up.
+	// Kill the whole Aspire orchestration — the watch wrapper, the AppHost, the
+	// dashboard, and the DCP control plane — so none of them keep holding ports.
+	// Dependency containers (SQL, Azurite, etc.) run under dockerd and don't match
+	// these patterns, so they stay up.
 	_, err := container.Exec(ctx, sd.Container, "sh", "-c",
-		"pkill -f 'dotnet watch' 2>/dev/null; pkill -f 'AppHost' 2>/dev/null; true")
+		"for p in 'dotnet watch' 'AppHost' 'Aspire.Dashboard' '/dcp '; do pkill -f \"$p\" 2>/dev/null; done; true")
 	return err
+}
+
+// LoadWarm streams the project's warm-cache tar from the host into the guest's
+// Docker store (via `docker load`, no bind mount), so Aspire reuses the images
+// instead of pulling/rebuilding. No-op if the project isn't warmed.
+func LoadWarm(ctx context.Context, app state.App, sd state.Siding) (bool, error) {
+	tar := WarmTarPath(app)
+	if _, err := os.Stat(tar); err != nil {
+		return false, nil
+	}
+	if err := container.ExecStdinFile(ctx, sd.Container, tar, "docker", "load"); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // WaitStarted blocks until the AppHost log says the app started, the guest exits,
