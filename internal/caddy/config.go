@@ -28,6 +28,17 @@ func Bootstrap() ([]byte, error) {
 		"apps": map[string]any{
 			"http":   map[string]any{"servers": map[string]any{}},
 			"layer4": map[string]any{"servers": map[string]any{}},
+			// Issue localhost certs from Caddy's own internal CA so HTTPS front-door
+			// routes work offline with no public ACME. `shunt init` runs `caddy trust`
+			// to add the CA root to the host trust store.
+			"tls": map[string]any{
+				"automation": map[string]any{
+					"policies": []any{map[string]any{
+						"subjects": []string{"localhost", "127.0.0.1"},
+						"issuers":  []any{map[string]any{"module": "internal"}},
+					}},
+				},
+			},
 		},
 	}
 	return json.MarshalIndent(doc, "", "  ")
@@ -48,6 +59,20 @@ func ServerForRoute(app string, r state.Route) (path string, body []byte, err er
 	case state.KindHTTP:
 		handler["handler"] = "reverse_proxy"
 		handler["upstreams"] = []any{map[string]any{"dial": state.PlaceholderDial}}
+		if r.TLS {
+			// Serve HTTPS at the edge with Caddy's internal CA (host match makes
+			// automatic HTTPS provision the localhost cert), and proxy to the app
+			// over TLS without verifying its dev cert (self-signed in the guest).
+			server["tls_connection_policies"] = []any{map[string]any{}}
+			server["routes"] = []any{map[string]any{
+				"match":  []any{map[string]any{"host": []string{"localhost", "127.0.0.1"}}},
+				"handle": []any{handler},
+			}}
+			handler["transport"] = map[string]any{
+				"protocol": "http",
+				"tls":      map[string]any{"insecure_skip_verify": true},
+			}
+		}
 		body, err = json.Marshal(server)
 		return fmt.Sprintf("/config/apps/http/servers/%s", ServerName(app, r.Key)), body, err
 	case state.KindLayer4:

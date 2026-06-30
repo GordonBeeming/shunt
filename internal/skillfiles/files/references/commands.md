@@ -36,7 +36,7 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 }
 ```
 
-- `frontDoor` maps Aspire resources/endpoints to stable local ports (the host:port you and Entra always hit). `kind` is `http` (web) or `layer4` (raw TCP, e.g. SQL).
+- `frontDoor` maps Aspire resources/endpoints to stable local ports (the host:port you and Entra always hit). `kind` is `http` (web) or `layer4` (raw TCP, e.g. SQL). **HTTP routes serve HTTPS** at the front door via Caddy's internal CA (trusted on the host); the proxy reaches the app over TLS with skip-verify. `layer4` routes stay raw TCP.
 - `mounts` carries per-project host paths into the guest — typically the dev's user-secrets so Aspire parameters resolve.
 - `prebakeImages` lists the dependency container images Aspire brings up. `shunt warm` keeps these in the host Docker cache and copies them into each siding, so guests never pull from the network. Re-run `app add` after editing the contract to apply changes.
 - shunt has no app-specific logic; this file is the only per-repo config.

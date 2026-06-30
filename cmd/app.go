@@ -60,10 +60,8 @@ func newAppAddCmd() *cobra.Command {
 			}
 
 			admin := caddy.NewAdmin()
-			if !updating {
-				if err := admin.Ping(ctx); err != nil {
-					return fmt.Errorf("caddy admin API not reachable — run `"+bin()+" init` first: %w", err)
-				}
+			if err := admin.Ping(ctx); err != nil {
+				return fmt.Errorf("caddy admin API not reachable — run `"+bin()+" init` first: %w", err)
 			}
 			for _, r := range ct.FrontDoor {
 				route := state.Route{
@@ -72,17 +70,19 @@ func newAppAddCmd() *cobra.Command {
 					ListenPort: r.ListenPort + offset,
 					Resource:   r.Resource,
 					Endpoint:   r.Endpoint,
-					TLS:        r.TLS,
-					CaddyID:    caddy.RouteID(loc.Project, r.Kind, r.Key),
+					// HTTP front-door routes serve HTTPS by default (Caddy terminates
+					// TLS with its internal CA); layer4/TCP routes stay raw.
+					TLS:     r.TLS || r.Kind == state.KindHTTP,
+					CaddyID: caddy.RouteID(loc.Project, r.Kind, r.Key),
 				}
 				app.FrontDoor = append(app.FrontDoor, route)
-				if updating {
-					continue // routes already exist in Caddy; re-PUT would 409
-				}
 				path, body, err := caddy.ServerForRoute(loc.Project, route)
 				if err != nil {
 					return err
 				}
+				// Delete-then-put so re-running app add applies route config changes
+				// (e.g. switching a route to HTTPS) instead of 409-ing on the existing one.
+				_ = admin.Delete(ctx, path)
 				if err := admin.Put(ctx, path, body); err != nil {
 					return fmt.Errorf("register route %q in Caddy: %w", r.Key, err)
 				}

@@ -66,6 +66,12 @@ func (a *Admin) Put(ctx context.Context, path string, body []byte) error {
 	return a.do(ctx, http.MethodPut, path, body)
 }
 
+// Delete removes the config at path. Callers ignore the error when clearing a
+// route that may not exist yet.
+func (a *Admin) Delete(ctx context.Context, path string) error {
+	return a.do(ctx, http.MethodDelete, path, nil)
+}
+
 func (a *Admin) do(ctx context.Context, method, path string, body []byte) error {
 	_, err := a.read(ctx, method, path, body)
 	return err
