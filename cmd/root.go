@@ -37,6 +37,7 @@ func newRootCmd() *cobra.Command {
 		newLsCmd(),
 		newLogsCmd(),
 		newGitCmd(),
+		newRunCmd(),
 		newDashboardCmd(),
 		newDebugDiscoverCmd(),
 	)
