@@ -163,6 +163,29 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 // doesn't show up in `container logs`).
 const appLogPath = "/var/log/apphost.log"
 
+// EnsureDockerd makes sure the in-guest Docker daemon is healthy before Aspire
+// needs it. A guest that was stopped and started again often fails to re-start
+// dockerd from its entrypoint (stale pid/socket state), leaving it dead even
+// though the guest is "running" — Aspire then reports the runtime unhealthy. This
+// clears the stale state and (re)starts dockerd, waiting for it to answer.
+func EnsureDockerd(ctx context.Context, sd state.Siding) error {
+	if out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "docker info >/dev/null 2>&1 && echo ok"); strings.Contains(out, "ok") {
+		return nil
+	}
+	_, _ = container.Exec(ctx, sd.Container, "sh", "-c",
+		"pkill dockerd 2>/dev/null; pkill containerd 2>/dev/null; rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid 2>/dev/null; true")
+	if err := container.ExecDetached(ctx, sd.Container, "/bin/sh", "-lc", "dockerd > /var/log/dockerd.log 2>&1"); err != nil {
+		return err
+	}
+	for i := 0; i < 20; i++ {
+		if out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "docker info >/dev/null 2>&1 && echo ok"); strings.Contains(out, "ok") {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("in-guest Docker daemon didn't become healthy (see `dockerd` log in the guest)")
+}
+
 // StartApp runs the Aspire AppHost inside an already-running siding guest (build
 // + dependency image pulls happen here). It's detached and its output goes to
 // appLogPath. The guest's env (Development, Aspire endpoints) was set at Spin

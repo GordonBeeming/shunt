@@ -45,6 +45,13 @@ func newUpCmd() *cobra.Command {
 				_ = siding.StopApp(ctx, sd)
 				_, _ = container.Exec(ctx, sd.Container, "sh", "-c", "> /var/log/apphost.log")
 
+				// A restarted guest often has a dead dockerd (stale state); make sure
+				// it's healthy before the warm-load and Aspire need it.
+				fmt.Println("• checking the in-guest Docker daemon…")
+				if e := siding.EnsureDockerd(ctx, sd); e != nil {
+					return fmt.Errorf("%w — try a fresh guest: `%s rm %s && %s new %s`", e, bin(), name, bin(), name)
+				}
+
 				// Keep the host as the canonical cache: if dependency images are
 				// declared and the project cache is missing, build it from the host
 				// (pull only what the host lacks), then load it into this guest — so
