@@ -94,6 +94,25 @@ func newAppAddCmd() *cobra.Command {
 			if err := admin.Ping(ctx); err != nil {
 				return fmt.Errorf("caddy admin API not reachable — run `"+bin()+" init` first: %w", err)
 			}
+			// Drop any existing Caddy server whose route was renamed or removed in
+			// the contract. Without this the old server keeps squatting its listen
+			// port, and Caddy 500s when the new (renamed) server tries to claim the
+			// same port. The live siding's upstreams are restored by re-activating
+			// after the re-register.
+			if updating {
+				keep := map[string]bool{}
+				for _, r := range ct.FrontDoor {
+					keep[r.Kind+"/"+r.Key] = true
+				}
+				for _, r := range existing.FrontDoor {
+					if keep[r.Kind+"/"+r.Key] {
+						continue
+					}
+					if p, _, perr := caddy.ServerForRoute(loc.Project, r); perr == nil {
+						_ = admin.Delete(ctx, p)
+					}
+				}
+			}
 			assigned := map[int]bool{}
 			for _, r := range ct.FrontDoor {
 				// Fixed apps use the exact declared port (Entra/config point at it);
