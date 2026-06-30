@@ -12,8 +12,10 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 | `shunt-dev restart <name>` | Kill only the AppHost and rebuild it, keeping the guest + dockerd + dependency containers + data running. Use when `dotnet watch` misses a change. |
 | `shunt-dev logs <name> [-n N]` | Print the siding's AppHost log (build + startup + crash output) from inside the guest. Use to diagnose a failed `up`. |
 | `shunt-dev git commit [args]` | Commit in the siding's worktree on the **host** (git doesn't resolve inside the guest). Args pass straight through to `git -C <worktree> commit`; signs with your usual key. Siding taken from cwd or the live one. |
-| `shunt-dev git push [args]` | Push the siding's `shunt/<name>` branch from its worktree on the host. Args pass straight through to `git -C <worktree> push`. |
-| `shunt-dev switch <name>` | Point the stable front-door ports at a running siding (live, no restart). |
+| `shunt-dev git push [args]` | Push the siding's branch (your configured prefix) from its worktree on the host. Args pass straight through to `git -C <worktree> push`. |
+| `shunt-dev switch [name]` | Point the stable front-door ports at a running siding (live, no restart). No name → arrow-key picker. **⚠ Always confirm with the user before switching** — it repoints the shared front door away from the current live siding and can interrupt another agent/session working against it. |
+| `shunt-dev dashboard` | Serve the shunt web UI on this channel's port (dev `2220`) — browse every app's front-door ports with live up/down status, and switch/restart sidings with a click. Non-release channels show a corner ribbon. Switch/restart in the UI confirm first.|
+| `shunt-dev up`/`restart`/`logs`/`kill`/`rm` `[name]` | All accept no name and fall back to the arrow-key picker (like `switch`). |
 | `shunt-dev kill <name>` | Stop a siding's guest, keeping its worktree + data to restart later. |
 | `shunt-dev rm <name> [--force]` | Tear down a siding: remove the guest, its worktree + branch, and its data. `--force` if it's live. |
 | `shunt-dev app add` | Register an Aspire repo with shunt (reads `.shunt.app.json`). Front-door ports are random+free by default (no collisions); `fixedPorts:true` pins them. Re-run to apply contract changes. |
