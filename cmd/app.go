@@ -120,9 +120,9 @@ func newAppAddCmd() *cobra.Command {
 					Resource:   r.Resource,
 					Endpoint:   r.Endpoint,
 					GuestPort:  r.GuestPort,
-					// HTTP front-door routes serve HTTPS by default (Caddy terminates
-					// TLS with its internal CA); layer4/TCP routes stay raw.
-					TLS:     r.TLS || r.Kind == state.KindHTTP,
+					// TLS is config-driven: terminate TLS at the front door only when
+					// the route says so (services are https; the dashboard is http).
+					TLS:     r.TLS,
 					CaddyID: caddy.RouteID(loc.Project, r.Kind, r.Key),
 				}
 				app.FrontDoor = append(app.FrontDoor, route)

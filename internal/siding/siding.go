@@ -71,16 +71,11 @@ func guestEnv(app state.App) map[string]string {
 		"DOTNET_ENVIRONMENT":              "Development",
 		"DOTNET_ROLL_FORWARD":             "Major",
 	}
-	// Aspire-only: pin the dashboard/resource-service endpoints shunt discovers
-	// against, allow the unsecured anonymous dashboard, use in-guest Docker.
+	// Aspire-only: just tell Aspire to use the in-guest Docker daemon. Everything
+	// else — dashboard scheme/auth, ports, transport — comes from the app's own
+	// launch profile / config (config-driven, no cleverness, no forced-insecure).
 	if app.Runner == "" || app.Runner == runner.Aspire {
 		env["DOTNET_ASPIRE_CONTAINER_RUNTIME"] = "docker"
-		env["ASPIRE_ALLOW_UNSECURED_TRANSPORT"] = "true"
-		env["ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS"] = "true"
-		env["ASPNETCORE_URLS"] = fmt.Sprintf("http://0.0.0.0:%d", guestDashboardPort)
-		env["ASPIRE_DASHBOARD_OTLP_ENDPOINT_URL"] = "http://127.0.0.1:18889"
-		env["ASPIRE_DASHBOARD_MCP_ENDPOINT_URL"] = "http://127.0.0.1:18891"
-		env["ASPIRE_RESOURCE_SERVICE_ENDPOINT_URL"] = fmt.Sprintf("http://127.0.0.1:%d", guestRSPort)
 	}
 	// App-specific env from the contract (parameters, secrets) wins.
 	for k, v := range app.Env {

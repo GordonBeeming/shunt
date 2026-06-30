@@ -94,10 +94,11 @@ func newUpCmd() *cobra.Command {
 				if err := siding.StartApp(ctx, app, sd); err != nil {
 					return err
 				}
-				fmt.Println("• waiting for the app to start…")
-				if err := siding.WaitReady(ctx, app, sd, 25*time.Minute); err != nil {
-					return err
-				}
+				// Brief, non-fatal: the app keeps building in the background and the
+				// eager bridges serve each route as it comes up — no blocking on a
+				// readiness marker (shunt pins nothing now). Watch the dashboard.
+				fmt.Println("• starting the app (it keeps building in the background)…")
+				_ = siding.WaitReady(ctx, app, sd, 45*time.Second)
 			} else {
 				fmt.Printf("• the app is already running in %q\n", name)
 			}
