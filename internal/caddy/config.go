@@ -1,12 +1,36 @@
 package caddy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/gordonbeeming/shunt/internal/config"
+	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
+
+// DevCertPath / DevCertKeyPath are where shunt exports the host's dotnet HTTPS
+// dev certificate (PEM) for Caddy to serve — the cert the host already trusts,
+// so no new root CA is introduced.
+func DevCertPath() string    { return filepath.Join(config.GlobalDir(), "caddy", "devcert.pem") }
+func DevCertKeyPath() string { return filepath.Join(config.GlobalDir(), "caddy", "devcert.key") }
+
+// ExportDevCert writes the host's dotnet dev cert to PEM for Caddy. `dotnet
+// dev-certs https` creates the cert if it doesn't exist; the host should have
+// trusted it once with `dotnet dev-certs https --trust`.
+func ExportDevCert(ctx context.Context) error {
+	if err := os.MkdirAll(filepath.Dir(DevCertPath()), 0o755); err != nil {
+		return err
+	}
+	if _, err := proc.Run(ctx, "dotnet", "dev-certs", "https",
+		"--export-path", DevCertPath(), "--format", "PEM", "--no-password"); err != nil {
+		return fmt.Errorf("export dotnet dev cert (run `dotnet dev-certs https --trust` once): %w", err)
+	}
+	return nil
+}
 
 // RouteID is the @id shunt stamps on a route's proxy handler so switch can PATCH
 // its upstream directly: app_<app>_<kind>_<key>.
@@ -28,14 +52,15 @@ func Bootstrap() ([]byte, error) {
 		"apps": map[string]any{
 			"http":   map[string]any{"servers": map[string]any{}},
 			"layer4": map[string]any{"servers": map[string]any{}},
-			// Issue localhost certs from Caddy's own internal CA so HTTPS front-door
-			// routes work offline with no public ACME. `shunt init` runs `caddy trust`
-			// to add the CA root to the host trust store.
+			// Serve HTTPS with the host's dotnet dev certificate (the one `dotnet
+			// dev-certs https --trust` already trusts) — NOT a Caddy-rolled internal
+			// CA. `shunt init` exports it to these PEM files; no new root cert is
+			// added to the trust store.
 			"tls": map[string]any{
-				"automation": map[string]any{
-					"policies": []any{map[string]any{
-						"subjects": []string{"localhost", "127.0.0.1"},
-						"issuers":  []any{map[string]any{"module": "internal"}},
+				"certificates": map[string]any{
+					"load_files": []any{map[string]any{
+						"certificate": DevCertPath(),
+						"key":         DevCertKeyPath(),
 					}},
 				},
 			},

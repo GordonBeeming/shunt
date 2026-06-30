@@ -39,6 +39,11 @@ func newInitCmd() *cobra.Command {
 				return err
 			}
 
+			fmt.Println("• exporting the dotnet dev certificate for Caddy…")
+			if err := caddy.ExportDevCert(ctx); err != nil {
+				return err
+			}
+
 			fmt.Println("• writing bootstrap config…")
 			if err := writeBootstrap(); err != nil {
 				return err
