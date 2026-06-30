@@ -358,43 +358,38 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 		sd.Bridges = map[string]int{}
 	}
 
-	// Non-aspire runners have no gRPC resource service — bridge each route's
-	// declared in-guest port straight to the front door (no discovery).
-	if app.Runner != "" && app.Runner != runner.Aspire {
-		for _, r := range app.FrontDoor {
-			if r.GuestPort == 0 {
-				return fmt.Errorf("route %q: a non-aspire app needs `guestPort` in .shunt.app.json", r.Key)
-			}
-			// host == guest: expose the app's port at the same number on the guest
-			// IP, so the front door is localhost:<port> -> guest:<port>.
-			ext := r.ListenPort
-			if err := container.Bridge(ctx, sd.Container, ip, ext, r.GuestPort); err != nil {
-				return err
-			}
-			sd.Bridges[r.Key] = ext
+	// Any route with a declared guestPort is bridged eagerly, host==guest: bind
+	// the guest IP at the same port and forward to the app's loopback port. socat
+	// comes up immediately (before the app even binds), so the front door
+	// auto-serves the moment each service starts — no discovery, no waiting on a
+	// slow/unhealthy resource, no re-switch.
+	var needDiscovery []state.Route
+	for _, r := range app.FrontDoor {
+		if r.GuestPort == 0 {
+			needDiscovery = append(needDiscovery, r)
+			continue
 		}
-		return nil
+		if err := container.Bridge(ctx, sd.Container, ip, r.ListenPort, r.GuestPort); err != nil {
+			return err
+		}
+		sd.Bridges[r.Key] = r.ListenPort
+	}
+	if len(needDiscovery) == 0 {
+		return nil // every route declared its port — nothing to discover
 	}
 
-	// Bridge the resource service so shunt can discover from the host (internal,
-	// all interfaces — extPort != intPort, so no host==guest reuse needed).
+	// Discovery fallback only for routes that DON'T declare a guestPort (legacy
+	// Aspire apps that let Aspire assign ports): bridge the resource service,
+	// resolve each one, bridge whatever has come up.
 	if err := container.Bridge(ctx, sd.Container, "", rsExtPort, guestRSPort); err != nil {
 		return err
 	}
-	// Give endpoints a short grace to publish after start, then bridge whatever
-	// has resolved — don't block on a resource that won't come up (e.g. a flaky
-	// web UI). The routes that are up become live; the rest stay on the
-	// placeholder dial and can be bound by re-running switch once they start.
-	eps, err := discoverReady(ctx, fmt.Sprintf("%s:%d", ip, rsExtPort), app.FrontDoor, 90*time.Second)
+	eps, err := discoverReady(ctx, fmt.Sprintf("%s:%d", ip, rsExtPort), needDiscovery, 90*time.Second)
 	if err != nil {
 		return fmt.Errorf("discover endpoints: %w", err)
 	}
-
-	if sd.Bridges == nil {
-		sd.Bridges = map[string]int{}
-	}
 	var pending []string
-	for _, r := range app.FrontDoor {
+	for _, r := range needDiscovery {
 		ep, ok := aspire.Find(eps, r.Resource, r.Endpoint)
 		if !ok {
 			pending = append(pending, fmt.Sprintf("%s (%s)", r.Key, r.Resource))
@@ -407,16 +402,13 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 		if dp := container.DockerPort(ctx, sd.Container, ep.Resource); dp > 0 {
 			realPort = dp
 		}
-		// host == guest: expose at the same number on the guest IP, so the front
-		// door is localhost:<listenPort> -> guest:<listenPort>.
-		ext := r.ListenPort
-		if err := container.Bridge(ctx, sd.Container, ip, ext, realPort); err != nil {
+		if err := container.Bridge(ctx, sd.Container, ip, r.ListenPort, realPort); err != nil {
 			return err
 		}
-		sd.Bridges[r.Key] = ext
+		sd.Bridges[r.Key] = r.ListenPort
 	}
 	if len(pending) > 0 {
-		fmt.Printf("  ⚠ %d route(s) not up yet: %s — they'll serve once they start; re-run `switch` to bind them\n",
+		fmt.Printf("  ⚠ %d route(s) not up yet: %s — they'll serve automatically once they start\n",
 			len(pending), strings.Join(pending, ", "))
 	}
 	return nil
