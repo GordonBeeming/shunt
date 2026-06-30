@@ -177,13 +177,23 @@ func CurrentDial(ctx context.Context, a *Admin, r state.Route) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	dial, err := parseDial(raw)
+	if err != nil {
+		return "", fmt.Errorf("%w for %q", err, r.CaddyID)
+	}
+	return dial, nil
+}
+
+// parseDial pulls the first upstream dial out of a Caddy handler's JSON, for both
+// shapes: http reverse_proxy stores `dial` as a string, layer4 proxy as an array.
+func parseDial(raw []byte) (string, error) {
 	var h struct {
 		Upstreams []struct {
 			Dial json.RawMessage `json:"dial"`
 		} `json:"upstreams"`
 	}
 	if err := json.Unmarshal(raw, &h); err != nil || len(h.Upstreams) == 0 {
-		return "", fmt.Errorf("no upstream dial for %q", r.CaddyID)
+		return "", fmt.Errorf("no upstream dial")
 	}
 	var s string
 	if json.Unmarshal(h.Upstreams[0].Dial, &s) == nil && s != "" {
@@ -193,7 +203,7 @@ func CurrentDial(ctx context.Context, a *Admin, r state.Route) (string, error) {
 	if json.Unmarshal(h.Upstreams[0].Dial, &arr) == nil && len(arr) > 0 {
 		return arr[0], nil
 	}
-	return "", fmt.Errorf("unrecognized dial shape for %q", r.CaddyID)
+	return "", fmt.Errorf("unrecognized dial shape")
 }
 
 // routeApp recovers the app name from a route's CaddyID (app_<app>_<kind>_<key>).

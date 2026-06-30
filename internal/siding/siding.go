@@ -321,7 +321,7 @@ func WaitStarted(ctx context.Context, guestName string, timeout time.Duration) e
 			return nil
 		}
 		// Fallback: Aspire's core (the dashboard) is up but not every resource has
-		// reported "started" — a flaky/slow resource (HubX's web UI is prone to
+		// reported "started" — a flaky/slow resource (a heavy web UI is prone to
 		// this). After a grace period, proceed so the front door can still bridge
 		// whatever IS up (DB, APIs, dashboard).
 		if strings.Contains(out, "Now listening on") && strings.Contains(out, ":18888") {
@@ -605,7 +605,7 @@ func allPortsListening(ctx context.Context, app state.App, sd state.Siding) bool
 
 // AppRunning reports whether the app is already up in the guest, so a re-run of
 // `up` re-activates instead of restarting (and colliding with) a live AppHost —
-// HubX never logs the "started" marker, so a log check alone re-launches it.
+// some apps never log the "started" marker, so a log check alone re-launches it.
 func AppRunning(ctx context.Context, app state.App, sd state.Siding) bool {
 	if app.Runner == "" || app.Runner == runner.Aspire {
 		// The resource-service port (18890 = hex 49CA) being bound means the

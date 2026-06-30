@@ -110,6 +110,32 @@ func TestDialPatch(t *testing.T) {
 	}
 }
 
+func TestParseDial(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{"http string dial", `{"handler":"reverse_proxy","upstreams":[{"dial":"1.2.3.4:80"}]}`, "1.2.3.4:80", false},
+		{"layer4 array dial", `{"handler":"proxy","upstreams":[{"dial":["1.2.3.4:5432"]}]}`, "1.2.3.4:5432", false},
+		{"no upstreams", `{"@id":"app_x_http_y"}`, "", true},
+		{"empty upstreams", `{"upstreams":[]}`, "", true},
+		{"garbage", `not json`, "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := parseDial([]byte(c.raw))
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, c.wantErr)
+			}
+			if got != c.want {
+				t.Errorf("parseDial = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestBootstrapHasApps(t *testing.T) {
 	body, err := Bootstrap()
 	if err != nil {

@@ -42,7 +42,7 @@ func newUpCmd() *cobra.Command {
 
 			// Idempotent: only (re)launch the app if it isn't already running in the
 			// guest. Checking the running app — not the log marker — means re-running
-			// `up` on a live app (which HubX never marks "started") re-activates
+			// `up` on a live app (some apps never mark "started") re-activates
 			// instead of restarting and colliding with the live AppHost.
 			if !siding.AppRunning(ctx, app, sd) {
 				// Stop any stale orchestration first so we don't start a second
