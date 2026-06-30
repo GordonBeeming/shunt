@@ -73,6 +73,7 @@ func newAppAddCmd() *cobra.Command {
 				RepoOrigin:    gitOrigin(ctx, cwd),
 				Runner:        runnerKind,
 				Start:         startCmd,
+				Stop:          ct.Stop,
 				Workdir:       workdir,
 				AppHostPath:   ct.AppHost,
 				ConfigDir:     loc.ConfigDir,

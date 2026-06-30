@@ -26,6 +26,7 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
   "runner": "aspire",                      // aspire | dotnet | node | custom (omit = auto-detect at app add)
   "apphost": "src/App.AppHost/App.AppHost.csproj",  // aspire only
   "start": "pnpm dev",                     // non-aspire: command to start the app
+  "stop": "aspire stop",                   // optional clean-stop command (shunt force-kills as a fallback)
   "workdir": "src/web",                    // non-aspire: dir to run start in (relative)
   "frontDoor": [
     { "key": "web", "kind": "http",   "listenPort": 8080,  "resource": "<aspire-resource>", "endpoint": "http" },

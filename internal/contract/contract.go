@@ -23,7 +23,8 @@ type Contract struct {
 	// use Start + a declared per-route guestPort.
 	Runner  string `json:"runner"`
 	Start   string `json:"start"`   // start command for dotnet/node/custom (run in Workdir)
-	Workdir string `json:"workdir"` // dir to run Start in, relative to the repo (default repo root)
+	Stop    string `json:"stop"`    // optional clean-stop command (e.g. `aspire stop`); shunt's force-kill is the fallback
+	Workdir string `json:"workdir"` // dir to run Start/Stop in, relative to the repo (default repo root)
 
 	AppHost     string             `json:"apphost"`   // aspire only: rel path to the AppHost project/csproj
 	FrontDoor   []FrontDoorRoute   `json:"frontDoor"` // stable front-door routes

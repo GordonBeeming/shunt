@@ -42,7 +42,7 @@ func newUpCmd() *cobra.Command {
 			if !strings.Contains(out, "Distributed application started") {
 				// Stop any stale orchestration first so we don't start a second
 				// AppHost (port clash), and clear its log so WaitStarted waits fresh.
-				_ = siding.StopApp(ctx, sd)
+				_ = siding.StopApp(ctx, app, sd)
 				_, _ = container.Exec(ctx, sd.Container, "sh", "-c", "> /var/log/apphost.log")
 
 				// A restarted guest often has a dead dockerd (stale state); make sure

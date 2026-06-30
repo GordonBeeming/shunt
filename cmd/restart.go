@@ -34,7 +34,7 @@ func newRestartCmd() *cobra.Command {
 			}
 
 			fmt.Printf("• stopping the AppHost in %q (keeping deps + data up)…\n", name)
-			if err := siding.StopApp(ctx, sd); err != nil {
+			if err := siding.StopApp(ctx, app, sd); err != nil {
 				return err
 			}
 			// Clear the old start marker so WaitStarted waits for the fresh run.

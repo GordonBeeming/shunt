@@ -216,17 +216,25 @@ func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 // service 18890, MCP 18891) as the hex used in /proc/net/tcp local addresses.
 const aspirePortHex = "49C8 49C9 49CA 49CB"
 
-// StopApp stops the Aspire orchestration inside the guest WITHOUT touching the
-// guest, dockerd, or the dependency containers (which run under dockerd on other
-// ports), so a rebuild keeps SQL etc. + their data up.
+// StopApp stops the app inside the guest WITHOUT touching the guest, dockerd, or
+// the dependency containers (which run under dockerd on other ports), so a
+// rebuild keeps SQL etc. + their data up.
 //
-// Two steps, because `dotnet run`/`watch` RESPAWN the compiled AppHost binary
-// when it's killed: first SIGKILL the run/watch wrappers so nothing respawns,
-// then free the Aspire host ports by finding whatever still holds them via the
-// socket inode in /proc/net/tcp (catches the compiled AppHost binary, dashboard,
-// and DCP regardless of their process names). Name-pattern pkill alone missed
-// the compiled binary and the wrapper kept restarting it.
-func StopApp(ctx context.Context, sd state.Siding) error {
+// First it runs the app's configured clean-stop command if any (e.g. `aspire
+// stop`). Then — always, as a fallback, because `dotnet run`/`watch` RESPAWN the
+// compiled AppHost binary when killed — it SIGKILLs the run/watch wrappers so
+// nothing respawns and frees the Aspire host ports by finding whatever holds
+// them via the socket inode in /proc/net/tcp (name-agnostic; catches the
+// compiled AppHost binary, dashboard, and DCP).
+func StopApp(ctx context.Context, app state.App, sd state.Siding) error {
+	// Clean stop first (best-effort) — the force-kill below is the safety net.
+	if app.Stop != "" {
+		wd := "/workspace"
+		if app.Workdir != "" {
+			wd = "/workspace/" + app.Workdir
+		}
+		_, _ = container.Exec(ctx, sd.Container, "/bin/sh", "-lc", fmt.Sprintf("cd %s && %s", wd, app.Stop))
+	}
 	script := `
 for p in 'dotnet watch' 'dotnet-watch' 'dotnet run'; do pkill -9 -f "$p" 2>/dev/null; done
 for hex in ` + aspirePortHex + `; do

@@ -33,7 +33,8 @@ type App struct {
 	RepoPath    string            `json:"repoPath"`          // the original repo on disk
 	Runner      string            `json:"runner"`            // aspire | dotnet | node | custom
 	Start       string            `json:"start,omitempty"`   // start command (non-aspire)
-	Workdir     string            `json:"workdir,omitempty"` // dir to run Start in (non-aspire)
+	Stop        string            `json:"stop,omitempty"`    // optional clean-stop command; force-kill is the fallback
+	Workdir     string            `json:"workdir,omitempty"` // dir to run Start/Stop in (non-aspire)
 	AppHostPath string            `json:"appHostPath"`       // aspire: rel path to the AppHost project
 	ConfigDir   string            `json:"configDir"`         // <repos>/.shunt[-ch]/<project>
 	FrontDoor   []Route           `json:"frontDoor"`
