@@ -202,21 +202,34 @@ func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 	return container.ExecDetached(ctx, sd.Container, "/bin/sh", "-lc", runCmd)
 }
 
-// StopApp kills the AppHost (dotnet watch/run) process inside the guest WITHOUT
-// touching the guest, dockerd, or the dependency containers — so a rebuild can
-// happen while SQL etc. and their data stay up. The docker-managed dependency
-// containers are a separate process tree, unaffected by these kills.
+// aspirePortHex are the Aspire host ports (dashboard 18888, OTLP 18889, resource
+// service 18890, MCP 18891) as the hex used in /proc/net/tcp local addresses.
+const aspirePortHex = "49C8 49C9 49CA 49CB"
+
+// StopApp stops the Aspire orchestration inside the guest WITHOUT touching the
+// guest, dockerd, or the dependency containers (which run under dockerd on other
+// ports), so a rebuild keeps SQL etc. + their data up.
+//
+// Two steps, because `dotnet run`/`watch` RESPAWN the compiled AppHost binary
+// when it's killed: first SIGKILL the run/watch wrappers so nothing respawns,
+// then free the Aspire host ports by finding whatever still holds them via the
+// socket inode in /proc/net/tcp (catches the compiled AppHost binary, dashboard,
+// and DCP regardless of their process names). Name-pattern pkill alone missed
+// the compiled binary and the wrapper kept restarting it.
 func StopApp(ctx context.Context, sd state.Siding) error {
-	// Kill the whole Aspire orchestration — the watch wrapper, the AppHost, the
-	// dashboard, and the DCP control plane — so none of them keep holding ports.
-	// Dependency containers (SQL, Azurite, etc.) run under dockerd and don't match
-	// these patterns, so they stay up.
-	// dotnet watch spawns a tree (the `dotnet watch` launcher, the dotnet-watch.dll
-	// worker, and DOTNET_WATCH=1 child processes per project) — match all of them,
-	// plus the AppHost, dashboard, and DCP, so nothing keeps holding the Aspire
-	// ports. Dep containers run under dockerd and don't carry these markers.
-	_, err := container.Exec(ctx, sd.Container, "sh", "-c",
-		"for p in 'dotnet watch' 'dotnet-watch' 'DOTNET_WATCH=1' 'AppHost' 'Aspire.Dashboard' '/dcp '; do pkill -f \"$p\" 2>/dev/null; done; sleep 1; true")
+	script := `
+for p in 'dotnet watch' 'dotnet-watch' 'dotnet run'; do pkill -9 -f "$p" 2>/dev/null; done
+for hex in ` + aspirePortHex + `; do
+  for f in /proc/net/tcp /proc/net/tcp6; do
+    ino=$(awk -v h=":$hex" '$2 ~ h"$" {print $10; exit}' "$f" 2>/dev/null)
+    [ -n "$ino" ] || continue
+    for d in /proc/[0-9]*/fd; do
+      ls -l "$d" 2>/dev/null | grep -q "socket:\[$ino\]" && kill -9 "$(echo "$d" | cut -d/ -f3)" 2>/dev/null
+    done
+  done
+done
+sleep 1; true`
+	_, err := container.Exec(ctx, sd.Container, "sh", "-c", script)
 	return err
 }
 
