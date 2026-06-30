@@ -16,6 +16,7 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 | `shunt-dev rm <name> [--force]` | Tear down a siding: remove the guest, its worktree + branch, and its data. `--force` if it's live. |
 | `shunt-dev app add` | Register an Aspire repo with shunt (reads `.shunt.app.json`). One-time per repo. |
 | `shunt-dev init` | One-time machine setup: builds Caddy + the base image, starts the proxy. |
+| `shunt-dev cert install` | Export the host's dotnet dev cert and load it into Caddy (front door serves HTTPS with the cert you already trust — no extra CA). |
 
 ## The `.shunt.app.json` contract (one per repo)
 
