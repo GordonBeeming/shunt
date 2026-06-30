@@ -182,8 +182,11 @@ func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 // happen while SQL etc. and their data stay up. The docker-managed dependency
 // containers are a separate process tree, unaffected by these kills.
 func StopApp(ctx context.Context, sd state.Siding) error {
+	// Target the AppHost runner specifically (its cmdline carries the AppHost
+	// project) plus the watch wrapper. Dependency containers run under dockerd
+	// in their own namespaces and don't match, so they stay up.
 	_, err := container.Exec(ctx, sd.Container, "sh", "-c",
-		"pkill -f 'dotnet watch' 2>/dev/null; pkill -f 'dotnet.*run' 2>/dev/null; true")
+		"pkill -f 'dotnet watch' 2>/dev/null; pkill -f 'AppHost' 2>/dev/null; true")
 	return err
 }
 
