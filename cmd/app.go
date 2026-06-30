@@ -5,11 +5,11 @@ import (
 	"os"
 
 	"github.com/gordonbeeming/shunt/internal/caddy"
-	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/contract"
 	"github.com/gordonbeeming/shunt/internal/resolve"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
+	"net"
 )
 
 func newAppCmd() *cobra.Command {
@@ -41,12 +41,6 @@ func newAppAddCmd() *cobra.Command {
 				return err
 			}
 
-			// Fixed-port apps use the exact declared ports (Entra/config point at
-			// them); otherwise apply the channel offset so channels coexist.
-			offset := config.Current().PortOffset
-			if ct.FixedPorts {
-				offset = 0
-			}
 			app := state.App{
 				Name:          loc.Project,
 				RepoPath:      cwd,
@@ -68,11 +62,29 @@ func newAppAddCmd() *cobra.Command {
 			if err := admin.Ping(ctx); err != nil {
 				return fmt.Errorf("caddy admin API not reachable — run `"+bin()+" init` first: %w", err)
 			}
+			assigned := map[int]bool{}
 			for _, r := range ct.FrontDoor {
+				// Fixed apps use the exact declared port (Entra/config point at it);
+				// otherwise pick a random free host port — preserved across re-adds —
+				// so different apps and channels never collide.
+				port := r.ListenPort
+				if !ct.FixedPorts {
+					port = 0
+					if updating {
+						port = existingRoutePort(existing, r.Key, r.Kind)
+					}
+					if port == 0 {
+						port, err = freePort(assigned)
+						if err != nil {
+							return err
+						}
+					}
+				}
+				assigned[port] = true
 				route := state.Route{
 					Key:        r.Key,
 					Kind:       r.Kind,
-					ListenPort: r.ListenPort + offset,
+					ListenPort: port,
 					Resource:   r.Resource,
 					Endpoint:   r.Endpoint,
 					// HTTP front-door routes serve HTTPS by default (Caddy terminates
@@ -109,7 +121,11 @@ func newAppAddCmd() *cobra.Command {
 			if updating {
 				verb = "updated"
 			}
-			fmt.Printf("✓ %s %s (%d front-door routes, channel offset +%d)\n", verb, app.Name, len(app.FrontDoor), offset)
+			ports := "random free ports"
+			if ct.FixedPorts {
+				ports = "fixed ports"
+			}
+			fmt.Printf("✓ %s %s (%d front-door routes, %s)\n", verb, app.Name, len(app.FrontDoor), ports)
 			for _, r := range app.FrontDoor {
 				fmt.Printf("  %-10s %-6s localhost:%d  ->  %s/%s\n", r.Key, r.Kind, r.ListenPort, r.Resource, r.Endpoint)
 			}
@@ -117,4 +133,31 @@ func newAppAddCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// freePort returns a free TCP port on the host not already in used.
+func freePort(used map[int]bool) (int, error) {
+	for i := 0; i < 200; i++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return 0, err
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		_ = l.Close()
+		if !used[port] {
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("could not find a free port")
+}
+
+// existingRoutePort returns the port already assigned to a route (by key+kind)
+// so re-running app add keeps stable ports; 0 if not found.
+func existingRoutePort(app state.App, key, kind string) int {
+	for _, r := range app.FrontDoor {
+		if r.Key == key && r.Kind == kind {
+			return r.ListenPort
+		}
+	}
+	return 0
 }
