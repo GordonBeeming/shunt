@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"os"
@@ -37,9 +36,11 @@ func newUpCmd() *cobra.Command {
 				return fmt.Errorf("the guest for %q isn't running (state=%s); recreate it with `"+bin()+" new`", name, st)
 			}
 
-			// Idempotent: only launch Aspire if it isn't already up in the guest.
-			out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "cat /var/log/apphost.log 2>/dev/null")
-			if !strings.Contains(out, "Distributed application started") {
+			// Idempotent: only (re)launch the app if it isn't already running in the
+			// guest. Checking the running app — not the log marker — means re-running
+			// `up` on a live app (which HubX never marks "started") re-activates
+			// instead of restarting and colliding with the live AppHost.
+			if !siding.AppRunning(ctx, app, sd) {
 				// Stop any stale orchestration first so we don't start a second
 				// AppHost (port clash), and clear its log so WaitStarted waits fresh.
 				_ = siding.StopApp(ctx, app, sd)

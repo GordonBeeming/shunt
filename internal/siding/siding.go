@@ -558,3 +558,17 @@ func allPortsListening(ctx context.Context, app state.App, sd state.Siding) bool
 	}
 	return true
 }
+
+// AppRunning reports whether the app is already up in the guest, so a re-run of
+// `up` re-activates instead of restarting (and colliding with) a live AppHost —
+// HubX never logs the "started" marker, so a log check alone re-launches it.
+func AppRunning(ctx context.Context, app state.App, sd state.Siding) bool {
+	if app.Runner == "" || app.Runner == runner.Aspire {
+		// The resource-service port (18890 = hex 49CA) being bound means the
+		// AppHost is running.
+		out, _ := container.Exec(ctx, sd.Container, "sh", "-c",
+			"cat /proc/net/tcp 2>/dev/null | awk '{print $2}' | grep -iq ':49CA' && echo up")
+		return strings.Contains(out, "up")
+	}
+	return allPortsListening(ctx, app, sd)
+}
