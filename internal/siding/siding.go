@@ -191,12 +191,13 @@ func EnsureDockerd(ctx context.Context, sd state.Siding) error {
 // appLogPath. The guest's env (Development, Aspire endpoints) was set at Spin
 // time and is inherited by the exec.
 //
-// It runs under `dotnet watch` so host edits hot-reload across the VM boundary
-// (DOTNET_USE_POLLING_FILE_WATCHER is set at Spin time). Watch is best-effort —
-// `shunt restart` (StopApp + StartApp) is the reliable full-rebuild path that
-// keeps the guest + dockerd + dependency containers + their data running.
+// It runs plain `dotnet run` for reliability. `dotnet watch` was tried for
+// hot-reload, but its static-web-assets watcher chokes on Linux under the .NET 10
+// preview SDK (looks for an `obj\Debug\…` Windows path and blocks the UI/API
+// projects from starting). `shunt restart` (StopApp + StartApp) is the rebuild
+// path — it keeps the guest + dockerd + dependency containers + data running.
 func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
-	runCmd := fmt.Sprintf("cd /workspace && dotnet watch --non-interactive --project %s run --no-launch-profile > %s 2>&1",
+	runCmd := fmt.Sprintf("cd /workspace && dotnet run --no-launch-profile --project %s > %s 2>&1",
 		app.AppHostPath, appLogPath)
 	return container.ExecDetached(ctx, sd.Container, "/bin/sh", "-lc", runCmd)
 }
@@ -239,6 +240,7 @@ func WaitStarted(ctx context.Context, guestName string, timeout time.Duration) e
 	deadline := time.Now().Add(timeout)
 	start := time.Now()
 	shown := 0
+	var dashSince time.Time // when the Aspire dashboard first came up
 	for time.Now().Before(deadline) {
 		st, err := container.State(ctx, guestName)
 		if err == nil && st != "running" {
@@ -257,6 +259,19 @@ func WaitStarted(ctx context.Context, guestName string, timeout time.Duration) e
 		if strings.Contains(out, startedMarker) {
 			tail.Stop(fmt.Sprintf("✓ Aspire started (%s)", time.Since(start).Round(time.Second)))
 			return nil
+		}
+		// Fallback: Aspire's core (the dashboard) is up but not every resource has
+		// reported "started" — a flaky/slow resource (HubX's web UI is prone to
+		// this). After a grace period, proceed so the front door can still bridge
+		// whatever IS up (DB, APIs, dashboard).
+		if strings.Contains(out, "Now listening on") && strings.Contains(out, ":18888") {
+			if dashSince.IsZero() {
+				dashSince = time.Now()
+			}
+			if time.Since(dashSince) > 90*time.Second {
+				tail.Stop(fmt.Sprintf("✓ Aspire up (%s) — dashboard reachable; some resources may still be starting", time.Since(start).Round(time.Second)))
+				return nil
+			}
 		}
 		if strings.Contains(out, "Unhandled exception") || strings.Contains(out, "Hosting failed") ||
 			strings.Contains(out, "Exited with error code") {
