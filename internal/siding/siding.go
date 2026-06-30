@@ -373,9 +373,11 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 	if err := container.Bridge(ctx, sd.Container, rsExtPort, guestRSPort); err != nil {
 		return err
 	}
-	// "Distributed application started" fires before every dependency has
-	// published its endpoint URL, so poll until all front-door resources resolve.
-	eps, err := discoverReady(ctx, fmt.Sprintf("%s:%d", ip, rsExtPort), app.FrontDoor, 10*time.Minute)
+	// Give endpoints a short grace to publish after start, then bridge whatever
+	// has resolved — don't block on a resource that won't come up (e.g. a flaky
+	// web UI). The routes that are up become live; the rest stay on the
+	// placeholder dial and can be bound by re-running switch once they start.
+	eps, err := discoverReady(ctx, fmt.Sprintf("%s:%d", ip, rsExtPort), app.FrontDoor, 90*time.Second)
 	if err != nil {
 		return fmt.Errorf("discover endpoints: %w", err)
 	}
@@ -383,11 +385,12 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 	if sd.Bridges == nil {
 		sd.Bridges = map[string]int{}
 	}
+	var pending []string
 	for i, r := range app.FrontDoor {
 		ep, ok := aspire.Find(eps, r.Resource, r.Endpoint)
 		if !ok {
-			return fmt.Errorf("route %q: no live endpoint for resource %q (endpoint %q) — discovered: %s",
-				r.Key, r.Resource, r.Endpoint, summarize(eps))
+			pending = append(pending, fmt.Sprintf("%s (%s)", r.Key, r.Resource))
+			continue
 		}
 		// For container-backed resources, target the real docker-published port
 		// rather than Aspire's DCP proxy port (which doesn't forward through a
@@ -401,6 +404,10 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 			return err
 		}
 		sd.Bridges[r.Key] = ext
+	}
+	if len(pending) > 0 {
+		fmt.Printf("  ⚠ %d route(s) not up yet: %s — they'll serve once they start; re-run `switch` to bind them\n",
+			len(pending), strings.Join(pending, ", "))
 	}
 	return nil
 }
@@ -450,7 +457,9 @@ func PointCaddy(ctx context.Context, app state.App, sd *state.Siding) error {
 	for _, r := range app.FrontDoor {
 		ext, ok := sd.Bridges[r.Key]
 		if !ok {
-			return fmt.Errorf("route %q has no bridge on siding %q (activate it first)", r.Key, sd.Name)
+			// Route not up yet (partial activation) — leave it on the placeholder
+			// dial; it gets bound when the resource starts and switch re-runs.
+			continue
 		}
 		path, body, err := caddy.DialPatch(r, fmt.Sprintf("%s:%d", ip, ext))
 		if err != nil {
