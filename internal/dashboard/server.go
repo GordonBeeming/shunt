@@ -96,7 +96,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue // a project whose state is missing/unreadable — skip, don't fail the page
 		}
-		av := appView{Name: app.Name, LiveSiding: app.LiveSiding}
+		av := appView{Name: app.Name, LiveSiding: app.LiveSiding, Routes: []routeView{}, Sidings: []sidingView{}}
 
 		// Routes + host-side liveness (only meaningful when something is live, but
 		// the dial is harmless either way — a refused port just reads as down).

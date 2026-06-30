@@ -47,27 +47,32 @@
     text-transform: uppercase; box-shadow: 0 -2px 8px rgba(0,0,0,.3);
   }
 
-  .app { background: var(--card); border: 1px solid var(--ui); border-radius: 12px; margin-bottom: 22px; overflow: hidden; }
-  .app > h2 { margin: 0; padding: 14px 18px; font-size: 17px; border-bottom: 1px solid var(--ui); display: flex; align-items: center; gap: 10px; }
-  .app > h2 .live { font-size: 12px; font-weight: 600; color: var(--text2); }
+  .app { background: var(--card); border: 1px solid var(--ui); border-radius: 14px; margin-bottom: 20px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  .app > h2 { margin: 0; padding: 15px 20px; font-size: 16px; border-bottom: 1px solid var(--ui); display: flex; align-items: center; gap: 10px; }
+  .app > h2 .live { font-size: 12px; font-weight: 500; color: var(--text2); }
+  .app > h2 .live strong { color: var(--text); }
 
-  .routes { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; padding: 16px 18px; }
-  .route { display: flex; align-items: center; gap: 9px; min-width: 0; }
-  .route .dot { width: 11px; height: 11px; border-radius: 50%; flex: none; box-shadow: 0 0 0 3px rgba(0,0,0,.04); }
+  /* one route per cell: status dot + key on top, full-width url underneath so it
+     never wraps mid-word into a cramped column */
+  .routes { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 15px 20px; padding: 18px 20px; }
+  .route { display: flex; align-items: flex-start; gap: 9px; min-width: 0; }
+  .route .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; margin-top: 4px; box-shadow: 0 0 0 3px rgba(0,0,0,.05); }
   .dot.up { background: var(--up); } .dot.down { background: var(--down); }
-  .route .key { font-weight: 600; flex: none; }
-  .route a, .route .addr { color: var(--primary); font-family: var(--mono); font-size: 12.5px; text-decoration: none; overflow-wrap: anywhere; }
+  .rmeta { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+  .route .key { font-weight: 600; font-size: 13px; }
+  .route a, .route .addr { color: var(--primary); font-family: var(--mono); font-size: 11.5px; text-decoration: none; word-break: break-all; }
   .route a:hover { text-decoration: underline; }
-  .route a:focus-visible, button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+  .route a:focus-visible, button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: 5px; }
 
-  .sidings { border-top: 1px solid var(--ui); padding: 12px 18px 16px; }
-  .sidings .lbl { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--text2); margin-bottom: 8px; }
-  .siding { display: flex; align-items: center; gap: 12px; padding: 7px 0; border-top: 1px dashed var(--ui); }
+  .sidings { border-top: 1px solid var(--ui); padding: 14px 20px 16px; }
+  .sidings .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--text2); margin-bottom: 6px; }
+  .siding { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-top: 1px solid var(--ui); }
   .siding:first-of-type { border-top: none; }
-  .siding .nm { font-family: var(--mono); font-size: 13px; }
-  .siding .star { color: var(--primary); font-weight: 800; width: 12px; flex: none; }
-  .siding .guest { font-size: 11.5px; color: var(--text2); }
-  .siding .status { font-size: 12px; color: var(--busy); margin-left: 4px; }
+  .siding .nm { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+  .badge { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; padding: 2px 8px; border-radius: 999px; }
+  .badge.live { background: var(--up); color: #fff; }
+  .siding .guest { font-size: 11px; color: var(--text2); }
+  .siding .status { font-size: 12px; color: var(--busy); }
   .siding .spacer { flex: 1; }
   button {
     font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
@@ -115,24 +120,25 @@ function routeHTML(r){
   const target = r.kind === 'http'
     ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url)}</a>`
     : `<span class="addr">${esc(r.url)}</span>`;
-  return `<div class="route">${dot}<span class="key">${esc(r.key)}</span>${target}</div>`;
+  return `<div class="route">${dot}<div class="rmeta"><span class="key">${esc(r.key)}</span>${target}</div></div>`;
 }
 
 function sidingHTML(appName, s){
-  const star = s.live ? '<span class="star" title="live">*</span>' : '<span class="star"></span>';
+  const badge = s.live ? '<span class="badge live">live</span>' : '';
   const status = s.status ? `<span class="status">${esc(s.status)}</span>` : '';
   const guest = s.guest ? `<span class="guest">${esc(s.guest)}</span>` : '';
   const busy = s.status && s.status.indexOf('…') >= 0;
   const sw = s.live ? '' : `<button onclick="doSwitch('${esc(appName)}','${esc(s.name)}')" ${busy?'disabled':''}>Switch</button>`;
-  return `<div class="siding">${star}<span class="nm">${esc(s.name)}</span> ${guest} ${status}
+  return `<div class="siding"><span class="nm">${esc(s.name)}</span> ${badge} ${guest} ${status}
     <span class="spacer"></span>${sw}
     <button class="primary" onclick="doRestart('${esc(appName)}','${esc(s.name)}')" ${busy?'disabled':''}>Restart</button></div>`;
 }
 
 function appHTML(a){
+  const rts = a.routes || [], sds = a.sidings || [];   // server may send null for empty
   const live = a.liveSiding ? `live: <strong>${esc(a.liveSiding)}</strong>` : 'nothing live';
-  const routes = a.routes.length ? a.routes.map(routeHTML).join('') : '<span class="guest">no routes</span>';
-  const sidings = a.sidings.length ? a.sidings.map(s => sidingHTML(a.name, s)).join('') : '<span class="guest">no sidings — `shunt new`</span>';
+  const routes = rts.length ? rts.map(routeHTML).join('') : '<span class="guest">no routes</span>';
+  const sidings = sds.length ? sds.map(s => sidingHTML(a.name, s)).join('') : '<span class="guest">no sidings — `shunt new`</span>';
   return `<section class="app">
     <h2>${esc(a.name)} <span class="live">${live}</span></h2>
     <div class="routes">${routes}</div>
@@ -160,20 +166,27 @@ function applyChannel(ch){
 }
 
 async function refresh(){
+  let st;
   try {
-    const st = await (await fetch('/api/state')).json();
+    st = await (await fetch('/api/state')).json();   // a real fetch/transport failure
+  } catch(e){
+    if(firstLoad) $('#apps').innerHTML = '<div class="empty">Dashboard server unreachable.</div>';
+    firstLoad = false;
+    return;
+  }
+  firstLoad = false;
+  try {                                              // a render bug is NOT "unreachable"
     applyChannel(st.channel);
     $('#apps').innerHTML = st.apps && st.apps.length
       ? st.apps.map(appHTML).join('')
       : '<div class="empty">No apps registered yet — run <code>shunt app add</code> in a repo.</div>';
   } catch(e){
-    if(firstLoad) $('#apps').innerHTML = '<div class="empty">Dashboard server unreachable.</div>';
+    $('#apps').innerHTML = '<div class="empty">render error: ' + esc(e.message) + '</div>';
   }
-  firstLoad = false;
 }
 
 refresh();
-setInterval(refresh, 2500);
+setInterval(refresh, 10000);
 </script>
 </body>
 </html>
