@@ -7,11 +7,21 @@ import (
 	"os"
 	"time"
 
+	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/dashboard"
 	"github.com/gordonbeeming/shunt/internal/launchagent"
 	"github.com/spf13/cobra"
 )
+
+// fileExists reports whether a regular file is present at p.
+func fileExists(p string) bool {
+	if p == "" {
+		return false
+	}
+	fi, err := os.Stat(p)
+	return err == nil && !fi.IsDir()
+}
 
 // newDashboardCmd runs the shunt web dashboard: one local page (this channel's
 // own port) to browse every app's front-door ports with live up/down status and
@@ -44,7 +54,20 @@ func newDashboardCmd() *cobra.Command {
 				return nil
 			}
 			srv := &http.Server{Addr: addr, Handler: dashboard.NewServer().Handler()}
-			fmt.Printf("• shunt dashboard: http://%s  (%s channel · Ctrl-C to stop)\n", addr, config.Current().Channel)
+			port := config.Current().DashboardPort
+			// Serve over TLS with the shared dotnet dev cert when it's installed
+			// (CN=localhost, host-trusted), so it's https://localhost:<port>;
+			// otherwise plain http. Run `shunt cert install` to get the cert.
+			cert, _ := caddy.DevCertPath()
+			key, _ := caddy.DevCertKeyPath()
+			if fileExists(cert) && fileExists(key) {
+				fmt.Printf("• shunt dashboard: https://localhost:%d  (%s channel · Ctrl-C to stop)\n", port, config.Current().Channel)
+				if err := srv.ListenAndServeTLS(cert, key); err != nil && err != http.ErrServerClosed {
+					return fmt.Errorf("dashboard server: %w", err)
+				}
+				return nil
+			}
+			fmt.Printf("• shunt dashboard: http://localhost:%d  (no dev cert — `%s cert install` for https · Ctrl-C to stop)\n", port, bin())
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				return fmt.Errorf("dashboard server: %w", err)
 			}
