@@ -211,8 +211,12 @@ func StopApp(ctx context.Context, sd state.Siding) error {
 	// dashboard, and the DCP control plane — so none of them keep holding ports.
 	// Dependency containers (SQL, Azurite, etc.) run under dockerd and don't match
 	// these patterns, so they stay up.
+	// dotnet watch spawns a tree (the `dotnet watch` launcher, the dotnet-watch.dll
+	// worker, and DOTNET_WATCH=1 child processes per project) — match all of them,
+	// plus the AppHost, dashboard, and DCP, so nothing keeps holding the Aspire
+	// ports. Dep containers run under dockerd and don't carry these markers.
 	_, err := container.Exec(ctx, sd.Container, "sh", "-c",
-		"for p in 'dotnet watch' 'AppHost' 'Aspire.Dashboard' '/dcp '; do pkill -f \"$p\" 2>/dev/null; done; true")
+		"for p in 'dotnet watch' 'dotnet-watch' 'DOTNET_WATCH=1' 'AppHost' 'Aspire.Dashboard' '/dcp '; do pkill -f \"$p\" 2>/dev/null; done; sleep 1; true")
 	return err
 }
 
