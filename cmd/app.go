@@ -32,9 +32,10 @@ func newAppAddCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if _, err := state.LoadApp(loc.ConfigDir); err == nil {
-				return fmt.Errorf("app %q is already registered (config: %s)", loc.Project, loc.ConfigDir)
-			}
+			// Re-running app add updates the registration from the contract
+			// (e.g. new prebakeImages or front-door routes), preserving sidings.
+			existing, existErr := state.LoadApp(loc.ConfigDir)
+			updating := existErr == nil
 			ct, err := contract.Load(cwd)
 			if err != nil {
 				return err
@@ -42,20 +43,27 @@ func newAppAddCmd() *cobra.Command {
 
 			offset := config.Current().PortOffset
 			app := state.App{
-				Name:        loc.Project,
-				RepoPath:    cwd,
-				RepoOrigin:  gitOrigin(ctx, cwd),
-				AppHostPath: ct.AppHost,
-				ConfigDir:   loc.ConfigDir,
-				DataVolumes: ct.DataVolumes,
-				Env:         ct.Env,
-				Mounts:      ct.Mounts,
-				Sidings:     map[string]state.Siding{},
+				Name:          loc.Project,
+				RepoPath:      cwd,
+				RepoOrigin:    gitOrigin(ctx, cwd),
+				AppHostPath:   ct.AppHost,
+				ConfigDir:     loc.ConfigDir,
+				DataVolumes:   ct.DataVolumes,
+				Env:           ct.Env,
+				Mounts:        ct.Mounts,
+				PrebakeImages: ct.PrebakeImages,
+				Sidings:       map[string]state.Siding{},
+			}
+			if updating {
+				app.Sidings = existing.Sidings
+				app.LiveSiding = existing.LiveSiding
 			}
 
 			admin := caddy.NewAdmin()
-			if err := admin.Ping(ctx); err != nil {
-				return fmt.Errorf("caddy admin API not reachable — run `"+bin()+" init` first: %w", err)
+			if !updating {
+				if err := admin.Ping(ctx); err != nil {
+					return fmt.Errorf("caddy admin API not reachable — run `"+bin()+" init` first: %w", err)
+				}
 			}
 			for _, r := range ct.FrontDoor {
 				route := state.Route{
@@ -68,6 +76,9 @@ func newAppAddCmd() *cobra.Command {
 					CaddyID:    caddy.RouteID(loc.Project, r.Kind, r.Key),
 				}
 				app.FrontDoor = append(app.FrontDoor, route)
+				if updating {
+					continue // routes already exist in Caddy; re-PUT would 409
+				}
 				path, body, err := caddy.ServerForRoute(loc.Project, route)
 				if err != nil {
 					return err
@@ -89,11 +100,15 @@ func newAppAddCmd() *cobra.Command {
 				return err
 			}
 
-			fmt.Printf("✓ registered %s (%d front-door routes, channel offset +%d)\n", app.Name, len(app.FrontDoor), offset)
+			verb := "registered"
+			if updating {
+				verb = "updated"
+			}
+			fmt.Printf("✓ %s %s (%d front-door routes, channel offset +%d)\n", verb, app.Name, len(app.FrontDoor), offset)
 			for _, r := range app.FrontDoor {
 				fmt.Printf("  %-10s %-6s localhost:%d  ->  %s/%s\n", r.Key, r.Kind, r.ListenPort, r.Resource, r.Endpoint)
 			}
-			fmt.Printf("next: `"+bin()+" new <name>` to create a siding\n")
+			fmt.Printf("next: `" + bin() + " new <name>` to create a siding\n")
 			return nil
 		},
 	}

@@ -37,8 +37,11 @@ type App struct {
 	DataVolumes []DataVolume      `json:"dataVolumes"`
 	Env         map[string]string `json:"env"`    // extra guest env (Aspire parameters, secrets)
 	Mounts      []MountSpec       `json:"mounts"` // explicit extra host->guest mounts
-	Sidings     map[string]Siding `json:"sidings"`
-	LiveSiding  string            `json:"liveSiding"` // "" = nothing live
+	// Dependency images kept in the host Docker cache and copied into sidings so
+	// guests never pull from the network (see `shunt warm`).
+	PrebakeImages []string          `json:"prebakeImages,omitempty"`
+	Sidings       map[string]Siding `json:"sidings"`
+	LiveSiding    string            `json:"liveSiding"` // "" = nothing live
 }
 
 // Route is a stable front-door entry. The upstream target is NOT stored — it's

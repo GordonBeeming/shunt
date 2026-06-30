@@ -23,6 +23,10 @@ type Contract struct {
 	DataVolumes []state.DataVolume `json:"dataVolumes"`
 	Env         map[string]string  `json:"env"`    // extra guest env (Aspire parameters, secrets)
 	Mounts      []state.MountSpec  `json:"mounts"` // explicit extra host->guest mounts (e.g. user-secrets)
+	// Dependency container images Aspire brings up (SQL, Azurite, etc.). shunt
+	// keeps these in the host Docker cache and copies them into each siding, so
+	// siding guests never pull from the network. `shunt warm` uses this list.
+	PrebakeImages []string `json:"prebakeImages"`
 }
 
 // FrontDoorRoute is one stable port mapping in the contract.
