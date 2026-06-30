@@ -1,42 +1,47 @@
-// Package fsclone makes a siding's host-resident working copy: a git clone of
-// the repo and APFS clones (cp -c) of any baseline data volumes.
+// Package fsclone makes a siding's host-resident working copy: a git worktree of
+// the repo (off main) plus APFS clones (cp -c) of any baseline data volumes.
 package fsclone
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
 )
 
-// CloneRepo makes a working copy of origin at dest. It git-clones (so the siding
-// has full history to commit experiments against), then overlays origin's
-// working tree so UNCOMMITTED and untracked changes are included — shunt runs the
-// code you're currently working on, not just the last commit. Build artifacts and
-// node_modules are excluded (rebuilt in the guest).
-func CloneRepo(ctx context.Context, origin, dest, branch string) error {
-	args := []string{"clone", origin, dest}
-	if branch != "" {
-		args = append(args, "--branch", branch)
+// AddWorktree creates a git worktree of repoPath at dest, on a fresh branch
+// (newBranch) based on baseBranch (default "main"). A worktree off main keeps the
+// siding independent of GitButler's churn on the workspace branch, and inherits
+// the repo's signing config (no separate signing setup). It is created in the
+// host repo's .git; GitButler ignores extra worktrees on their own branches.
+func AddWorktree(ctx context.Context, repoPath, dest, newBranch, baseBranch string) error {
+	if baseBranch == "" {
+		baseBranch = "main"
 	}
-	if _, err := proc.Run(ctx, "git", args...); err != nil {
-		return fmt.Errorf("git clone %s: %w", origin, err)
+	// Drop any stale registration from a previous siding at this path.
+	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "prune")
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return fmt.Errorf("create siding dir: %w", err)
 	}
-	// Overlay the live working tree (uncommitted + untracked) onto the clone.
-	if _, err := proc.Run(ctx, "rsync", "-a",
-		"--exclude=.git/", "--exclude=bin/", "--exclude=obj/", "--exclude=node_modules/",
-		ensureTrailingSlash(origin), ensureTrailingSlash(dest)); err != nil {
-		return fmt.Errorf("overlay working tree from %s: %w", origin, err)
+	// --force + -B so re-creating a siding of the same name resets cleanly.
+	if _, err := proc.Run(ctx, "git", "-C", repoPath,
+		"worktree", "add", "--force", "-B", newBranch, dest, baseBranch); err != nil {
+		return fmt.Errorf("git worktree add (base %q): %w", baseBranch, err)
 	}
 	return nil
 }
 
-func ensureTrailingSlash(p string) string {
-	if len(p) > 0 && p[len(p)-1] == '/' {
-		return p
+// RemoveWorktree tears down a siding's worktree at dest and deletes its branch,
+// leaving the main repo clean (no dangling worktree registration).
+func RemoveWorktree(ctx context.Context, repoPath, dest, branch string) error {
+	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "remove", "--force", dest)
+	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "prune")
+	if branch != "" {
+		_, _ = proc.Run(ctx, "git", "-C", repoPath, "branch", "-D", branch)
 	}
-	return p + "/"
+	return nil
 }
 
 // CloneVolume APFS-clones a baseline data dir to dest (cp -c, copy-on-write —

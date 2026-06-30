@@ -74,7 +74,8 @@ func guestEnv(app state.App) map[string]string {
 // for the app to be ready (see Activate).
 func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding, error) {
 	src, volRoot := Paths(app, name)
-	if err := fsclone.CloneRepo(ctx, originForClone(app), src, branch); err != nil {
+	wtBranch := "shunt/" + name
+	if err := fsclone.AddWorktree(ctx, app.RepoPath, src, wtBranch, branch); err != nil {
 		return state.Siding{}, err
 	}
 
@@ -119,7 +120,7 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 
 	return state.Siding{
 		Name:      name,
-		Branch:    branch,
+		Branch:    wtBranch,
 		Container: guestName,
 		RSPort:    guestRSPort,
 		Bridges:   map[string]int{},

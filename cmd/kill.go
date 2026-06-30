@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/gordonbeeming/shunt/internal/container"
+	"github.com/gordonbeeming/shunt/internal/fsclone"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
@@ -66,9 +67,11 @@ func newRmCmd() *cobra.Command {
 			}
 			_ = container.Remove(ctx, sd.Container)
 
-			src, volRoot := siding.Paths(app, name)
+			src, _ := siding.Paths(app, name)
+			// Tear down the git worktree + its branch from the main repo first,
+			// so removing the dir doesn't leave a dangling worktree registration.
+			_ = fsclone.RemoveWorktree(ctx, app.RepoPath, src, sd.Branch)
 			base := filepath.Dir(src) // <configDir>/<name>
-			_ = volRoot
 			if err := os.RemoveAll(base); err != nil {
 				return fmt.Errorf("remove siding dir %s: %w", base, err)
 			}
