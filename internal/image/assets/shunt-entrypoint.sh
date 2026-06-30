@@ -24,6 +24,15 @@ fi
 # Generate the ASP.NET Core dev certificate so projects with HTTPS endpoints can
 # bind Kestrel (otherwise they crash: "developer certificate could not be found").
 dotnet dev-certs https >/dev/null 2>&1 || true
+# Trust it in the guest's system CA bundle so .NET HttpClient (health checks,
+# service-to-service https between Aspire projects) accepts it. Linux has no
+# per-user trust store like macOS, and `dotnet dev-certs --trust` only half-works
+# here, so export the cert and add it to ca-certificates — the bundle OpenSSL
+# (and thus HttpClient) actually reads. Without this, https services come up
+# "Running (Unhealthy)" with "The SSL connection could not be established".
+if dotnet dev-certs https --export-path /usr/local/share/ca-certificates/aspnetcore-dev.crt --format PEM --no-password >/dev/null 2>&1; then
+  update-ca-certificates >/dev/null 2>&1 || true
+fi
 
 echo "shunt-entrypoint: dockerd ready; launching command: $*"
 exec "$@"
