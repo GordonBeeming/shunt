@@ -26,6 +26,24 @@ func devCertFile(name string) (string, error) {
 	return filepath.Join(dir, "caddy", name), nil
 }
 
+// TLSAppBody is the Caddy `tls` app config that serves the host dotnet dev cert
+// (used by both the init bootstrap and `cert install` against a running Caddy).
+func TLSAppBody() ([]byte, error) {
+	cert, err := DevCertPath()
+	if err != nil {
+		return nil, err
+	}
+	key, err := DevCertKeyPath()
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{
+		"certificates": map[string]any{
+			"load_files": []any{map[string]any{"certificate": cert, "key": key}},
+		},
+	})
+}
+
 // ExportDevCert writes the host's dotnet dev cert to PEM for Caddy. `dotnet
 // dev-certs https` creates the cert if it doesn't exist; the host should have
 // trusted it once with `dotnet dev-certs https --trust`.

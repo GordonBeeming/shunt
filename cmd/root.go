@@ -22,6 +22,7 @@ func newRootCmd() *cobra.Command {
 		newVersionCmd(),
 		newInitCmd(),
 		newSkillCmd(),
+		newCertCmd(),
 		newAppCmd(),
 		newNewCmd(),
 		newUpCmd(),
