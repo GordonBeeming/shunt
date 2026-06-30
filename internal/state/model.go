@@ -3,6 +3,12 @@
 // its sidings) stored project-locally in <repos>/.shunt[-channel]/<project>/state.json.
 package state
 
+import (
+	"encoding/json"
+	"path"
+	"strings"
+)
+
 const (
 	// RegistryVersion / StateVersion let us migrate on-disk formats later.
 	RegistryVersion = 1
@@ -81,6 +87,37 @@ type MountSpec struct {
 	Host     string `json:"host"`     // host path, ~ expanded
 	Guest    string `json:"guest"`    // path inside the guest
 	ReadOnly bool   `json:"readOnly"` // mount read-only
+}
+
+// UnmarshalJSON accepts either the full object {host, guest, readOnly} or a plain
+// path string. A string auto-maps both sides from one path: `~/X` mounts the host
+// home's X to the guest's home (/root/X, since the guest runs as root); an
+// absolute `/X` mounts to the same path. String form defaults to read-only (it's
+// for config/secrets the app reads) — use the object form for read-write.
+func (m *MountSpec) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		m.Host = s
+		m.Guest = guestPathFor(s)
+		m.ReadOnly = true
+		return nil
+	}
+	type raw MountSpec // avoid recursing into this method
+	var r raw
+	if err := json.Unmarshal(data, &r); err != nil {
+		return err
+	}
+	*m = MountSpec(r)
+	return nil
+}
+
+// guestPathFor maps a mount path to its in-guest location: `~/X` -> /root/X (the
+// guest's home), absolute paths unchanged.
+func guestPathFor(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		return path.Join("/root", strings.TrimPrefix(p, "~"))
+	}
+	return p
 }
 
 // Siding is one isolated experiment of an app.
