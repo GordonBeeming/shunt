@@ -23,7 +23,7 @@ CLI: **`shunt-dev`**. Full command list and the `.shunt.app.json` contract are i
      - *main repo* → nothing more; proceed in the main repo.
    - If it isn't a shunt app and there's no `.shunt.app.json`, skip the prompt and just work in the main repo (offer `shunt-dev app add` only if a contract exists).
 3. If they picked a siding, make every code change under that siding's `src` path. Never edit the main repo for that task — the guest mounts `src` and runs whatever's on disk.
-4. Run it via shunt, never started locally (the app runs in the guest). The status script prints the right next command — usually `shunt-dev up <name>`; after edits, hot reload covers most changes and `shunt-dev restart <name>` does a full rebuild without dropping the env. See [iterating](references/iterating.md).
+4. **Build + test on the host before any `up`.** The siding's `src` is a normal checkout — compile it and run the tests there (`dotnet build`/`dotnet test`, `pnpm build`, etc.); `up` is a full guest rebuild, so don't spend it on code that doesn't compile yet. When it's green, go live in stages: **ask the user**, then `shunt-dev up <name> --no-bridge` (starts it in the guest with no host bridges/front door — confirm it comes up on the guest's Aspire dashboard without disturbing whatever's currently live); then, once it looks healthy, **confirm** and run a plain `shunt-dev up <name>` to bridge + go live. The full app always runs *in the guest*, never started on the host. After edits, hot reload covers most changes and `shunt-dev restart <name>` does a full rebuild without dropping the env. See [iterating](references/iterating.md).
 
 ## Rules
 

@@ -16,6 +16,7 @@ import (
 
 func newUpCmd() *cobra.Command {
 	var noSwitch bool
+	var noBridge bool
 	c := &cobra.Command{
 		Use:   "up [name]",
 		Short: "Build + start the app in a siding's guest, then point the front door at it",
@@ -103,6 +104,26 @@ func newUpCmd() *cobra.Command {
 				fmt.Printf("• the app is already running in %q\n", name)
 			}
 
+			// --no-bridge: start it in the guest but don't touch the host at all —
+			// no socat bridges, no Caddy. Lets you confirm "would it work" on the
+			// guest's own Aspire dashboard before bridging steals the shared ports
+			// from whatever's currently live. Bridge later with a plain `up`/`switch`.
+			if noBridge {
+				if ip, e := container.IP(ctx, sd.Container); e == nil {
+					sd.LastIP = ip
+				}
+				app.Sidings[name] = sd
+				if err := state.SaveApp(app); err != nil {
+					return err
+				}
+				fmt.Printf("✓ %q started in the guest — not bridged to the host (front door untouched)\n", name)
+				if u := siding.DashboardURL(sd); u != "" {
+					fmt.Printf("  check it on the guest's Aspire dashboard: %s\n", u)
+				}
+				fmt.Printf("  when it looks good: `%s up %s` to bridge + go live (or `%s switch %s`)\n", bin(), name, bin(), name)
+				return nil
+			}
+
 			fmt.Println("• discovering endpoints + bridging to the host…")
 			if err := siding.Activate(ctx, app, &sd); err != nil {
 				return err
@@ -125,6 +146,7 @@ func newUpCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&noSwitch, "no-switch", false, "start it but don't point the front door at it")
+	c.Flags().BoolVar(&noSwitch, "no-switch", false, "start it + bridge, but don't point the front door at it")
+	c.Flags().BoolVar(&noBridge, "no-bridge", false, "start it in the guest only — no host bridges, no front door (verify before going live)")
 	return c
 }
