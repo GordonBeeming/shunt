@@ -36,7 +36,16 @@ func newUpCmd() *cobra.Command {
 			// Idempotent: only launch Aspire if it isn't already up in the guest.
 			out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "cat /var/log/apphost.log 2>/dev/null")
 			if !strings.Contains(out, "Distributed application started") {
-				fmt.Printf("• starting Aspire in %q (first run builds + pulls dependency images)…\n", name)
+				// Load the project warm cache (if any) so Aspire reuses pre-built/
+				// pulled dependency images instead of rebuilding/pulling from scratch.
+				if siding.IsWarmed(app) {
+					fmt.Println("• loading pre-warmed dependency images…")
+					if _, e := container.Exec(ctx, sd.Container, "sh", "-c",
+						"test -f /mnt/base/images.tar && docker load -i /mnt/base/images.tar"); e != nil {
+						fmt.Printf("  (warm load skipped: %v)\n", e)
+					}
+				}
+				fmt.Printf("• starting Aspire in %q (first run builds + pulls anything not warmed)…\n", name)
 				if err := siding.StartApp(ctx, app, sd); err != nil {
 					return err
 				}

@@ -60,6 +60,26 @@ func RunPassthrough(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
+// RunToFile runs name with args, streaming stdout straight to the file at
+// outPath (created/truncated). For large binary output — e.g. `docker save` of
+// multi-GB images — where buffering into memory would be wrong. Stderr is
+// captured so a failure still produces a useful message.
+func RunToFile(ctx context.Context, outPath, name string, args ...string) error {
+	f, err := os.Create(outPath)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", outPath, err)
+	}
+	defer f.Close()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdout = f
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("run %s: %w: %s", name, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
 // Look reports whether an executable is on PATH.
 func Look(name string) bool {
 	_, err := exec.LookPath(name)

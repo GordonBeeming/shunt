@@ -40,6 +40,22 @@ func Paths(app state.App, name string) (src, volRoot string) {
 	return filepath.Join(base, "src"), filepath.Join(base, "vol")
 }
 
+// guestWarmTar is where Spin mounts the project warm image cache, read-only.
+const guestWarmTar = "/mnt/base/images.tar"
+
+// WarmTarPath is the per-project warm image cache (a `docker save` tar produced
+// by `shunt warm`). Its presence means `up` should `docker load` it into a new
+// siding instead of pulling/rebuilding dependency images from scratch.
+func WarmTarPath(app state.App) string {
+	return filepath.Join(app.ConfigDir, "base", "images.tar")
+}
+
+// IsWarmed reports whether a project warm cache exists.
+func IsWarmed(app state.App) bool {
+	_, err := os.Stat(WarmTarPath(app))
+	return err == nil
+}
+
 // guestEnv is the proven Aspire-13 launch env: unsecured anonymous dashboard (so
 // shunt can read the resource service without an API key), all endpoints pinned,
 // http transport, in-guest Docker runtime.
@@ -102,6 +118,11 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 		if _, statErr := os.Stat(nugetHost); statErr == nil {
 			mounts = append(mounts, container.Mount{Host: nugetHost, Guest: "/root/.nuget/packages"})
 		}
+	}
+	// Project warm image cache (from `shunt warm`): mount read-only so `up` can
+	// `docker load` the pre-built/pulled dependency images instead of rebuilding.
+	if IsWarmed(app) {
+		mounts = append(mounts, container.Mount{Host: WarmTarPath(app), Guest: guestWarmTar, ReadOnly: true})
 	}
 
 	guestName := config.ContainerName(app.Name, name)
