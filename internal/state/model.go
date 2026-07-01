@@ -21,6 +21,12 @@ const (
 	// PlaceholderDial is the upstream a route points at before any siding is
 	// live. A refused connection here is an honest "nothing live yet" signal.
 	PlaceholderDial = "127.0.0.1:1"
+
+	// HostTarget is the reserved switch target meaning "the local app running
+	// natively on the host, from the main repo" — an alternative to any siding.
+	// App.LiveSiding holds this value when the host is live; a siding can't be
+	// named this.
+	HostTarget = "host"
 )
 
 // Registry is the global index (~/.shunt[-channel]/registry.json): just enough

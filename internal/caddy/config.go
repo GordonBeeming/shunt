@@ -125,6 +125,10 @@ func ServerForRoute(app string, r state.Route) (path string, body []byte, err er
 	case state.KindHTTP:
 		handler["handler"] = "reverse_proxy"
 		handler["upstreams"] = []any{map[string]any{"dial": state.PlaceholderDial}}
+		// shunt serves its own (loaded) dev cert, so Caddy must not add the
+		// automatic HTTP->HTTPS redirect vhost — that binds :80, which needs root
+		// and fails ("permission denied") when servers are re-created one by one.
+		server["automatic_https"] = map[string]any{"disable_redirects": true}
 		if r.TLS {
 			// Serve HTTPS at the edge (host match makes automatic HTTPS provision
 			// the localhost cert).
@@ -169,6 +173,35 @@ func DialPatch(r state.Route, hostPort string) (path string, body []byte, err er
 	default:
 		return "", nil, fmt.Errorf("unknown route kind %q", r.Kind)
 	}
+}
+
+// EnsureFrontDoor (re)creates every one of the app's front-door Caddy servers
+// (one listener per stable port, placeholder dial). Idempotent — delete-then-put
+// so a re-register applies route config changes. Used by `app add` and to re-take
+// the ports after they were released for the host (see RemoveFrontDoor).
+func EnsureFrontDoor(ctx context.Context, a *Admin, app state.App) error {
+	for _, r := range app.FrontDoor {
+		path, body, err := ServerForRoute(app.Name, r)
+		if err != nil {
+			return err
+		}
+		_ = a.Delete(ctx, path)
+		if err := a.Put(ctx, path, body); err != nil {
+			return fmt.Errorf("register route %q in Caddy: %w", r.Key, err)
+		}
+	}
+	return nil
+}
+
+// RemoveFrontDoor deletes every one of the app's front-door Caddy servers,
+// releasing the stable ports so the native (host) app can bind them directly.
+func RemoveFrontDoor(ctx context.Context, a *Admin, app state.App) error {
+	for _, r := range app.FrontDoor {
+		if path, _, err := ServerForRoute(app.Name, r); err == nil {
+			_ = a.Delete(ctx, path)
+		}
+	}
+	return nil
 }
 
 // CurrentDial reads a route's live upstream dial from Caddy (e.g. "192.168.64.5:7022"),

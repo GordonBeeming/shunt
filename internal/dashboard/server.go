@@ -110,6 +110,14 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 
+		// The host (your local copy) is a switch target too — list it first.
+		av.Sidings = append(av.Sidings, sidingView{
+			Name:   state.HostTarget,
+			Live:   app.LiveSiding == state.HostTarget,
+			Guest:  "local",
+			Status: s.getStatus(name, state.HostTarget),
+		})
+
 		// Sidings (sorted) with guest state + any in-flight action status.
 		snames := make([]string, 0, len(app.Sidings))
 		for n := range app.Sidings {
@@ -165,6 +173,23 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.release(key, "")
 		httpErr(w, err)
+		return
+	}
+	// Restarting the host target bounces the native app (stop+start), not a guest.
+	if sdName == state.HostTarget {
+		s.setStatus(project, sdName, "restarting…")
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			siding.HostStop(ctx, app)
+			msg := ""
+			if err := siding.HostStart(ctx, app); err != nil {
+				msg = "error: " + err.Error()
+			}
+			s.release(key, msg)
+		}()
+		w.WriteHeader(http.StatusAccepted)
+		writeJSON(w, map[string]string{"ok": "restarting host"})
 		return
 	}
 	sd, ok := app.Sidings[sdName]

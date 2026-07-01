@@ -66,6 +66,12 @@ func newActiveCmd() *cobra.Command {
 			res.Active = true
 			res.ConfigDir = app.ConfigDir
 			res.RepoPath = app.RepoPath
+			// The host (local copy) is a switch target too.
+			res.Sidings = append(res.Sidings, activeSiding{
+				Name: state.HostTarget,
+				Live: app.LiveSiding == state.HostTarget,
+				Src:  app.RepoPath,
+			})
 			for name, s := range app.Sidings {
 				src, _ := siding.Paths(app, name)
 				guestUp := false

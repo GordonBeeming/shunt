@@ -35,9 +35,12 @@ func newUpCmd() *cobra.Command {
 			if !ok {
 				return fmt.Errorf("no siding %q — create it with `"+bin()+" new %s`", name, name)
 			}
-			st, _ := container.State(ctx, sd.Container)
-			if st != "running" {
-				return fmt.Errorf("the guest for %q isn't running (state=%s); recreate it with `"+bin()+" new`", name, st)
+			// Make sure the guest is genuinely up before anything execs into it. It
+			// may be stopped, or a post-sleep/reboot zombie (runtime says "running"
+			// but exec fails) — either way bounce it, which keeps the worktree + data.
+			fmt.Println("• checking the guest is up…")
+			if err := siding.EnsureGuestLive(ctx, sd); err != nil {
+				return fmt.Errorf("%w — if it persists, recreate: `%s rm %s && %s new %s`", err, bin(), name, bin(), name)
 			}
 
 			// Idempotent: only (re)launch the app if it isn't already running in the

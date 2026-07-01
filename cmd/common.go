@@ -74,5 +74,5 @@ func sidingArg(app state.App, args []string) (string, error) {
 	if len(args) > 0 {
 		return args[0], nil
 	}
-	return pickSiding(app)
+	return pickSiding(app, false) // guest ops (up/restart/kill/logs) — host isn't a target
 }

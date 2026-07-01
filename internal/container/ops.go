@@ -262,6 +262,16 @@ func Stop(ctx context.Context, name string) error {
 	return nil
 }
 
+// Start boots a stopped guest, re-running its entrypoint (dockerd + dev cert,
+// then the idle keep-alive). The guest's own disk and its host bind mounts (the
+// worktree + data volumes) persist across stop/start, so nothing is lost.
+func Start(ctx context.Context, name string) error {
+	if _, err := proc.Run(ctx, Bin, "start", name); err != nil {
+		return fmt.Errorf("container start %s: %w", name, err)
+	}
+	return nil
+}
+
 // Remove tears down a guest. It stops first because `container rm` won't remove
 // a running guest reliably, then removes (ignoring "not found").
 func Remove(ctx context.Context, name string) error {

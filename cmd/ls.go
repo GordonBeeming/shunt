@@ -75,6 +75,12 @@ func newLsCmd() *cobra.Command {
 					continue
 				}
 				la := lsApp{Name: app.Name, Sidings: []lsSiding{}}
+				// The host (your local copy) is a switch target too — list it first.
+				la.Sidings = append(la.Sidings, lsSiding{
+					Name:  state.HostTarget,
+					Live:  app.LiveSiding == state.HostTarget,
+					Guest: "local",
+				})
 				sidingNames := make([]string, 0, len(app.Sidings))
 				for sn := range app.Sidings {
 					sidingNames = append(sidingNames, sn)
