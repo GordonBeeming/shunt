@@ -125,6 +125,10 @@ func ServerForRoute(app string, r state.Route) (path string, body []byte, err er
 	case state.KindHTTP:
 		handler["handler"] = "reverse_proxy"
 		handler["upstreams"] = []any{map[string]any{"dial": state.PlaceholderDial}}
+		// shunt serves its own (loaded) dev cert, so Caddy must not add the
+		// automatic HTTP->HTTPS redirect vhost — that binds :80, which needs root
+		// and fails ("permission denied") when servers are re-created one by one.
+		server["automatic_https"] = map[string]any{"disable_redirects": true}
 		if r.TLS {
 			// Serve HTTPS at the edge (host match makes automatic HTTPS provision
 			// the localhost cert).

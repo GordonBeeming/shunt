@@ -805,16 +805,27 @@ func HostStart(ctx context.Context, app state.App) error {
 
 // HostStop stops the natively-running app (best-effort — fine if nothing's
 // running), freeing the front-door ports. aspire → `aspire stop`; else the
-// contract's stop command.
+// contract's stop command. It also stops any host Docker container still
+// publishing a front-door port: `aspire stop` leaves persistent-lifetime deps
+// (e.g. the SQL container behind the layer4 route) running, and those hold the
+// ports a siding switch needs to re-bind.
 func HostStop(ctx context.Context, app state.App) {
 	cmd := app.Stop
 	if app.Runner == "" || app.Runner == runner.Aspire {
 		cmd = "aspire stop --non-interactive"
 	}
-	if cmd == "" {
-		return
+	if cmd != "" {
+		_ = hostShellCmd(ctx, app, cmd)
 	}
-	_ = hostShellCmd(ctx, app, cmd)
+	for _, r := range app.FrontDoor {
+		out, err := proc.Run(ctx, "docker", "ps", "--filter", fmt.Sprintf("publish=%d", r.ListenPort), "--format", "{{.ID}}")
+		if err != nil {
+			continue // no host docker / not reachable — nothing to free
+		}
+		for _, id := range strings.Fields(out.Stdout) {
+			_, _ = proc.Run(ctx, "docker", "stop", id) // stop (keeps data); host-restart re-creates it
+		}
+	}
 }
 
 // Restart stops the app in the guest and starts it again (the configured stop +
