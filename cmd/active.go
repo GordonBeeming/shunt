@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/resolve"
@@ -73,10 +72,11 @@ func newActiveCmd() *cobra.Command {
 				if st, err := container.State(ctx, s.Container); err == nil {
 					guestUp = st == "running"
 				}
+				// Reliable across runners: the log marker is Aspire-only (and even
+				// some Aspire apps never emit it), so reuse the shared helper.
 				appUp := false
 				if guestUp {
-					out, _ := container.Exec(ctx, s.Container, "sh", "-c", "cat /var/log/apphost.log 2>/dev/null")
-					appUp = strings.Contains(out, "Distributed application started")
+					appUp = siding.AppRunning(ctx, app, s)
 				}
 				res.Sidings = append(res.Sidings, activeSiding{
 					Name:         name,

@@ -42,6 +42,21 @@ func TestLoadMissing(t *testing.T) {
 	}
 }
 
+func TestNonAspireContractNeedsNoAppHost(t *testing.T) {
+	// A dotnet/node/custom app declares runner + start instead of an apphost, so
+	// validation must not demand apphost for them.
+	dir := writeContract(t, `{
+      "runner": "node",
+      "start": "pnpm dev",
+      "frontDoor": [
+        { "key": "web", "kind": "http", "listenPort": 5173, "resource": "web", "guestPort": 5173 }
+      ]
+    }`)
+	if _, err := Load(dir); err != nil {
+		t.Fatalf("non-aspire contract without apphost should validate, got: %v", err)
+	}
+}
+
 func TestValidationErrors(t *testing.T) {
 	cases := map[string]string{
 		"no apphost":      `{"frontDoor":[{"key":"a","kind":"http","listenPort":1,"resource":"r"}]}`,

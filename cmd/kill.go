@@ -78,6 +78,11 @@ func newRmCmd() *cobra.Command {
 			// so removing the dir doesn't leave a dangling worktree registration.
 			_ = fsclone.RemoveWorktree(ctx, app.RepoPath, src, sd.Branch)
 			base := filepath.Dir(src) // <configDir>/<name>
+			// Guard against nuking an unintended path if ConfigDir/src was empty or
+			// unresolved: only ever remove a deep, absolute, siding-shaped dir.
+			if !filepath.IsAbs(base) || base == "/" || base == "." || filepath.Dir(base) == base {
+				return fmt.Errorf("refusing to remove unsafe siding dir %q (resolved from %q)", base, src)
+			}
 			if err := os.RemoveAll(base); err != nil {
 				return fmt.Errorf("remove siding dir %s: %w", base, err)
 			}

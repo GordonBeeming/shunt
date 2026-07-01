@@ -128,10 +128,13 @@ function sidingHTML(appName, s){
   const status = s.status ? `<span class="status">${esc(s.status)}</span>` : '';
   const guest = s.guest ? `<span class="guest">${esc(s.guest)}</span>` : '';
   const busy = s.status && s.status.indexOf('…') >= 0;
-  const sw = s.live ? '' : `<button onclick="doSwitch('${esc(appName)}','${esc(s.name)}')" ${busy?'disabled':''}>Switch</button>`;
+  // esc(JSON.stringify(...)) produces a valid, attribute-safe JS string literal:
+  // a name containing ' or " can't break out of the inline handler or inject.
+  const a = esc(JSON.stringify(appName)), n = esc(JSON.stringify(s.name));
+  const sw = s.live ? '' : `<button onclick="doSwitch(${a},${n})" ${busy?'disabled':''}>Switch</button>`;
   return `<div class="siding"><span class="nm">${esc(s.name)}</span> ${badge} ${guest} ${status}
     <span class="spacer"></span>${sw}
-    <button class="primary" onclick="doRestart('${esc(appName)}','${esc(s.name)}')" ${busy?'disabled':''}>Restart</button></div>`;
+    <button class="primary" onclick="doRestart(${a},${n})" ${busy?'disabled':''}>Restart</button></div>`;
 }
 
 function appHTML(a){

@@ -82,8 +82,11 @@ func Load(repoPath string) (Contract, error) {
 }
 
 func (c Contract) validate() error {
-	if c.AppHost == "" {
-		return errors.New("apphost is required")
+	// apphost is Aspire-only (StartApp reads it just for the aspire runner). A
+	// dotnet/node/custom app declares `runner` + `start` instead, so only require
+	// it for the aspire runner (empty runner defaults to aspire).
+	if (c.Runner == "" || c.Runner == "aspire") && c.AppHost == "" {
+		return errors.New("apphost is required for the aspire runner")
 	}
 	if len(c.FrontDoor) == 0 {
 		return errors.New("at least one frontDoor route is required")

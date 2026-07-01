@@ -115,7 +115,10 @@ func Bootstrap() ([]byte, error) {
 func ServerForRoute(app string, r state.Route) (path string, body []byte, err error) {
 	handler := map[string]any{"@id": r.CaddyID}
 	server := map[string]any{
-		"listen": []string{fmt.Sprintf(":%d", r.ListenPort)},
+		// Bind loopback only: these are localhost dev ports (the CLI and dashboard
+		// present them as localhost), so a bare ":port" would needlessly expose the
+		// app/API and especially the layer4 DB front door to the local network.
+		"listen": []string{fmt.Sprintf("127.0.0.1:%d", r.ListenPort)},
 		"routes": []any{map[string]any{"handle": []any{handler}}},
 	}
 	switch r.Kind {

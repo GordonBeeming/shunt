@@ -134,7 +134,11 @@ func waitForAdmin(ctx context.Context, timeout time.Duration) error {
 		if lastErr = admin.Ping(ctx); lastErr == nil {
 			return nil
 		}
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 	return lastErr
 }

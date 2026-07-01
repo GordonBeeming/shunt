@@ -61,6 +61,15 @@ func CloneVolume(ctx context.Context, src, dest string) error {
 		}
 		return fmt.Errorf("stat baseline %s: %w", src, err)
 	}
+	// `cp -c -R src dest` copies src *inside* dest when dest already exists
+	// (dest/<basename>/… instead of overwriting dest/…), so a re-clone of the same
+	// siding would nest. Clear a stale dest first — it's this siding's own COW
+	// clone, cheap to recreate.
+	if _, err := os.Stat(dest); err == nil {
+		if err := os.RemoveAll(dest); err != nil {
+			return fmt.Errorf("clear stale volume clone %s: %w", dest, err)
+		}
+	}
 	if _, err := proc.Run(ctx, "cp", "-c", "-R", src, dest); err != nil {
 		return fmt.Errorf("cp -c %s -> %s: %w", src, dest, err)
 	}

@@ -221,7 +221,11 @@ func Bridge(ctx context.Context, name, bindIP string, extPort, intPort int) erro
 			return nil
 		}
 		lastErr = ExecDetached(ctx, name, "sh", "-c", spec)
-		time.Sleep(time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
 	}
 	if out, _ := Exec(ctx, name, "sh", "-c", listening); strings.Contains(out, "up") {
 		return nil
@@ -232,9 +236,27 @@ func Bridge(ctx context.Context, name, bindIP string, extPort, intPort int) erro
 	return fmt.Errorf("bridge port %d->127.0.0.1:%d never came up", extPort, intPort)
 }
 
-// Stop stops a running guest (ignores "not running").
+// isAbsentErr reports whether a `container` CLI error just means the guest isn't
+// there / isn't running — which Stop and Remove treat as success (the desired end
+// state already holds), so Recreate doesn't fail on a first-time guest.
+func isAbsentErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "not found") ||
+		strings.Contains(s, "no such") ||
+		strings.Contains(s, "not running") ||
+		strings.Contains(s, "not started") ||
+		strings.Contains(s, "does not exist")
+}
+
+// Stop stops a running guest (ignores "not running" / absent).
 func Stop(ctx context.Context, name string) error {
 	if _, err := proc.Run(ctx, Bin, "stop", name); err != nil {
+		if isAbsentErr(err) {
+			return nil
+		}
 		return fmt.Errorf("container stop %s: %w", name, err)
 	}
 	return nil
@@ -245,6 +267,9 @@ func Stop(ctx context.Context, name string) error {
 func Remove(ctx context.Context, name string) error {
 	_, _ = proc.Run(ctx, Bin, "stop", name)
 	if _, err := proc.Run(ctx, Bin, "rm", "-f", name); err != nil {
+		if isAbsentErr(err) {
+			return nil
+		}
 		return fmt.Errorf("container rm %s: %w", name, err)
 	}
 	return nil

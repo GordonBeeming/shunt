@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/proc"
@@ -44,14 +43,17 @@ func newRunCmd() *cobra.Command {
 			if app.Workdir != "" {
 				wd = "/workspace/" + app.Workdir
 			}
-			script := "cd " + wd
+			// Pass the workdir + command as positional params to sh so each argument
+			// keeps its exact boundaries/quoting (flattening with strings.Join would
+			// mangle spaces, quotes, and flags). `exec -i` passes stdin through.
+			execArgs := []string{"exec", "-i", sd.Container, "sh", "-c"}
 			if len(rest) > 0 {
-				script += " && " + strings.Join(rest, " ")
+				execArgs = append(execArgs, `cd "$1" && shift && exec "$@"`, "sh", wd)
+				execArgs = append(execArgs, rest...)
 			} else {
-				script += " && exec ${SHELL:-bash}" // bare run → interactive shell
+				execArgs = append(execArgs, `cd "$1" && exec "${SHELL:-bash}"`, "sh", wd) // bare run → interactive shell
 			}
-			// `exec -i` so stdin (and the command's own flags) pass through.
-			return proc.RunPassthrough(ctx, container.Bin, "exec", "-i", sd.Container, "sh", "-lc", script)
+			return proc.RunPassthrough(ctx, container.Bin, execArgs...)
 		},
 	}
 }

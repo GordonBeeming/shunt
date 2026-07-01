@@ -417,8 +417,11 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 		sd.Bridges[r.Key] = r.ListenPort
 	}
 	if len(pending) > 0 {
-		fmt.Printf("  ⚠ %d route(s) not up yet: %s — they'll serve automatically once they start\n",
-			len(pending), strings.Join(pending, ", "))
+		// These are discovery-only routes (no declared guestPort) that hadn't
+		// resolved within the window, so — unlike the eagerly-bridged host==guest
+		// routes — they have no bridge yet. Re-run once they're up to bridge them.
+		fmt.Printf("  ⚠ %d route(s) didn't resolve in time: %s — run `%s up %s` (or `switch`) again once they start\n",
+			len(pending), strings.Join(pending, ", "), config.Current().BinaryName, sd.Name)
 	}
 	return nil
 }

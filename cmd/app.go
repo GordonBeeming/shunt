@@ -11,6 +11,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/contract"
 	"github.com/gordonbeeming/shunt/internal/resolve"
 	"github.com/gordonbeeming/shunt/internal/runner"
+	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 	"net"
@@ -167,6 +168,22 @@ func newAppAddCmd() *cobra.Command {
 			reg.Projects[app.Name] = app.ConfigDir
 			if err := state.SaveRegistry(reg); err != nil {
 				return err
+			}
+
+			// The delete-then-put above reset every route to the placeholder dial,
+			// so a re-`app add` of a live app would drop its front door. Re-point the
+			// live siding back at itself (best effort — its socat bridges are still
+			// up, so this just re-patches Caddy).
+			if updating && app.LiveSiding != "" {
+				if sd, ok := app.Sidings[app.LiveSiding]; ok && len(sd.Bridges) > 0 {
+					if err := siding.PointCaddy(ctx, app, &sd); err != nil {
+						fmt.Printf("  (front door not re-pointed at %q: %v — run `%s switch %s`)\n",
+							app.LiveSiding, err, bin(), app.LiveSiding)
+					} else {
+						app.Sidings[app.LiveSiding] = sd
+						_ = state.SaveApp(app)
+					}
+				}
 			}
 
 			verb := "registered"

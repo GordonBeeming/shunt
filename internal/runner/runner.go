@@ -27,8 +27,9 @@ type Detected struct {
 }
 
 // Detect classifies a repo by what's on disk. Order matters: an Aspire repo also
-// has .csproj/package.json, so aspire wins, then dotnet, then node. Returns
-// Kind=Custom (with empty Start) when it can't classify — the caller asks.
+// has .csproj/package.json, so aspire wins, then node (package.json), then dotnet
+// (first .csproj). Returns Kind=Custom (with empty Start) when it can't classify —
+// the caller asks.
 func Detect(repoPath string) Detected {
 	if findAppHost(repoPath) != "" {
 		return Detected{Kind: Aspire}

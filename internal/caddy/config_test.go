@@ -40,8 +40,8 @@ func TestServerForRouteHTTP(t *testing.T) {
 	if err := json.Unmarshal(body, &srv); err != nil {
 		t.Fatal(err)
 	}
-	if len(srv.Listen) != 1 || srv.Listen[0] != ":5000" {
-		t.Errorf("listen = %v, want [:5000]", srv.Listen)
+	if len(srv.Listen) != 1 || srv.Listen[0] != "127.0.0.1:5000" {
+		t.Errorf("listen = %v, want [127.0.0.1:5000]", srv.Listen)
 	}
 	h := srv.Routes[0].Handle[0]
 	if h.Handler != "reverse_proxy" || h.ID != "app_x_http_frontend" {
