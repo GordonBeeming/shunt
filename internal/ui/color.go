@@ -13,7 +13,12 @@ import (
 var colorEnabled = detectColor()
 
 func detectColor() bool {
-	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+	// NO_COLOR disables colour whenever it's present, regardless of value (per
+	// no-color.org) — so `NO_COLOR=` (empty) still counts.
+	if _, noColor := os.LookupEnv("NO_COLOR"); noColor {
+		return false
+	}
+	if os.Getenv("TERM") == "dumb" {
 		return false
 	}
 	return term.IsTerminal(int(os.Stdout.Fd()))

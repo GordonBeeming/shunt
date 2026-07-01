@@ -51,12 +51,12 @@ func switchTo(ctx context.Context, app *state.App, target string) error {
 		return err
 	}
 	if target == state.HostTarget {
-		fmt.Println(ui.Cyan("✓") + " switched to the host — started your local app; it now serves the front-door ports (Caddy stepped aside)")
+		fmt.Println(tick() + " switched to the host — started your local app; it now serves the front-door ports (Caddy stepped aside)")
 		fmt.Printf("  switch back to a siding any time with `%s switch <name>`\n", bin())
 		return nil
 	}
 	sd := app.Sidings[target]
-	fmt.Printf("%s switched to %q\n", ui.Cyan("✓"), target)
+	fmt.Printf("%s switched to %q\n", tick(), target)
 	for _, r := range app.FrontDoor {
 		fmt.Printf("  %s  ->  %s:%d  (%s)\n", ui.Cyan(fmt.Sprintf("localhost:%d", r.ListenPort)), sd.LastIP, sd.Bridges[r.Key], r.Key)
 	}
@@ -115,8 +115,9 @@ func pickSidingInteractive(app state.App, names []string, fd int) (string, error
 				marker = "*"
 			}
 			if i == sel {
-				// Selected row is inverse-video; don't inject a colour reset mid-row.
-				fmt.Fprintf(os.Stdout, "\r\x1b[7m> %d) %s %s \x1b[0m\x1b[K\r\n", i+1, marker, n)
+				// Green the live marker, then re-enable inverse-video (\x1b[7m) so the
+				// rest of the selected row stays highlighted after liveMarker's reset.
+				fmt.Fprintf(os.Stdout, "\r\x1b[7m> %d) %s\x1b[7m %s \x1b[0m\x1b[K\r\n", i+1, liveMarker(marker), n)
 			} else {
 				fmt.Fprintf(os.Stdout, "\r  %d) %s %s\x1b[K\r\n", i+1, liveMarker(marker), n)
 			}
