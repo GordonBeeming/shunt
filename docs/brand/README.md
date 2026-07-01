@@ -11,22 +11,22 @@ Wordmark: **Space Grotesk** 600. Tagline: **"Never lose your train of thought."*
   - `shunt-mark-black.svg`  1-colour black
   - `alt-monogram-s.svg`, `alt-sidings.svg` — the two runner-up directions, kept for reference
 - `icon/` — app icon + favicon
-  - `app-icon.svg` + `app-icon-512/256/128/64/32/16.png`  (rounded dark tile)
-  - `favicon.svg` + `favicon-48/32/16.png`
+  - `app-icon.svg` + PNG renders `app-icon-{512,256,128,64,32,16}.png`  (rounded dark tile)
+  - `favicon.svg` + PNG renders `favicon-{48,32,16}.png`
 - `social/` — raster pieces that use the Space Grotesk wordmark (PNG, because GitHub won't load a webfont inside an SVG)
   - `shunt-social-1280x640.png`        GitHub repo social preview
   - `shunt-readme-header-1280x320.png` header image for the README
   - `shunt-lockup-dark.png`, `shunt-lockup-light.png`  horizontal logo lockups
 
 ## Getting these into your repo
-1. Copy this whole `export/` folder into your repo (e.g. as `/.github/brand/` or `/docs/brand/`).
-2. **Social preview:** GitHub → repo **Settings → General → Social preview → Upload an image** → `social/shunt-social-1280x640.png`.
-3. **README header:** put `shunt-readme-header-1280x320.png` in the repo and add to the top of `README.md`:
+These assets live in `docs/brand/`. To reuse them elsewhere, copy the folder into that repo (e.g. `docs/brand/` or `.github/brand/`) and adjust the paths below to match.
+1. **Social preview:** GitHub → repo **Settings → General → Social preview → Upload an image** → `docs/brand/social/shunt-social-1280x640.png`.
+2. **README header:** add to the top of `README.md` (image path is repo-relative):
    ```md
    <p align="center"><img src="docs/brand/social/shunt-readme-header-1280x320.png" alt="shunt" width="100%"></p>
    ```
    (see `repo-readme-snippet.md` for a ready block with badges)
-4. **Favicon** (for the dashboard / docs site):
+3. **Favicon** (for the dashboard / docs site): copy the icons to your site's web root first, then reference them (the `href`s below are root-relative — the files ship under `docs/brand/icon/`):
    ```html
    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
    <link rel="icon" href="/favicon-32.png" sizes="32x32">
@@ -35,7 +35,7 @@ Wordmark: **Space Grotesk** 600. Tagline: **"Never lose your train of thought."*
 
 ## Palette
 ```
-Xylem / shunt palette
+shunt palette
   cyan (dark brand)   #46CBFF
   blue (light brand)  #0063B2
   live green          #6EE79A  (dark) / #1B7F3B (light)  — LIVE state ONLY

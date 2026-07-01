@@ -17,7 +17,7 @@ files in your repo and keep each font's `OFL.txt` beside them.
 ## Quick web load (CDN)
 ```html
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600&family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;500;700&display=swap">
 ```
 
 ## CSS tokens
