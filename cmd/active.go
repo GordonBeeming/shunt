@@ -48,6 +48,11 @@ func newActiveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Fold a differently-cased cwd onto the registered project (the FS is
+			// case-insensitive), so `active` resolves the same from `hubX` or `HubX`.
+			if name, dir, ok := state.CanonicalProject(loc.Project); ok {
+				loc.Project, loc.ConfigDir = name, dir
+			}
 			res := activeResult{Project: loc.Project, Siding: loc.Siding}
 
 			reg, err := state.LoadRegistry()
