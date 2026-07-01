@@ -27,6 +27,9 @@ func newKillCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if name == state.HostTarget {
+				return fmt.Errorf("%q is your local copy, not a siding — nothing for shunt to tear down", name)
+			}
 			sd, ok := app.Sidings[name]
 			if !ok {
 				return fmt.Errorf("no siding %q", name)
@@ -64,6 +67,9 @@ func newRmCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if name == state.HostTarget {
+				return fmt.Errorf("%q is your local copy, not a siding — nothing for shunt to tear down", name)
+			}
 			sd, ok := app.Sidings[name]
 			if !ok {
 				return fmt.Errorf("no siding %q", name)
@@ -71,11 +77,13 @@ func newRmCmd() *cobra.Command {
 			if app.LiveSiding == name && !force {
 				return fmt.Errorf("siding %q is live — switch away first, or pass --force", name)
 			}
+			fmt.Printf("• removing guest %q…\n", sd.Container)
 			_ = container.Remove(ctx, sd.Container)
 
 			src, _ := siding.Paths(app, name)
 			// Tear down the git worktree + its branch from the main repo first,
 			// so removing the dir doesn't leave a dangling worktree registration.
+			fmt.Println("• removing the worktree…")
 			_ = fsclone.RemoveWorktree(ctx, app.RepoPath, src, sd.Branch)
 			base := filepath.Dir(src) // <configDir>/<name>
 			// Guard against nuking an unintended path if ConfigDir/src was empty or
@@ -83,6 +91,9 @@ func newRmCmd() *cobra.Command {
 			if !filepath.IsAbs(base) || base == "/" || base == "." || filepath.Dir(base) == base {
 				return fmt.Errorf("refusing to remove unsafe siding dir %q (resolved from %q)", base, src)
 			}
+			// Deleting the copy-on-write data clones is the slow part (a large SQL
+			// volume can take a while), so say so instead of hanging silently.
+			fmt.Println("• deleting siding data (a large data volume can take a while)…")
 			if err := os.RemoveAll(base); err != nil {
 				return fmt.Errorf("remove siding dir %s: %w", base, err)
 			}

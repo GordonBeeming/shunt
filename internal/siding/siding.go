@@ -17,6 +17,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/fsclone"
 	"github.com/gordonbeeming/shunt/internal/hostdocker"
+	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/runner"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/gordonbeeming/shunt/internal/ui"
@@ -86,10 +87,18 @@ func guestEnv(app state.App) map[string]string {
 
 // Spin clones the repo + data volumes and launches the guest. It does not wait
 // for the app to be ready (see Activate).
-func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding, error) {
+func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (state.Siding, error) {
 	src, volRoot := Paths(app, name)
 	wtBranch := config.BranchPrefix() + name
-	if err := fsclone.AddWorktree(ctx, app.RepoPath, src, wtBranch, branch); err != nil {
+	if fromBranch != "" {
+		// Pick up an existing (remote) branch and stay ON it, so commits continue
+		// that branch and push back to it — rather than forking a new prefixed
+		// siding branch off a start point.
+		wtBranch = fromBranch
+		if err := fsclone.AddWorktreeTracking(ctx, app.RepoPath, src, fromBranch); err != nil {
+			return state.Siding{}, err
+		}
+	} else if err := fsclone.AddWorktree(ctx, app.RepoPath, src, wtBranch, branch); err != nil {
 		return state.Siding{}, err
 	}
 
@@ -173,6 +182,36 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 // doesn't show up in `container logs`).
 const appLogPath = "/var/log/apphost.log"
 
+// EnsureGuestLive makes sure the guest actually runs — not just per stale
+// metadata. After a host sleep/reboot the Apple container runtime can report a
+// guest as "running" while its VM is dead, so `container exec` fails with
+// "cannot exec: container is not running". Probe with a trivial exec; if it
+// fails, bounce the guest (stop+start). That's non-destructive: the worktree and
+// data volumes are host bind mounts and the guest's own disk (incl. loaded
+// dependency images) persists across stop/start, so no work is lost — it just
+// re-runs the entrypoint (dockerd + dev cert). Returns an error only if the guest
+// genuinely can't be brought back (e.g. it no longer exists → the caller says new).
+func EnsureGuestLive(ctx context.Context, sd state.Siding) error {
+	if _, err := container.Exec(ctx, sd.Container, "true"); err == nil {
+		return nil // truly alive
+	}
+	_ = container.Stop(ctx, sd.Container) // clear the zombie/stopped state
+	if err := container.Start(ctx, sd.Container); err != nil {
+		return fmt.Errorf("guest for %q wouldn't restart: %w", sd.Name, err)
+	}
+	for i := 0; i < 20; i++ {
+		if _, err := container.Exec(ctx, sd.Container, "true"); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return fmt.Errorf("guest for %q didn't become reachable after a restart", sd.Name)
+}
+
 // EnsureDockerd makes sure the in-guest Docker daemon is healthy before Aspire
 // needs it. A guest that was stopped and started again often fails to re-start
 // dockerd from its entrypoint (stale pid/socket state), leaving it dead even
@@ -209,12 +248,16 @@ func EnsureDockerd(ctx context.Context, sd state.Siding) error {
 func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 	var runCmd string
 	if app.Runner == "" || app.Runner == runner.Aspire {
-		// Run WITH the launch profile so each project binds the fixed ports from
-		// its launchSettings (7011, 5001, …) — the ports the contract front-doors
-		// host==guest — instead of Aspire-assigned ones. shunt's pinned dashboard/
-		// resource-service ports come from explicit ASPIRE_* env (not launchSettings),
-		// so discovery still connects on 18888/18890.
-		runCmd = fmt.Sprintf("cd /workspace && dotnet run --project %s > %s 2>&1",
+		// Run the AppHost via the Aspire CLI — `aspire start` runs it managed in the
+		// background and reuses/does not stack a second instance on a running one.
+		// (`dotnet run` launched a fresh AppHost every time, which piled up competing
+		// instances on the fixed ports.) Each project still binds its launchSettings
+		// ports, which the contract front-doors host==guest.
+		// Raise the CLI's start timeout well past its 120s default — a heavy app's
+		// cold start (restore + build + many resources) blows through 120s and
+		// `aspire start` would otherwise give up with "Timed out waiting … for
+		// AppHost to start" before the front door has anything to serve.
+		runCmd = fmt.Sprintf(`export PATH="$PATH:/root/.dotnet/tools"; export ASPIRE_CLI_START_TIMEOUT=900; cd /workspace && aspire start --apphost "%s" --non-interactive > %s 2>&1`,
 			app.AppHostPath, appLogPath)
 	} else {
 		wd := "/workspace"
@@ -242,6 +285,12 @@ const aspirePortHex = "49C8 49C9 49CA 49CB"
 // compiled AppHost binary, dashboard, and DCP).
 func StopApp(ctx context.Context, app state.App, sd state.Siding) error {
 	// Clean stop first (best-effort) — the force-kill below is the safety net.
+	if app.Runner == "" || app.Runner == runner.Aspire {
+		// Match `aspire start`: `aspire stop` cleanly shuts down the managed AppHost.
+		// With a single managed instance it doesn't prompt, so it runs non-interactively.
+		_, _ = container.Exec(ctx, sd.Container, "/bin/sh", "-lc",
+			`export PATH="$PATH:/root/.dotnet/tools"; cd /workspace && aspire stop --non-interactive`)
+	}
 	if app.Stop != "" {
 		wd := "/workspace"
 		if app.Workdir != "" {
@@ -687,10 +736,39 @@ func CreateBindVolumes(ctx context.Context, app state.App, sd state.Siding) erro
 // done, repoints Caddy, marks it live, and persists. This is the fast path — a
 // Caddy rebind, no app restart — and assumes the siding is running on its ports.
 // Shared by `shunt switch` and the dashboard.
-func Switch(ctx context.Context, app *state.App, name string) error {
-	sd, ok := app.Sidings[name]
+// Switch points the app's stable front door at a target: either a siding or the
+// special `host` target (the local app running natively from the main repo).
+// Every switch first stops the host app best-effort, so it isn't holding the
+// shared ports — whether we're going to the host or a siding.
+func Switch(ctx context.Context, app *state.App, target string) error {
+	admin := caddy.NewAdmin()
+	wasHost := app.LiveSiding == state.HostTarget
+
+	HostStop(ctx, *app) // best-effort: free the ports in case the local app is running
+
+	if target == state.HostTarget {
+		// Step the front door aside so the native app binds the real ports directly.
+		if err := caddy.RemoveFrontDoor(ctx, admin, *app); err != nil {
+			return err
+		}
+		if err := HostStart(ctx, *app); err != nil {
+			_ = caddy.EnsureFrontDoor(ctx, admin, *app) // don't leave it with no front door
+			return err
+		}
+		app.LiveSiding = state.HostTarget
+		return state.SaveApp(*app)
+	}
+
+	sd, ok := app.Sidings[target]
 	if !ok {
-		return fmt.Errorf("no siding %q", name)
+		return fmt.Errorf("no siding %q", target)
+	}
+	// Coming back from the host, the front-door servers were removed — re-create
+	// them so Caddy re-binds the ports before pointing them at the guest.
+	if wasHost {
+		if err := caddy.EnsureFrontDoor(ctx, admin, *app); err != nil {
+			return err
+		}
 	}
 	if len(sd.Bridges) == 0 {
 		if err := Activate(ctx, *app, &sd); err != nil {
@@ -700,9 +778,62 @@ func Switch(ctx context.Context, app *state.App, name string) error {
 	if err := PointCaddy(ctx, *app, &sd); err != nil {
 		return err
 	}
-	app.LiveSiding = name
-	app.Sidings[name] = sd
+	app.LiveSiding = target
+	app.Sidings[target] = sd
 	return state.SaveApp(*app)
+}
+
+// hostShellCmd runs a command on the HOST (not a guest) in the app's main repo,
+// via a login shell so the user's PATH (incl. the aspire global tool) is loaded.
+func hostShellCmd(ctx context.Context, app state.App, command string) error {
+	// Set the working directory via cmd.Dir rather than injecting `cd %q` — in a
+	// login shell, double quotes don't stop `$`/backtick expansion, so a repo path
+	// with those characters would be mis-evaluated.
+	_, err := proc.RunInDir(ctx, app.RepoPath, "sh", "-lc", command)
+	return err
+}
+
+// HostStart runs the app natively on the host from the main repo, so the local
+// copy serves the front-door ports directly. aspire → `aspire start` (managed,
+// background); other runners → the contract's start command.
+func HostStart(ctx context.Context, app state.App) error {
+	cmd := app.Start
+	if app.Runner == "" || app.Runner == runner.Aspire {
+		// Raise the CLI start timeout past its 120s default for a heavy cold start.
+		cmd = fmt.Sprintf("ASPIRE_CLI_START_TIMEOUT=900 aspire start --apphost \"%s\" --non-interactive", app.AppHostPath)
+	}
+	if cmd == "" {
+		return fmt.Errorf("no host start command for runner %q — set `start` in the contract", app.Runner)
+	}
+	if err := hostShellCmd(ctx, app, cmd); err != nil {
+		return fmt.Errorf("host start: %w", err)
+	}
+	return nil
+}
+
+// HostStop stops the natively-running app (best-effort — fine if nothing's
+// running), freeing the front-door ports. aspire → `aspire stop`; else the
+// contract's stop command. It also stops any host Docker container still
+// publishing a front-door port: `aspire stop` leaves persistent-lifetime deps
+// (e.g. the SQL container behind the layer4 route) running, and those hold the
+// ports a siding switch needs to re-bind.
+func HostStop(ctx context.Context, app state.App) {
+	cmd := app.Stop
+	if app.Runner == "" || app.Runner == runner.Aspire {
+		cmd = "aspire stop --non-interactive"
+	}
+	if cmd != "" {
+		_ = hostShellCmd(ctx, app, cmd)
+	}
+	for _, r := range app.FrontDoor {
+		out, err := proc.Run(ctx, "docker", "ps", "--filter", fmt.Sprintf("publish=%d", r.ListenPort), "--format", "{{.ID}}")
+		if err != nil {
+			continue // no host docker / not reachable — nothing to free
+		}
+		for _, id := range strings.Fields(out.Stdout) {
+			_, _ = proc.Run(ctx, "docker", "stop", id) // stop (keeps data); host-restart re-creates it
+		}
+	}
 }
 
 // Restart stops the app in the guest and starts it again (the configured stop +
