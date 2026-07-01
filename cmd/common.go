@@ -18,6 +18,11 @@ func loadCurrentApp() (state.App, resolve.Location, error) {
 	if err != nil {
 		return state.App{}, resolve.Location{}, err
 	}
+	// Fold a differently-cased cwd onto the registered project name/dir so a
+	// case-insensitive-FS `cd myApp` resolves to the registered `MyApp`.
+	if name, dir, ok := state.CanonicalProject(loc.Project); ok {
+		loc.Project, loc.ConfigDir = name, dir
+	}
 	app, err := state.LoadApp(loc.ConfigDir)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {

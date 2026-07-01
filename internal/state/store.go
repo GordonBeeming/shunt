@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/gordonbeeming/shunt/internal/config"
@@ -42,6 +43,35 @@ func SaveRegistry(reg Registry) error {
 	}
 	reg.Version = RegistryVersion
 	return withLock(path, func() error { return writeJSON(path, reg) })
+}
+
+// CanonicalProject case-folds a project name against the registry. The macOS
+// filesystem is case-insensitive, so `cd myApp` and `cd MyApp` land in the same
+// repo but yield different `basename(cwd)` values; without this, a differently-
+// cased cwd forks a phantom project that then collides on the real app's ports.
+// When a registered project matches case-insensitively, it returns the REGISTERED
+// name + its config dir so every command lines up with the existing registration.
+// ok is false when there's no match (a genuinely new project keeps its own name).
+func CanonicalProject(name string) (canonicalName, configDir string, ok bool) {
+	reg, err := LoadRegistry()
+	if err != nil {
+		return "", "", false
+	}
+	return canonicalIn(reg.Projects, name)
+}
+
+// canonicalIn is the pure case-fold against a project map (exact match wins,
+// then case-insensitive), split out so it's testable without touching disk.
+func canonicalIn(projects map[string]string, name string) (canonicalName, configDir string, ok bool) {
+	if dir, exact := projects[name]; exact {
+		return name, dir, true
+	}
+	for n, dir := range projects {
+		if strings.EqualFold(n, name) {
+			return n, dir, true
+		}
+	}
+	return "", "", false
 }
 
 // statePath is <configDir>/state.json.
