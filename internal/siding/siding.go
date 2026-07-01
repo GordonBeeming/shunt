@@ -247,12 +247,12 @@ func EnsureDockerd(ctx context.Context, sd state.Siding) error {
 func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 	var runCmd string
 	if app.Runner == "" || app.Runner == runner.Aspire {
-		// Run WITH the launch profile so each project binds the fixed ports from
-		// its launchSettings (7011, 5001, …) — the ports the contract front-doors
-		// host==guest — instead of Aspire-assigned ones. shunt's pinned dashboard/
-		// resource-service ports come from explicit ASPIRE_* env (not launchSettings),
-		// so discovery still connects on 18888/18890.
-		runCmd = fmt.Sprintf("cd /workspace && dotnet run --project %s > %s 2>&1",
+		// Run the AppHost via the Aspire CLI — `aspire start` runs it managed in the
+		// background and reuses/does not stack a second instance on a running one.
+		// (`dotnet run` launched a fresh AppHost every time, which piled up competing
+		// instances on the fixed ports.) Each project still binds its launchSettings
+		// ports, which the contract front-doors host==guest.
+		runCmd = fmt.Sprintf(`export PATH="$PATH:/root/.dotnet/tools"; cd /workspace && aspire start --apphost %s --non-interactive > %s 2>&1`,
 			app.AppHostPath, appLogPath)
 	} else {
 		wd := "/workspace"
@@ -280,6 +280,12 @@ const aspirePortHex = "49C8 49C9 49CA 49CB"
 // compiled AppHost binary, dashboard, and DCP).
 func StopApp(ctx context.Context, app state.App, sd state.Siding) error {
 	// Clean stop first (best-effort) — the force-kill below is the safety net.
+	if app.Runner == "" || app.Runner == runner.Aspire {
+		// Match `aspire start`: `aspire stop` cleanly shuts down the managed AppHost.
+		// With a single managed instance it doesn't prompt, so it runs non-interactively.
+		_, _ = container.Exec(ctx, sd.Container, "/bin/sh", "-lc",
+			`export PATH="$PATH:/root/.dotnet/tools"; cd /workspace && aspire stop --non-interactive`)
+	}
 	if app.Stop != "" {
 		wd := "/workspace"
 		if app.Workdir != "" {
