@@ -98,7 +98,7 @@ func newActiveCmd() *cobra.Command {
 			if asJSON {
 				return printJSON(res)
 			}
-			fmt.Printf("✓ %s is a shunt app (%d siding(s)) — config: %s\n", res.Project, len(res.Sidings), res.ConfigDir)
+			fmt.Printf("%s %s is a shunt app (%d siding(s)) — config: %s\n", tick(), res.Project, len(res.Sidings), res.ConfigDir)
 			if res.Siding != "" {
 				fmt.Printf("  (cwd is inside siding %q)\n", res.Siding)
 			}

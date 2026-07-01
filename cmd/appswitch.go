@@ -86,7 +86,7 @@ func newAppSwitchCmd() *cobra.Command {
 			} else {
 				fmt.Printf("  (no live siding yet — `%s up <siding>` in %s to bring it up)\n", bin(), target)
 			}
-			fmt.Printf("✓ %s is now active on its front-door ports\n", target)
+			fmt.Printf("%s %s is now active on its front-door ports\n", tick(), target)
 			return nil
 		},
 	}

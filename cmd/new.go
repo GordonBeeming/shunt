@@ -58,7 +58,7 @@ func newNewCmd() *cobra.Command {
 			}
 
 			src, _ := siding.Paths(app, name)
-			fmt.Printf("✓ siding %q ready — guest is up, Aspire is NOT started yet.\n", name)
+			fmt.Printf("%s siding %q ready — guest is up, Aspire is NOT started yet.\n", tick(), name)
 			fmt.Printf("  edit code here:  %s\n", src)
 			fmt.Printf("  on branch:       %s\n", sd.Branch)
 			fmt.Printf("  run it:          "+bin()+" up %s   (builds + starts Aspire, then points the front door at it)\n", name)

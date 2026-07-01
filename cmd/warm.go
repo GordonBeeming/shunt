@@ -62,8 +62,8 @@ func newWarmCmd() *cobra.Command {
 				return err
 			}
 			fi, _ := os.Stat(tar)
-			fmt.Printf("✓ warmed from host: %s (%.1f GB). New sidings `docker load` this — no pull.\n",
-				tar, float64(fi.Size())/1e9)
+			fmt.Printf("%s warmed from host: %s (%.1f GB). New sidings `docker load` this — no pull.\n",
+				tick(), tar, float64(fi.Size())/1e9)
 			return nil
 		},
 	}
@@ -106,6 +106,6 @@ func warmFromGuest(ctx context.Context, app state.App, src, tar string) error {
 		return fmt.Errorf("docker save → %s: %w", tar, err)
 	}
 	fi, _ := os.Stat(tar)
-	fmt.Printf("✓ warmed from siding: %s (%.1f GB).\n", tar, float64(fi.Size())/1e9)
+	fmt.Printf("%s warmed from siding: %s (%.1f GB).\n", tick(), tar, float64(fi.Size())/1e9)
 	return nil
 }

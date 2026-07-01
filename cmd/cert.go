@@ -46,7 +46,7 @@ func newCertInstallCmd() *cobra.Command {
 			}
 
 			cert, _ := caddy.DevCertPath()
-			fmt.Printf("✓ front door now serves the dotnet dev cert (%s) — no extra CA.\n", cert)
+			fmt.Printf("%s front door now serves the dotnet dev cert (%s) — no extra CA.\n", tick(), cert)
 			return nil
 		},
 	}

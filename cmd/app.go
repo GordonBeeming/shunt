@@ -189,7 +189,7 @@ func newAppAddCmd() *cobra.Command {
 			if ct.FixedPorts {
 				ports = "fixed ports"
 			}
-			fmt.Printf("✓ %s %s (runner: %s, %d front-door routes, %s)\n", verb, app.Name, app.Runner, len(app.FrontDoor), ports)
+			fmt.Printf("%s %s %s (runner: %s, %d front-door routes, %s)\n", tick(), verb, app.Name, app.Runner, len(app.FrontDoor), ports)
 			for _, r := range app.FrontDoor {
 				fmt.Printf("  %-10s %-6s localhost:%d  ->  %s/%s\n", r.Key, r.Kind, r.ListenPort, r.Resource, r.Endpoint)
 			}

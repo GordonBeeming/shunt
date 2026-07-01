@@ -79,7 +79,7 @@ func newInitCmd() *cobra.Command {
 				return fmt.Errorf("caddy admin API never came up: %w", err)
 			}
 
-			fmt.Printf("✓ shunt ready (channel=%s, admin=%s)\n", config.Channel, config.AdminBaseURL())
+			fmt.Printf("%s shunt ready (channel=%s, admin=%s)\n", tick(), config.Channel, config.AdminBaseURL())
 			return nil
 		},
 	}

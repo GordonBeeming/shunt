@@ -45,7 +45,7 @@ func newKillCmd() *cobra.Command {
 			if err := state.SaveApp(app); err != nil {
 				return err
 			}
-			fmt.Printf("✓ stopped %q\n", name)
+			fmt.Printf("%s stopped %q\n", tick(), name)
 			return nil
 		},
 	}
@@ -104,7 +104,7 @@ func newRmCmd() *cobra.Command {
 			if err := state.SaveApp(app); err != nil {
 				return err
 			}
-			fmt.Printf("✓ removed %q\n", name)
+			fmt.Printf("%s removed %q\n", tick(), name)
 			return nil
 		},
 	}

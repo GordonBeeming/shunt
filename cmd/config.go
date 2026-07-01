@@ -61,7 +61,7 @@ func configField(name, desc string, field func(*config.UserConfig) *string, effe
 			if err := config.SaveUserConfig(uc); err != nil {
 				return err
 			}
-			fmt.Printf("✓ %s = %q\n", name, args[0])
+			fmt.Printf("%s %s = %q\n", tick(), name, args[0])
 			fmt.Println("  applies to sidings created from now on")
 			return nil
 		},
