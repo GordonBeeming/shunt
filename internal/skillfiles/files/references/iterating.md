@@ -35,6 +35,15 @@ The guest, its Docker daemon, and the dependency containers (SQL etc.) are separ
 
 So the loop is: `up` once, then edit-and-hot-reload, and reach for `restart` when watch falls short. You should rarely pay the cold start again on a warmed project.
 
+## Changed config? Re-apply it — a running siding won't pick it up on its own
+
+Editing `.shunt.app.json` or running `shunt config` does **not** reach a siding that already exists — guest settings are baked in when the guest is created, and the front door is derived at `app add` time. After any config change, re-apply it before expecting the siding to behave differently:
+
+- **Guest settings** — `memory`, `cpus`, `mounts`, `env` (from the contract or `shunt config`): `shunt-dev reapply <siding>` recreates just the container with the current config, keeping the worktree, branch, and data clones; then `shunt-dev up <siding>` starts it.
+- **Front-door ports/routes** — the contract's `frontDoor`: re-run `shunt-dev app add` to re-derive the front door.
+
+This is a common miss: a siding built before the edit keeps running the **old** config, so the app misbehaves or dies right after start — e.g. `up`/`aspire start` launches and the AppHost then exits with no error because a mount or env var it needs isn't there. If a siding goes wrong right after a config edit, `reapply` + `up` before you deep-dive the app itself.
+
 ## Reading `active --json` to decide the next move
 
 - `appRunning == false` → `shunt-dev up <name>`

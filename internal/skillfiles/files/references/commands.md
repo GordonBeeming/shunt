@@ -20,11 +20,12 @@ The CLI is `shunt-dev` (dev channel). Release/beta builds are `shunt`/`shunt-bet
 | `shunt-dev up`/`restart`/`logs`/`kill`/`rm` `[name]` | All accept no name and fall back to the arrow-key picker (like `switch`). |
 | `shunt-dev kill <name>` | Stop a siding's guest, keeping its worktree + data to restart later. |
 | `shunt-dev rm <name> [--force]` | Tear down a siding: remove the guest, its worktree + branch, and its data. `--force` if it's live. |
+| `shunt-dev reapply <name>` | Recreate a siding's guest with the **current** config (`memory`/`cpus`/`mounts`/`env`, from the contract or `shunt config`), keeping its worktree, branch, and data clones. Guest settings are baked in at creation, so **after editing config, an existing siding only picks it up via `reapply` then `up`**. (Front-door port/route changes use `app add` instead.) |
 | `shunt-dev app add` | Register the repo with shunt (reads `.shunt.app.json`). Front-door ports are random+free by default (no collisions); `fixedPorts:true` pins them. Re-run to apply contract changes. |
 | `shunt-dev app switch <app>` | Make `<app>` active on its (fixed) front-door ports, parking any app that conflicts — without stopping the parked app's siding. For apps that share ports (e.g. Vite on the same port). |
 | `shunt-dev init` | One-time machine setup: builds Caddy + the base image, starts the proxy. |
 | `shunt-dev cert install` | Export the host's dotnet dev cert and load it into Caddy (front door serves HTTPS with the cert you already trust — no extra CA). |
-| `shunt-dev config <branchPrefix|memory|cpus> [value]` | Get/set user-config defaults: `branchPrefix` (e.g. `gb/shunt/` — must end in `/` or `-`; it's joined straight onto the siding name, and only applies to sidings created after), `memory` (per-guest RAM, default `4g`), `cpus` (default `4`). A repo's `.shunt.app.json` `memory`/`cpus` overrides per app. Stored per channel in `<global-dir>/config.json`. |
+| `shunt-dev config <branchPrefix|memory|cpus> [value]` | Get/set user-config defaults: `branchPrefix` (e.g. `gb/shunt/` — must end in `/` or `-`; it's joined straight onto the siding name, and only applies to sidings created after), `memory` (per-guest RAM, default `4g`), `cpus` (default `4`). A repo's `.shunt.app.json` `memory`/`cpus` overrides per app. Stored per channel in `<global-dir>/config.json`. Changing `memory`/`cpus` only reaches an existing siding after `shunt-dev reapply <siding>` + `up`. |
 
 ## The `.shunt.app.json` contract (one per repo)
 
