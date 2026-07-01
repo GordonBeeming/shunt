@@ -8,6 +8,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 // isSiding reports whether name is one of the app's sidings (so `run` can tell a
@@ -77,7 +78,15 @@ func newRunCmd() *cobra.Command {
 			// Pass the workdir + command as positional params to sh so each argument
 			// keeps its exact boundaries/quoting (flattening with strings.Join would
 			// mangle spaces, quotes, and flags). `exec -i` passes stdin through.
-			execArgs := []string{"exec", "-i", sd.Container, "sh", "-c"}
+			// Allocate a pseudo-TTY when stdin is a real terminal, so interactive
+			// guest commands work — a shell's line editing, and CLIs that show a
+			// selection prompt (e.g. `aspire stop` with several AppHosts) which
+			// otherwise fail with "the current terminal isn't interactive".
+			execArgs := []string{"exec", "-i"}
+			if term.IsTerminal(int(os.Stdin.Fd())) {
+				execArgs = append(execArgs, "-t")
+			}
+			execArgs = append(execArgs, sd.Container, "sh", "-c")
 			if len(rest) > 0 {
 				execArgs = append(execArgs, `cd "$1" && shift && exec "$@"`, "sh", wd)
 				execArgs = append(execArgs, rest...)
