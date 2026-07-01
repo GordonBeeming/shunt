@@ -236,6 +236,16 @@ func Bridge(ctx context.Context, name, bindIP string, extPort, intPort int) erro
 	return fmt.Errorf("bridge port %d->127.0.0.1:%d never came up", extPort, intPort)
 }
 
+// KillBridge stops the in-guest socat bridge listening on extPort, if any.
+// Best-effort (no error if nothing's there). Needed because Bridge is idempotent
+// on the external port — it returns success the moment *anything* listens there —
+// so a route whose target (guestPort) changed must have its stale socat killed
+// first, or it keeps forwarding to the old target. The trailing comma anchors the
+// match to `socat TCP-LISTEN:<port>,…` so a port isn't matched as a substring.
+func KillBridge(ctx context.Context, name string, extPort int) {
+	_, _ = Exec(ctx, name, "sh", "-c", fmt.Sprintf("pkill -f 'TCP-LISTEN:%d,' 2>/dev/null; true", extPort))
+}
+
 // isAbsentErr reports whether a `container` CLI error just means the guest isn't
 // there / isn't running — which Stop and Remove treat as success (the desired end
 // state already holds), so Recreate doesn't fail on a first-time guest.

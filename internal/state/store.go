@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -62,13 +63,20 @@ func CanonicalProject(name string) (canonicalName, configDir string, ok bool) {
 
 // canonicalIn is the pure case-fold against a project map (exact match wins,
 // then case-insensitive), split out so it's testable without touching disk.
+// Case-insensitive matches are resolved in sorted key order so the result is
+// deterministic even in the pathological case of two keys differing only by case.
 func canonicalIn(projects map[string]string, name string) (canonicalName, configDir string, ok bool) {
 	if dir, exact := projects[name]; exact {
 		return name, dir, true
 	}
-	for n, dir := range projects {
+	names := make([]string, 0, len(projects))
+	for n := range projects {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
 		if strings.EqualFold(n, name) {
-			return n, dir, true
+			return n, projects[n], true
 		}
 	}
 	return "", "", false
