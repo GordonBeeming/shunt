@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: build + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: unit tests
+        # Integration tests are behind the `integration` build tag (they need the
+        # Apple container runtime), so the default test run is unit-only and works
+        # on a stock GitHub-hosted runner.
+        run: go test ./... -race -count=1
