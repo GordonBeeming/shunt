@@ -253,7 +253,11 @@ func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 		// (`dotnet run` launched a fresh AppHost every time, which piled up competing
 		// instances on the fixed ports.) Each project still binds its launchSettings
 		// ports, which the contract front-doors host==guest.
-		runCmd = fmt.Sprintf(`export PATH="$PATH:/root/.dotnet/tools"; cd /workspace && aspire start --apphost %s --non-interactive > %s 2>&1`,
+		// Raise the CLI's start timeout well past its 120s default — a heavy app's
+		// cold start (restore + build + many resources) blows through 120s and
+		// `aspire start` would otherwise give up with "Timed out waiting … for
+		// AppHost to start" before the front door has anything to serve.
+		runCmd = fmt.Sprintf(`export PATH="$PATH:/root/.dotnet/tools"; export ASPIRE_CLI_START_TIMEOUT=900; cd /workspace && aspire start --apphost %s --non-interactive > %s 2>&1`,
 			app.AppHostPath, appLogPath)
 	} else {
 		wd := "/workspace"
@@ -792,7 +796,8 @@ func hostShellCmd(ctx context.Context, app state.App, command string) error {
 func HostStart(ctx context.Context, app state.App) error {
 	cmd := app.Start
 	if app.Runner == "" || app.Runner == runner.Aspire {
-		cmd = fmt.Sprintf("aspire start --apphost %s --non-interactive", app.AppHostPath)
+		// Raise the CLI start timeout past its 120s default for a heavy cold start.
+		cmd = fmt.Sprintf("ASPIRE_CLI_START_TIMEOUT=900 aspire start --apphost %s --non-interactive", app.AppHostPath)
 	}
 	if cmd == "" {
 		return fmt.Errorf("no host start command for runner %q — set `start` in the contract", app.Runner)
