@@ -37,10 +37,10 @@ So the loop is: `up` once, then edit-and-hot-reload, and reach for `restart` whe
 
 ## Changed config? Re-apply it — a running siding won't pick it up on its own
 
-Editing `.shunt.app.json` or running `shunt config` does **not** reach a siding that already exists — guest settings are baked in when the guest is created, and the front door is derived at `app add` time. After any config change, re-apply it before expecting the siding to behave differently:
+Editing `.shunt.app.json` or running `shunt config` does **not** reach a siding that already exists — guest settings are baked into the guest when it's created, and the front door is derived into saved state. After a `.shunt.app.json` edit, run **`shunt-dev app update`** to fold it into saved state, then apply it:
 
-- **Guest settings** — `memory`, `cpus`, `mounts`, `env`: `shunt-dev reapply [siding]` recreates just the container from the app's **saved** settings, keeping the worktree, branch, and data clones; then `shunt-dev up [siding]`. If you changed these in `.shunt.app.json` (rather than via `shunt config`), run `shunt-dev app add` first so the saved settings pick up the edit — `reapply` reads saved state, only `app add` re-reads the contract.
-- **Front-door ports/routes** — the contract's `frontDoor` (adding, removing, or renaming a route): re-run `shunt-dev app add`, **not** `reapply`. `reapply` never reads `frontDoor`, so a route you just added won't appear until `app add` re-derives the front door; then `up` (or `switch`) bridges the new route to the guest.
+- **Front-door ports/routes** — the contract's `frontDoor` (adding, removing, or renaming a route): `shunt-dev app update` re-derives the front door and applies just the delta — a new route is registered and bridged onto the live siding right away (no full `up`, no front-door blackout). Not `reapply` — it never reads `frontDoor`.
+- **Guest settings** — `memory`, `cpus`, `mounts`, `env`: `app update` refreshes these into saved state, then `shunt-dev reapply [siding]` recreates the container from the saved settings and `shunt-dev up [siding]` starts it. (`reapply` alone reads saved state, so without `app update` first it'd use the pre-edit values. A `shunt config` change skips `app update` — go straight to `reapply` + `up`.)
 
 This is a common miss: a siding built before the edit keeps running the **old** config, so the app misbehaves or dies right after start — e.g. `up`/`aspire start` launches and the AppHost then exits with no error because a mount or env var it needs isn't there. If a siding goes wrong right after a config edit, `reapply` + `up` before you deep-dive the app itself.
 
