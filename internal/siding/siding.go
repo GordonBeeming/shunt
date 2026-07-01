@@ -257,7 +257,7 @@ func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 		// cold start (restore + build + many resources) blows through 120s and
 		// `aspire start` would otherwise give up with "Timed out waiting … for
 		// AppHost to start" before the front door has anything to serve.
-		runCmd = fmt.Sprintf(`export PATH="$PATH:/root/.dotnet/tools"; export ASPIRE_CLI_START_TIMEOUT=900; cd /workspace && aspire start --apphost %s --non-interactive > %s 2>&1`,
+		runCmd = fmt.Sprintf(`export PATH="$PATH:/root/.dotnet/tools"; export ASPIRE_CLI_START_TIMEOUT=900; cd /workspace && aspire start --apphost "%s" --non-interactive > %s 2>&1`,
 			app.AppHostPath, appLogPath)
 	} else {
 		wd := "/workspace"
@@ -786,7 +786,10 @@ func Switch(ctx context.Context, app *state.App, target string) error {
 // hostShellCmd runs a command on the HOST (not a guest) in the app's main repo,
 // via a login shell so the user's PATH (incl. the aspire global tool) is loaded.
 func hostShellCmd(ctx context.Context, app state.App, command string) error {
-	_, err := proc.Run(ctx, "sh", "-lc", fmt.Sprintf("cd %q && %s", app.RepoPath, command))
+	// Set the working directory via cmd.Dir rather than injecting `cd %q` — in a
+	// login shell, double quotes don't stop `$`/backtick expansion, so a repo path
+	// with those characters would be mis-evaluated.
+	_, err := proc.RunInDir(ctx, app.RepoPath, "sh", "-lc", command)
 	return err
 }
 
@@ -797,7 +800,7 @@ func HostStart(ctx context.Context, app state.App) error {
 	cmd := app.Start
 	if app.Runner == "" || app.Runner == runner.Aspire {
 		// Raise the CLI start timeout past its 120s default for a heavy cold start.
-		cmd = fmt.Sprintf("ASPIRE_CLI_START_TIMEOUT=900 aspire start --apphost %s --non-interactive", app.AppHostPath)
+		cmd = fmt.Sprintf("ASPIRE_CLI_START_TIMEOUT=900 aspire start --apphost \"%s\" --non-interactive", app.AppHostPath)
 	}
 	if cmd == "" {
 		return fmt.Errorf("no host start command for runner %q — set `start` in the contract", app.Runner)

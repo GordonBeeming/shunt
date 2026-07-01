@@ -50,8 +50,8 @@ func switchTo(ctx context.Context, app *state.App, target string) error {
 		return err
 	}
 	if target == state.HostTarget {
-		fmt.Println("✓ switched to the host — your local app now serves the front-door ports (Caddy stepped aside)")
-		fmt.Printf("  start it if it isn't already, then switch back to a siding any time with `%s switch <name>`\n", bin())
+		fmt.Println("✓ switched to the host — started your local app; it now serves the front-door ports (Caddy stepped aside)")
+		fmt.Printf("  switch back to a siding any time with `%s switch <name>`\n", bin())
 		return nil
 	}
 	sd := app.Sidings[target]

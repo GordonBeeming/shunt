@@ -55,10 +55,18 @@ func AddWorktreeTracking(ctx context.Context, repoPath, dest, branch string) err
 	if _, err := proc.Run(ctx, "git", "-C", repoPath, "fetch", "origin", branch); err != nil {
 		return fmt.Errorf("fetch origin/%s (does the remote branch exist?): %w", branch, err)
 	}
-	// -B resets the local branch to the freshly-fetched origin/<branch> and checks
-	// it out in the worktree; then point it at its upstream so push/pull just work.
-	if _, err := proc.Run(ctx, "git", "-C", repoPath,
-		"worktree", "add", "--force", "-B", branch, dest, "origin/"+branch); err != nil {
+	// If a local branch of this name already exists, check it out as-is — never
+	// `-B`, which would hard-reset it to origin/<branch> and silently discard the
+	// user's unpushed commits. Only create it (tracking origin) when it's absent.
+	localExists := false
+	if _, err := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
+		localExists = true
+	}
+	addArgs := []string{"-C", repoPath, "worktree", "add", "--force", "-b", branch, dest, "origin/" + branch}
+	if localExists {
+		addArgs = []string{"-C", repoPath, "worktree", "add", "--force", dest, branch}
+	}
+	if _, err := proc.Run(ctx, "git", addArgs...); err != nil {
 		return fmt.Errorf("git worktree add (branch %q): %w", branch, err)
 	}
 	_, _ = proc.Run(ctx, "git", "-C", dest, "branch", "--set-upstream-to=origin/"+branch, branch)

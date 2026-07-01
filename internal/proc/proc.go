@@ -23,7 +23,16 @@ type Result struct {
 // returned as an error that includes stderr, so callers get a useful message
 // without having to re-assemble it.
 func Run(ctx context.Context, name string, args ...string) (Result, error) {
+	return RunInDir(ctx, "", name, args...)
+}
+
+// RunInDir is Run with the process's working directory set to dir (empty = the
+// current one). Use it instead of injecting a `cd <dir> && …` into a shell
+// string — a shell would subject dir to expansion (quotes don't stop `$`/backtick
+// evaluation in sh), whereas cmd.Dir is passed verbatim to the OS.
+func RunInDir(ctx context.Context, dir, name string, args ...string) (Result, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
