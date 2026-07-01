@@ -47,7 +47,7 @@ func newReapplyCmd() *cobra.Command {
 			if err := state.SaveApp(app); err != nil {
 				return err
 			}
-			fmt.Printf("✓ %q guest recreated — run `%s up %s` to start it\n", name, bin(), name)
+			fmt.Printf("%s %q guest recreated — run `%s up %s` to start it\n", tick(), name, bin(), name)
 			return nil
 		},
 	}

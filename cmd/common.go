@@ -10,6 +10,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/resolve"
 	"github.com/gordonbeeming/shunt/internal/state"
+	"github.com/gordonbeeming/shunt/internal/ui"
 )
 
 // loadCurrentApp resolves the project from cwd and loads its registered app.
@@ -31,6 +32,9 @@ func loadCurrentApp() (state.App, resolve.Location, error) {
 // bin is this build's command name (shunt / shunt-beta / shunt-dev), used in
 // user-facing hints so copy-pasted commands actually exist on PATH.
 func bin() string { return config.Current().BinaryName }
+
+// tick is the brand-cyan success check mark for "done" lines.
+func tick() string { return ui.Cyan("✓") }
 
 // gitOrigin returns the repo's origin URL, or "" if there isn't one.
 func gitOrigin(ctx context.Context, repoPath string) string {
@@ -63,7 +67,7 @@ func printFrontDoor(app state.App, sd state.Siding) {
 		if _, ok := sd.Bridges[r.Key]; !ok {
 			note = "  (pending — not up yet)"
 		}
-		fmt.Printf("    %-8s %s%s\n", r.Key, routeURL(r), note)
+		fmt.Printf("    %-8s %s%s\n", r.Key, ui.Cyan(routeURL(r)), ui.Dim(note))
 	}
 }
 

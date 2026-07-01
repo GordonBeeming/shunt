@@ -73,7 +73,7 @@ func newSkillInstallCmd() *cobra.Command {
 				return nil
 			}
 
-			fmt.Printf("✓ installed the %q skill:\n", skillName)
+			fmt.Printf("%s installed the %q skill:\n", tick(), skillName)
 			for _, t := range selected {
 				dest := filepath.Join(home, t.SkillsRel, skillName)
 				if err := writeSkill(dest, bin); err != nil {

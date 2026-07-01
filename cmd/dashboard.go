@@ -42,7 +42,7 @@ func newDashboardCmd() *cobra.Command {
 				if err := launchagent.InstallDashboard(cmd.Context(), exe); err != nil {
 					return err
 				}
-				fmt.Printf("✓ dashboard LaunchAgent installed — always on at http://%s\n", config.DashboardAddr())
+				fmt.Printf("%s dashboard LaunchAgent installed — always on at http://%s\n", tick(), config.DashboardAddr())
 				return nil
 			}
 			addr := config.DashboardAddr()

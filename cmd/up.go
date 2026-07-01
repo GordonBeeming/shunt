@@ -119,7 +119,7 @@ func newUpCmd() *cobra.Command {
 				if err := state.SaveApp(app); err != nil {
 					return err
 				}
-				fmt.Printf("✓ %q started in the guest — not bridged to the host (front door untouched)\n", name)
+				fmt.Printf("%s %q started in the guest — not bridged to the host (front door untouched)\n", tick(), name)
 				if u := siding.DashboardURL(app, sd); u != "" {
 					fmt.Printf("  check it on the guest's Aspire dashboard: %s\n", u)
 				}
@@ -135,7 +135,7 @@ func newUpCmd() *cobra.Command {
 			if err := state.SaveApp(app); err != nil {
 				return err
 			}
-			fmt.Printf("✓ %q is up\n", name)
+			fmt.Printf("%s %q is up\n", tick(), name)
 
 			if noSwitch {
 				fmt.Printf("  run `"+bin()+" switch %s` to point the stable ports at it\n", name)

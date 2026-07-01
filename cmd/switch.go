@@ -11,6 +11,7 @@ import (
 
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
+	"github.com/gordonbeeming/shunt/internal/ui"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -50,14 +51,14 @@ func switchTo(ctx context.Context, app *state.App, target string) error {
 		return err
 	}
 	if target == state.HostTarget {
-		fmt.Println("✓ switched to the host — started your local app; it now serves the front-door ports (Caddy stepped aside)")
+		fmt.Println(tick() + " switched to the host — started your local app; it now serves the front-door ports (Caddy stepped aside)")
 		fmt.Printf("  switch back to a siding any time with `%s switch <name>`\n", bin())
 		return nil
 	}
 	sd := app.Sidings[target]
-	fmt.Printf("✓ switched to %q\n", target)
+	fmt.Printf("%s switched to %q\n", tick(), target)
 	for _, r := range app.FrontDoor {
-		fmt.Printf("  localhost:%d  ->  %s:%d  (%s)\n", r.ListenPort, sd.LastIP, sd.Bridges[r.Key], r.Key)
+		fmt.Printf("  %s  ->  %s:%d  (%s)\n", ui.Cyan(fmt.Sprintf("localhost:%d", r.ListenPort)), sd.LastIP, sd.Bridges[r.Key], r.Key)
 	}
 	return nil
 }
@@ -114,9 +115,11 @@ func pickSidingInteractive(app state.App, names []string, fd int) (string, error
 				marker = "*"
 			}
 			if i == sel {
-				fmt.Fprintf(os.Stdout, "\r\x1b[7m> %d) %s %s \x1b[0m\x1b[K\r\n", i+1, marker, n)
+				// Green the live marker, then re-enable inverse-video (\x1b[7m) so the
+				// rest of the selected row stays highlighted after liveMarker's reset.
+				fmt.Fprintf(os.Stdout, "\r\x1b[7m> %d) %s\x1b[7m %s \x1b[0m\x1b[K\r\n", i+1, liveMarker(marker), n)
 			} else {
-				fmt.Fprintf(os.Stdout, "\r  %d) %s %s\x1b[K\r\n", i+1, marker, n)
+				fmt.Fprintf(os.Stdout, "\r  %d) %s %s\x1b[K\r\n", i+1, liveMarker(marker), n)
 			}
 		}
 	}
@@ -159,6 +162,15 @@ func pickSidingInteractive(app state.App, names []string, fd int) (string, error
 	}
 }
 
+// liveMarker greens the live "*" marker (brand: green = LIVE state only); a
+// blank marker stays plain.
+func liveMarker(m string) string {
+	if m == "*" {
+		return ui.Live("*")
+	}
+	return m
+}
+
 // pickSidingByNumber is the non-TTY fallback: print the list, read a number.
 func pickSidingByNumber(app state.App, names []string) (string, error) {
 	fmt.Println("Select a siding:")
@@ -167,7 +179,7 @@ func pickSidingByNumber(app state.App, names []string) (string, error) {
 		if app.LiveSiding == n {
 			marker = "*"
 		}
-		fmt.Printf("  %d) %s %s\n", i+1, marker, n)
+		fmt.Printf("  %d) %s %s\n", i+1, liveMarker(marker), n)
 	}
 	fmt.Print("> ")
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
