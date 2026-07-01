@@ -17,8 +17,8 @@ import (
 
 func newSwitchCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "switch [name]",
-		Short: "Point the stable front door at a siding (live, no restart)",
+		Use:   "switch [name|host]",
+		Short: "Point the stable front door at a siding, or `host` to run your local copy",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -26,13 +26,10 @@ func newSwitchCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if len(app.Sidings) == 0 {
-				return fmt.Errorf("no sidings yet — run `%s new <name>` first", bin())
-			}
 			var name string
 			if len(args) == 1 {
 				name = args[0]
-			} else if name, err = pickSiding(app); err != nil {
+			} else if name, err = pickSiding(app, true); err != nil {
 				return err
 			}
 			return switchTo(ctx, &app, name)
@@ -40,27 +37,25 @@ func newSwitchCmd() *cobra.Command {
 	}
 }
 
-// switchTo activates the siding if needed, repoints Caddy, and persists.
-func switchTo(ctx context.Context, app *state.App, name string) error {
-	sd, ok := app.Sidings[name]
-	if !ok {
-		return fmt.Errorf("no siding %q", name)
-	}
-	if len(sd.Bridges) == 0 {
-		fmt.Println("• siding not activated yet — discovering + bridging…")
-		if err := siding.Activate(ctx, *app, &sd); err != nil {
-			return err
+// switchTo repoints the front door at a siding or the host, via siding.Switch
+// (which stops the host app first, then either bridges a guest or steps the
+// front door aside for the native app), and reports the result.
+func switchTo(ctx context.Context, app *state.App, target string) error {
+	if target != state.HostTarget {
+		if _, ok := app.Sidings[target]; !ok {
+			return fmt.Errorf("no siding %q (use `host` to run your local copy)", target)
 		}
 	}
-	if err := siding.PointCaddy(ctx, *app, &sd); err != nil {
+	if err := siding.Switch(ctx, app, target); err != nil {
 		return err
 	}
-	app.LiveSiding = name
-	app.Sidings[name] = sd
-	if err := state.SaveApp(*app); err != nil {
-		return err
+	if target == state.HostTarget {
+		fmt.Println("✓ switched to the host — your local app now serves the front-door ports (Caddy stepped aside)")
+		fmt.Printf("  start it if it isn't already, then switch back to a siding any time with `%s switch <name>`\n", bin())
+		return nil
 	}
-	fmt.Printf("✓ switched to %q\n", name)
+	sd := app.Sidings[target]
+	fmt.Printf("✓ switched to %q\n", target)
 	for _, r := range app.FrontDoor {
 		fmt.Printf("  localhost:%d  ->  %s:%d  (%s)\n", r.ListenPort, sd.LastIP, sd.Bridges[r.Key], r.Key)
 	}
@@ -69,12 +64,16 @@ func switchTo(ctx context.Context, app *state.App, name string) error {
 
 // pickSiding lets the user choose a siding — arrow-key navigation on a TTY,
 // numbered prompt otherwise.
-func pickSiding(app state.App) (string, error) {
-	names := make([]string, 0, len(app.Sidings))
+func pickSiding(app state.App, includeHost bool) (string, error) {
+	names := make([]string, 0, len(app.Sidings)+1)
 	for n := range app.Sidings {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	if includeHost {
+		// `host` (run the local copy) is a switch target too — list it first.
+		names = append([]string{state.HostTarget}, names...)
+	}
 	if len(names) == 0 {
 		return "", fmt.Errorf("no sidings yet — `%s new <name>`", bin())
 	}

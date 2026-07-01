@@ -27,6 +27,9 @@ func newKillCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if name == state.HostTarget {
+				return fmt.Errorf("%q is your local copy, not a siding — nothing for shunt to tear down", name)
+			}
 			sd, ok := app.Sidings[name]
 			if !ok {
 				return fmt.Errorf("no siding %q", name)
@@ -63,6 +66,9 @@ func newRmCmd() *cobra.Command {
 			name, err := sidingArg(app, args)
 			if err != nil {
 				return err
+			}
+			if name == state.HostTarget {
+				return fmt.Errorf("%q is your local copy, not a siding — nothing for shunt to tear down", name)
 			}
 			sd, ok := app.Sidings[name]
 			if !ok {

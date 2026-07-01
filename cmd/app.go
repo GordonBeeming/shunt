@@ -146,16 +146,11 @@ func newAppAddCmd() *cobra.Command {
 					CaddyID: caddy.RouteID(loc.Project, r.Kind, r.Key),
 				}
 				app.FrontDoor = append(app.FrontDoor, route)
-				path, body, err := caddy.ServerForRoute(loc.Project, route)
-				if err != nil {
-					return err
-				}
-				// Delete-then-put so re-running app add applies route config changes
-				// (e.g. switching a route to HTTPS) instead of 409-ing on the existing one.
-				_ = admin.Delete(ctx, path)
-				if err := admin.Put(ctx, path, body); err != nil {
-					return fmt.Errorf("register route %q in Caddy: %w", r.Key, err)
-				}
+			}
+			// Register (delete-then-put) every front-door server in one place, shared
+			// with the switch-back-from-host path (caddy.EnsureFrontDoor).
+			if err := caddy.EnsureFrontDoor(ctx, admin, app); err != nil {
+				return err
 			}
 
 			if err := state.SaveApp(app); err != nil {

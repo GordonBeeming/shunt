@@ -57,10 +57,10 @@ func newRunCmd() *cobra.Command {
 				name = loc.Siding
 			case len(args) > 0 && isSiding(app, args[0]):
 				name, rest, explicit = args[0], args[1:], true
-			case app.LiveSiding != "":
+			case app.LiveSiding != "" && app.LiveSiding != state.HostTarget:
 				name = app.LiveSiding
 			default:
-				if name, err = pickSiding(app); err != nil {
+				if name, err = pickSiding(app, false); err != nil { // run needs a guest, not the host
 					return err
 				}
 			}

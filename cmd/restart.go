@@ -6,6 +6,7 @@ import (
 
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/siding"
+	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 )
 
@@ -26,6 +27,15 @@ func newRestartCmd() *cobra.Command {
 			name, err := sidingArg(app, args)
 			if err != nil {
 				return err
+			}
+			if name == state.HostTarget {
+				fmt.Println("• restarting your local app on the host…")
+				siding.HostStop(ctx, app)
+				if err := siding.HostStart(ctx, app); err != nil {
+					return err
+				}
+				fmt.Println("✓ host app restarted")
+				return nil
 			}
 			sd, ok := app.Sidings[name]
 			if !ok {

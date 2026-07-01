@@ -19,6 +19,9 @@ func newNewCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			name := args[0]
+			if name == state.HostTarget {
+				return fmt.Errorf("%q is reserved — it's the switch target for your local copy; pick another siding name", name)
+			}
 			if from != "" && branch != "" {
 				return fmt.Errorf("--from and --branch are mutually exclusive: --from continues an existing branch, --branch forks a new siding branch off a start point")
 			}

@@ -17,6 +17,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/fsclone"
 	"github.com/gordonbeeming/shunt/internal/hostdocker"
+	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/runner"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/gordonbeeming/shunt/internal/ui"
@@ -731,10 +732,39 @@ func CreateBindVolumes(ctx context.Context, app state.App, sd state.Siding) erro
 // done, repoints Caddy, marks it live, and persists. This is the fast path — a
 // Caddy rebind, no app restart — and assumes the siding is running on its ports.
 // Shared by `shunt switch` and the dashboard.
-func Switch(ctx context.Context, app *state.App, name string) error {
-	sd, ok := app.Sidings[name]
+// Switch points the app's stable front door at a target: either a siding or the
+// special `host` target (the local app running natively from the main repo).
+// Every switch first stops the host app best-effort, so it isn't holding the
+// shared ports — whether we're going to the host or a siding.
+func Switch(ctx context.Context, app *state.App, target string) error {
+	admin := caddy.NewAdmin()
+	wasHost := app.LiveSiding == state.HostTarget
+
+	HostStop(ctx, *app) // best-effort: free the ports in case the local app is running
+
+	if target == state.HostTarget {
+		// Step the front door aside so the native app binds the real ports directly.
+		if err := caddy.RemoveFrontDoor(ctx, admin, *app); err != nil {
+			return err
+		}
+		if err := HostStart(ctx, *app); err != nil {
+			_ = caddy.EnsureFrontDoor(ctx, admin, *app) // don't leave it with no front door
+			return err
+		}
+		app.LiveSiding = state.HostTarget
+		return state.SaveApp(*app)
+	}
+
+	sd, ok := app.Sidings[target]
 	if !ok {
-		return fmt.Errorf("no siding %q", name)
+		return fmt.Errorf("no siding %q", target)
+	}
+	// Coming back from the host, the front-door servers were removed — re-create
+	// them so Caddy re-binds the ports before pointing them at the guest.
+	if wasHost {
+		if err := caddy.EnsureFrontDoor(ctx, admin, *app); err != nil {
+			return err
+		}
 	}
 	if len(sd.Bridges) == 0 {
 		if err := Activate(ctx, *app, &sd); err != nil {
@@ -744,9 +774,47 @@ func Switch(ctx context.Context, app *state.App, name string) error {
 	if err := PointCaddy(ctx, *app, &sd); err != nil {
 		return err
 	}
-	app.LiveSiding = name
-	app.Sidings[name] = sd
+	app.LiveSiding = target
+	app.Sidings[target] = sd
 	return state.SaveApp(*app)
+}
+
+// hostShellCmd runs a command on the HOST (not a guest) in the app's main repo,
+// via a login shell so the user's PATH (incl. the aspire global tool) is loaded.
+func hostShellCmd(ctx context.Context, app state.App, command string) error {
+	_, err := proc.Run(ctx, "sh", "-lc", fmt.Sprintf("cd %q && %s", app.RepoPath, command))
+	return err
+}
+
+// HostStart runs the app natively on the host from the main repo, so the local
+// copy serves the front-door ports directly. aspire → `aspire start` (managed,
+// background); other runners → the contract's start command.
+func HostStart(ctx context.Context, app state.App) error {
+	cmd := app.Start
+	if app.Runner == "" || app.Runner == runner.Aspire {
+		cmd = fmt.Sprintf("aspire start --apphost %s --non-interactive", app.AppHostPath)
+	}
+	if cmd == "" {
+		return fmt.Errorf("no host start command for runner %q — set `start` in the contract", app.Runner)
+	}
+	if err := hostShellCmd(ctx, app, cmd); err != nil {
+		return fmt.Errorf("host start: %w", err)
+	}
+	return nil
+}
+
+// HostStop stops the natively-running app (best-effort — fine if nothing's
+// running), freeing the front-door ports. aspire → `aspire stop`; else the
+// contract's stop command.
+func HostStop(ctx context.Context, app state.App) {
+	cmd := app.Stop
+	if app.Runner == "" || app.Runner == runner.Aspire {
+		cmd = "aspire stop --non-interactive"
+	}
+	if cmd == "" {
+		return
+	}
+	_ = hostShellCmd(ctx, app, cmd)
 }
 
 // Restart stops the app in the guest and starts it again (the configured stop +

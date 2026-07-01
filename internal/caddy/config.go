@@ -171,6 +171,35 @@ func DialPatch(r state.Route, hostPort string) (path string, body []byte, err er
 	}
 }
 
+// EnsureFrontDoor (re)creates every one of the app's front-door Caddy servers
+// (one listener per stable port, placeholder dial). Idempotent — delete-then-put
+// so a re-register applies route config changes. Used by `app add` and to re-take
+// the ports after they were released for the host (see RemoveFrontDoor).
+func EnsureFrontDoor(ctx context.Context, a *Admin, app state.App) error {
+	for _, r := range app.FrontDoor {
+		path, body, err := ServerForRoute(app.Name, r)
+		if err != nil {
+			return err
+		}
+		_ = a.Delete(ctx, path)
+		if err := a.Put(ctx, path, body); err != nil {
+			return fmt.Errorf("register route %q in Caddy: %w", r.Key, err)
+		}
+	}
+	return nil
+}
+
+// RemoveFrontDoor deletes every one of the app's front-door Caddy servers,
+// releasing the stable ports so the native (host) app can bind them directly.
+func RemoveFrontDoor(ctx context.Context, a *Admin, app state.App) error {
+	for _, r := range app.FrontDoor {
+		if path, _, err := ServerForRoute(app.Name, r); err == nil {
+			_ = a.Delete(ctx, path)
+		}
+	}
+	return nil
+}
+
 // CurrentDial reads a route's live upstream dial from Caddy (e.g. "192.168.64.5:7022"),
 // so a switch can capture it and roll back to it if a later route fails to repoint.
 // Handles both shapes: http reverse_proxy stores `dial` as a string, layer4 proxy
