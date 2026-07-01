@@ -173,6 +173,36 @@ func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding
 // doesn't show up in `container logs`).
 const appLogPath = "/var/log/apphost.log"
 
+// EnsureGuestLive makes sure the guest actually runs — not just per stale
+// metadata. After a host sleep/reboot the Apple container runtime can report a
+// guest as "running" while its VM is dead, so `container exec` fails with
+// "cannot exec: container is not running". Probe with a trivial exec; if it
+// fails, bounce the guest (stop+start). That's non-destructive: the worktree and
+// data volumes are host bind mounts and the guest's own disk (incl. loaded
+// dependency images) persists across stop/start, so no work is lost — it just
+// re-runs the entrypoint (dockerd + dev cert). Returns an error only if the guest
+// genuinely can't be brought back (e.g. it no longer exists → the caller says new).
+func EnsureGuestLive(ctx context.Context, sd state.Siding) error {
+	if _, err := container.Exec(ctx, sd.Container, "true"); err == nil {
+		return nil // truly alive
+	}
+	_ = container.Stop(ctx, sd.Container) // clear the zombie/stopped state
+	if err := container.Start(ctx, sd.Container); err != nil {
+		return fmt.Errorf("guest for %q wouldn't restart: %w", sd.Name, err)
+	}
+	for i := 0; i < 20; i++ {
+		if _, err := container.Exec(ctx, sd.Container, "true"); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return fmt.Errorf("guest for %q didn't become reachable after a restart", sd.Name)
+}
+
 // EnsureDockerd makes sure the in-guest Docker daemon is healthy before Aspire
 // needs it. A guest that was stopped and started again often fails to re-start
 // dockerd from its entrypoint (stale pid/socket state), leaving it dead even
