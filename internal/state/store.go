@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -46,7 +47,7 @@ func SaveRegistry(reg Registry) error {
 }
 
 // CanonicalProject case-folds a project name against the registry. The macOS
-// filesystem is case-insensitive, so `cd hubX` and `cd HubX` land in the same
+// filesystem is case-insensitive, so `cd myApp` and `cd MyApp` land in the same
 // repo but yield different `basename(cwd)` values; without this, a differently-
 // cased cwd forks a phantom project that then collides on the real app's ports.
 // When a registered project matches case-insensitively, it returns the REGISTERED
@@ -62,13 +63,20 @@ func CanonicalProject(name string) (canonicalName, configDir string, ok bool) {
 
 // canonicalIn is the pure case-fold against a project map (exact match wins,
 // then case-insensitive), split out so it's testable without touching disk.
+// Case-insensitive matches are resolved in sorted key order so the result is
+// deterministic even in the pathological case of two keys differing only by case.
 func canonicalIn(projects map[string]string, name string) (canonicalName, configDir string, ok bool) {
 	if dir, exact := projects[name]; exact {
 		return name, dir, true
 	}
-	for n, dir := range projects {
+	names := make([]string, 0, len(projects))
+	for n := range projects {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
 		if strings.EqualFold(n, name) {
-			return n, dir, true
+			return n, projects[n], true
 		}
 	}
 	return "", "", false

@@ -507,6 +507,22 @@ func allResolved(eps []aspire.Endpoint, routes []state.Route) bool {
 	return true
 }
 
+// DropBridges tears down the in-guest socat bridge for each given route (by its
+// listen port) and clears it from the siding's Bridges map, so a following
+// Activate rebuilds it against the current target. Needed when a route's bridge
+// definition changed (e.g. a new guestPort): Activate alone is idempotent on the
+// external port and would keep the stale forwarder. Routes without a guestPort
+// (discovery-based) have no eager bridge to drop.
+func DropBridges(ctx context.Context, sd *state.Siding, routes []state.Route) {
+	for _, r := range routes {
+		if r.GuestPort == 0 {
+			continue
+		}
+		container.KillBridge(ctx, sd.Container, r.ListenPort)
+		delete(sd.Bridges, r.Key)
+	}
+}
+
 // PointCaddy repoints the app's front-door routes at this siding's bridged
 // endpoints — the actual switch. It refreshes the guest IP first.
 func PointCaddy(ctx context.Context, app state.App, sd *state.Siding) error {

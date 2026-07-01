@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -56,14 +57,21 @@ func applyContract(ctx context.Context, cwd string, mode applyMode) error {
 		return err
 	}
 	// Fold a differently-cased cwd onto the registered project (the macOS FS is
-	// case-insensitive, so `cd hubX` and `cd HubX` are the same repo): resolve to
-	// the registered `HubX` instead of forking a phantom project whose new Caddy
+	// case-insensitive, so `cd myApp` and `cd MyApp` are the same repo): resolve to
+	// the registered `MyApp` instead of forking a phantom project whose new Caddy
 	// servers then collide on the real app's ports.
 	if name, dir, ok := state.CanonicalProject(loc.Project); ok {
 		loc.Project, loc.ConfigDir = name, dir
 	}
 
 	existing, existErr := state.LoadApp(loc.ConfigDir)
+	// Only a genuinely absent registration means "not registered". A real load
+	// failure (corrupt JSON, permissions) must surface — otherwise `app add` would
+	// overwrite sidings it couldn't read, and `app update` would mis-report it as
+	// unregistered.
+	if existErr != nil && !errors.Is(existErr, state.ErrNotFound) {
+		return fmt.Errorf("load app state for %q: %w", loc.Project, existErr)
+	}
 	updating := existErr == nil
 	if mode == applyUpdate && !updating {
 		return fmt.Errorf("no shunt app registered here yet — run `%s app add` first", bin())
@@ -183,19 +191,30 @@ func applyContract(ctx context.Context, cwd string, mode applyMode) error {
 		return err
 	}
 
-	// Bring the live siding in line: bridge any newly-added routes (Activate is
-	// idempotent — it only adds socat for ports not already listening) and
-	// re-point the front door at the guest, so a new route comes up without a
-	// full `up`.
-	if updating && app.LiveSiding != "" && app.LiveSiding != state.HostTarget {
-		if sd, ok := app.Sidings[app.LiveSiding]; ok && len(sd.Bridges) > 0 {
+	// Bring the live siding in line with the reconciled front door: rebuild the
+	// bridges for added/changed routes (DropBridges first, so a changed guestPort
+	// doesn't keep forwarding to the old target — Activate is idempotent on the
+	// external port), then re-point. Persist right after each step so the on-disk
+	// bridges never drift from what's actually running.
+	if updating && (len(added) > 0 || len(removed) > 0) && app.LiveSiding != "" && app.LiveSiding != state.HostTarget {
+		if sd, ok := app.Sidings[app.LiveSiding]; ok {
+			siding.DropBridges(ctx, &sd, added)
+			siding.DropBridges(ctx, &sd, removed)
 			if err := siding.Activate(ctx, app, &sd); err != nil {
-				fmt.Printf("  (couldn't bridge new routes on %q: %v — run `%s up %s`)\n", app.LiveSiding, err, bin(), app.LiveSiding)
-			} else if err := siding.PointCaddy(ctx, app, &sd); err != nil {
-				fmt.Printf("  (front door not re-pointed at %q: %v — run `%s switch %s`)\n", app.LiveSiding, err, bin(), app.LiveSiding)
+				fmt.Printf("  (couldn't bridge routes on %q: %v — run `%s up %s`)\n", app.LiveSiding, err, bin(), app.LiveSiding)
 			} else {
 				app.Sidings[app.LiveSiding] = sd
-				_ = state.SaveApp(app)
+				if err := state.SaveApp(app); err != nil {
+					return fmt.Errorf("save siding state after bridging: %w", err)
+				}
+				if err := siding.PointCaddy(ctx, app, &sd); err != nil {
+					fmt.Printf("  (front door not re-pointed at %q: %v — run `%s switch %s`)\n", app.LiveSiding, err, bin(), app.LiveSiding)
+				} else {
+					app.Sidings[app.LiveSiding] = sd
+					if err := state.SaveApp(app); err != nil {
+						return fmt.Errorf("save siding state after re-pointing: %w", err)
+					}
+				}
 			}
 		}
 	}
@@ -237,6 +256,19 @@ func reconcileFrontDoor(ctx context.Context, admin *caddy.Admin, appName string,
 	for _, r := range next {
 		newByKey[r.Kind+"/"+r.Key] = r
 	}
+	// Delete removed/renamed routes FIRST so their listen ports are freed before we
+	// (re)bind added or changed ones. A rename that keeps the same port lives at a
+	// different server path, so the old server would still hold the port and Caddy
+	// would 500 on the new bind if we added before removing.
+	for _, r := range existing {
+		if _, ok := newByKey[r.Kind+"/"+r.Key]; ok {
+			continue
+		}
+		removed = append(removed, r)
+		if path, _, e := caddy.ServerForRoute(appName, r); e == nil {
+			_ = admin.Delete(ctx, path)
+		}
+	}
 	for _, r := range next {
 		if o, ok := oldByKey[r.Kind+"/"+r.Key]; ok && routesEqual(o, r) {
 			continue // unchanged — leave its server + live dial alone
@@ -251,24 +283,17 @@ func reconcileFrontDoor(ctx context.Context, admin *caddy.Admin, appName string,
 			return nil, nil, fmt.Errorf("register route %q in Caddy: %w", r.Key, e)
 		}
 	}
-	for _, r := range existing {
-		if _, ok := newByKey[r.Kind+"/"+r.Key]; ok {
-			continue
-		}
-		removed = append(removed, r)
-		if path, _, e := caddy.ServerForRoute(appName, r); e == nil {
-			_ = admin.Delete(ctx, path)
-		}
-	}
 	return added, removed, nil
 }
 
 // routesEqual reports whether two routes match in every field that affects the
-// Caddy server or the guest bridge — so an unchanged route can be left alone.
+// Caddy server, its @id, or the guest bridge — so an unchanged route can be left
+// alone. CaddyID is included so a project rename/case migration (which changes the
+// @id) is treated as a change and the server re-registered, not left stale.
 func routesEqual(a, b state.Route) bool {
 	return a.Key == b.Key && a.Kind == b.Kind && a.ListenPort == b.ListenPort &&
 		a.Resource == b.Resource && a.Endpoint == b.Endpoint &&
-		a.GuestPort == b.GuestPort && a.TLS == b.TLS
+		a.GuestPort == b.GuestPort && a.TLS == b.TLS && a.CaddyID == b.CaddyID
 }
 
 // freePort returns a free TCP port on the host not already in used.

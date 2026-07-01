@@ -19,6 +19,6 @@ shunt-dev skill install --all
 
 Use the GitButler flow from the global rules (this repo lives on `gitbutler/workspace`; commit with `but`). Sidings themselves are plain-git worktrees — see the global git rule for the carve-out.
 
-## Test fixtures
+## Test fixtures — client code, never named here
 
-Two real Aspire repos are used to validate the infra and must never appear in shipped docs/README/help: `SSWConsulting/SSW.Woodpecker` (fast) and `asfaudits/HubX` (heavy). They exist only to prove shunt works end to end.
+Real client Aspire repos are used **locally** to validate the infra end to end (a light one for fast loops, a heavy one for load). Their names, org names, paths, resource names, and ports are **client-confidential and must NEVER appear anywhere in this repo** — not in code, comments, tests, commit messages, PR titles/bodies, review replies, docs, README, or help. Keep every example generic (`myapp`, `MyApp`, `api`, `db`, `web`). If a real client name shows up in a diff, commit, or message, treat it as a leak and scrub it before anything is pushed.
