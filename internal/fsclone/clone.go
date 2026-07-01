@@ -41,6 +41,30 @@ func AddWorktree(ctx context.Context, repoPath, dest, newBranch, baseBranch stri
 	return nil
 }
 
+// AddWorktreeTracking creates a worktree at dest checked out on an EXISTING
+// branch (fetched from origin), tracking origin/<branch>. Unlike AddWorktree —
+// which forks a fresh siding branch off a start point — this stays on the branch
+// itself, so commits continue it and `git push` goes back to the same branch.
+// Used by `new --from <branch>` to pick up an existing remote branch in a siding.
+func AddWorktreeTracking(ctx context.Context, repoPath, dest, branch string) error {
+	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "remove", "--force", dest)
+	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "prune")
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return fmt.Errorf("create siding dir: %w", err)
+	}
+	if _, err := proc.Run(ctx, "git", "-C", repoPath, "fetch", "origin", branch); err != nil {
+		return fmt.Errorf("fetch origin/%s (does the remote branch exist?): %w", branch, err)
+	}
+	// -B resets the local branch to the freshly-fetched origin/<branch> and checks
+	// it out in the worktree; then point it at its upstream so push/pull just work.
+	if _, err := proc.Run(ctx, "git", "-C", repoPath,
+		"worktree", "add", "--force", "-B", branch, dest, "origin/"+branch); err != nil {
+		return fmt.Errorf("git worktree add (branch %q): %w", branch, err)
+	}
+	_, _ = proc.Run(ctx, "git", "-C", dest, "branch", "--set-upstream-to=origin/"+branch, branch)
+	return nil
+}
+
 // RemoveWorktree tears down a siding's worktree at dest and deletes its branch,
 // leaving the main repo clean (no dangling worktree registration).
 func RemoveWorktree(ctx context.Context, repoPath, dest, branch string) error {

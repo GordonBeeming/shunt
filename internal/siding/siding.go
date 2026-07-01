@@ -86,10 +86,18 @@ func guestEnv(app state.App) map[string]string {
 
 // Spin clones the repo + data volumes and launches the guest. It does not wait
 // for the app to be ready (see Activate).
-func Spin(ctx context.Context, app state.App, name, branch string) (state.Siding, error) {
+func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (state.Siding, error) {
 	src, volRoot := Paths(app, name)
 	wtBranch := config.BranchPrefix() + name
-	if err := fsclone.AddWorktree(ctx, app.RepoPath, src, wtBranch, branch); err != nil {
+	if fromBranch != "" {
+		// Pick up an existing (remote) branch and stay ON it, so commits continue
+		// that branch and push back to it — rather than forking a new prefixed
+		// siding branch off a start point.
+		wtBranch = fromBranch
+		if err := fsclone.AddWorktreeTracking(ctx, app.RepoPath, src, fromBranch); err != nil {
+			return state.Siding{}, err
+		}
+	} else if err := fsclone.AddWorktree(ctx, app.RepoPath, src, wtBranch, branch); err != nil {
 		return state.Siding{}, err
 	}
 
