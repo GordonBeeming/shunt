@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/gordonbeeming/shunt/internal/siding"
+	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 )
 
@@ -18,7 +20,8 @@ func newCdCmd() *cobra.Command {
 			"jump into it. A process can't cd its parent shell, so this prints the path:\n\n" +
 			"  cd \"$(" + bin() + " cd <name>)\"\n\n" +
 			"Handy as a shell function: `scd() { cd \"$(" + bin() + " cd \"$@\")\"; }`.\n" +
-			"Siding is taken from the name arg, else the one your cwd is inside, else the live one.",
+			"Siding is taken from the name arg, else the one your cwd is inside, else the live one;\n" +
+			"`host` prints the original repo checkout.",
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -38,11 +41,20 @@ func newCdCmd() *cobra.Command {
 			if name == "" {
 				return fmt.Errorf("which siding? pass a name or make one live (`%s ls`)", bin())
 			}
-			if _, ok := app.Sidings[name]; !ok {
-				return fmt.Errorf("no siding %q in %q", name, app.Name)
+			// "host" isn't a siding — it's the original repo checkout.
+			dir := app.RepoPath
+			if name != state.HostTarget {
+				if _, ok := app.Sidings[name]; !ok {
+					return fmt.Errorf("no siding %q in %q", name, app.Name)
+				}
+				dir, _ = siding.Paths(app, name)
 			}
-			src, _ := siding.Paths(app, name)
-			fmt.Println(src)
+			// Guard a missing worktree (siding metadata without its checkout) so
+			// `cd "$(shunt cd …)"` never lands in a nonexistent path.
+			if _, err := os.Stat(dir); err != nil {
+				return fmt.Errorf("path not found at %s: %w", dir, err)
+			}
+			fmt.Println(dir)
 			return nil
 		},
 	}
