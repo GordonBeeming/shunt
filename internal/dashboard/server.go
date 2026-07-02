@@ -55,6 +55,7 @@ type routeView struct {
 	Kind       string `json:"kind"`
 	ListenPort int    `json:"listenPort"`
 	URL        string `json:"url"`
+	GuestURL   string `json:"guestUrl,omitempty"` // direct guest address (live siding), bypassing Caddy
 	Up         bool   `json:"up"`
 }
 
@@ -98,14 +99,22 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		}
 		av := appView{Name: app.Name, LiveSiding: app.LiveSiding, Routes: []routeView{}, Sidings: []sidingView{}}
 
-		// Routes + host-side liveness (only meaningful when something is live, but
-		// the dial is harmless either way — a refused port just reads as down).
+		// Liveness is a front-door dial (through Caddy) — see routeUp for why we
+		// can't dial the guest directly from the launchd dashboard. When a siding
+		// is live, also surface its guest-direct URL so you can browse past Caddy
+		// in a real browser to tell "app down" from "front-door misrouted".
+		liveIP := app.Sidings[app.LiveSiding].LastIP
 		for _, rt := range app.FrontDoor {
+			guestURL := ""
+			if liveIP != "" {
+				guestURL = guestRouteURL(rt, liveIP)
+			}
 			av.Routes = append(av.Routes, routeView{
 				Key:        rt.Key,
 				Kind:       rt.Kind,
 				ListenPort: rt.ListenPort,
 				URL:        routeURL(rt),
+				GuestURL:   guestURL,
 				Up:         routeUp(rt),
 			})
 		}
@@ -216,10 +225,15 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 
 // --- helpers ---
 
-// routeUp reports whether a front-door route actually serves right now. Caddy's
-// listener is always up, so a raw TCP dial is a false positive — for HTTP we make
-// a real request and treat 502/503/504 (or no response) as down; for layer4 we
-// fall back to a TCP dial (a true upstream check would need a protocol handshake).
+// routeUp reports whether a front-door route actually serves right now, dialing
+// the stable localhost port through Caddy. We deliberately go through the front
+// door rather than the guest IP: the dashboard runs as a launchd agent, and
+// macOS Local Network privacy blocks a launchd process from reaching the guest's
+// 192.168.64.x address (loopback is fine). Caddy's listener is always up, so a
+// raw TCP dial is a false positive — for HTTP we make a real request and treat
+// 502/503/504 (Caddy can't reach the app = app down) or no response as down; for
+// layer4 we fall back to a TCP dial. For app-vs-Caddy disambiguation, use the
+// guest-direct link (opened in a real browser, which has Local Network access).
 func routeUp(r state.Route) bool {
 	addr := fmt.Sprintf("127.0.0.1:%d", r.ListenPort)
 	if r.Kind == state.KindHTTP {
@@ -250,6 +264,18 @@ func routeUp(r state.Route) bool {
 	}
 	_ = conn.Close()
 	return true
+}
+
+// guestRouteURL is the direct guest address for a route, bypassing Caddy — meant
+// to be opened in a real browser (which has macOS Local Network access) to verify
+// the app past the front door. The guest is exposed on the same port Caddy
+// listens on (host==guest port); http mirrors the CLI's DashboardURL convention
+// (guest apps usually serve http behind an https front door).
+func guestRouteURL(r state.Route, ip string) string {
+	if r.Kind == state.KindHTTP {
+		return fmt.Sprintf("http://%s:%d", ip, r.ListenPort)
+	}
+	return fmt.Sprintf("%s:%d", ip, r.ListenPort)
 }
 
 func routeURL(r state.Route) string {
