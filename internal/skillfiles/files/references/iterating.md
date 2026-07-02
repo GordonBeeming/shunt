@@ -18,12 +18,13 @@ shunt-dev new exp1 && shunt-dev up exp1   # the guest docker-loads the cache →
 
 A siding's `src` is an ordinary checkout on the host, so build it and run the tests **there** before touching the guest — `dotnet build` / `dotnet test`, `pnpm build`, whatever the project uses. That's the fast feedback loop; `up` is a full guest rebuild, so don't spend it on code that doesn't compile yet.
 
-Once it builds and the tests pass, go live in two steps, not one:
+Once it builds and the tests pass, bring it online without stealing the front door, then go live deliberately:
 
 1. **Ask the user first, then `shunt up <name> --no-bridge`** — starts the app in the guest but leaves the host alone: no socat bridges and no Caddy, so nothing is taken from whatever's currently live. The command prints the guest's own Aspire dashboard URL; open it to confirm the app actually comes up ("would it work").
-2. **Confirm with the user, then a plain `shunt up <name>`** (or `switch <name>`) — *this* bridges the host ports and repoints the stable front door, so it can interrupt another session/agent using those ports. Only do it once step 1 looks healthy.
+2. **`shunt up <name>`** — bridges the host ports but leaves the stable front door where it is, so it does **not** interrupt whatever's currently live. Safe to run once step 1 looks healthy; the siding now shows as `up` in `ls`.
+3. **Confirm with the user, then `shunt switch <name>`** — *this* repoints the front door at the siding, so it's the step that can interrupt another session/agent using those ports. Going live is only ever an explicit `switch`. (`up <name> --switch` folds steps 2–3 into one when you already want it live.)
 
-So the default for a substantial change is: build + test on the host → ask → `up --no-bridge` → confirm → `up`. Don't jump straight to a bridging `up`.
+So the default for a substantial change is: build + test on the host → ask → `up --no-bridge` → `up` → confirm → `switch`. The front door only moves on an explicit `switch`.
 
 ## Three tiers — never drop the whole environment to see a change
 

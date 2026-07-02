@@ -15,11 +15,11 @@ import (
 )
 
 func newUpCmd() *cobra.Command {
-	var noSwitch bool
+	var doSwitch bool
 	var noBridge bool
 	c := &cobra.Command{
 		Use:   "up [name]",
-		Short: "Build + start the app in a siding's guest, then point the front door at it",
+		Short: "Build + start the app in a siding's guest and bridge it (use `switch` to go live)",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -27,7 +27,7 @@ func newUpCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			name, err := sidingArg(app, args)
+			name, err := sidingArg(ctx, app, args)
 			if err != nil {
 				return err
 			}
@@ -123,7 +123,7 @@ func newUpCmd() *cobra.Command {
 				if u := siding.DashboardURL(app, sd); u != "" {
 					fmt.Printf("  check it on the guest's Aspire dashboard: %s\n", u)
 				}
-				fmt.Printf("  when it looks good: `%s up %s` to bridge + go live (or `%s switch %s`)\n", bin(), name, bin(), name)
+				fmt.Printf("  when it looks good: `%s up %s` bridges it, then `%s switch %s` (or `up %s --switch`) goes live\n", bin(), name, bin(), name, name)
 				return nil
 			}
 
@@ -135,12 +135,18 @@ func newUpCmd() *cobra.Command {
 			if err := state.SaveApp(app); err != nil {
 				return err
 			}
-			fmt.Printf("%s %q is up\n", tick(), name)
-
-			if noSwitch {
-				fmt.Printf("  run `"+bin()+" switch %s` to point the stable ports at it\n", name)
+			// By default `up` brings the siding online (bridged) but leaves the
+			// front door where it is, so it can't yank the shared ports away from
+			// whatever's currently live. Going live is a deliberate `switch`.
+			if !doSwitch {
+				fmt.Printf("%s %q is up and bridged — not live yet\n", tick(), name)
+				fmt.Printf("  run `%s switch %s` to point the front door at it (or `up %s --switch` to go live now)\n", bin(), name, name)
+				if u := siding.DashboardURL(app, sd); u != "" {
+					fmt.Printf("  dashboard (guest): %s\n", u)
+				}
 				return nil
 			}
+			fmt.Printf("%s %q is up\n", tick(), name)
 			if err := switchTo(ctx, &app, name); err != nil {
 				return err
 			}
@@ -149,7 +155,7 @@ func newUpCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&noSwitch, "no-switch", false, "start it + bridge, but don't point the front door at it")
+	c.Flags().BoolVar(&doSwitch, "switch", false, "also point the front door at it once it's up (go live in one shot)")
 	c.Flags().BoolVar(&noBridge, "no-bridge", false, "start it in the guest only — no host bridges, no front door (verify before going live)")
 	return c
 }

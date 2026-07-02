@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/gordonbeeming/shunt/internal/ui"
@@ -30,7 +31,7 @@ func newSwitchCmd() *cobra.Command {
 			var name string
 			if len(args) == 1 {
 				name = args[0]
-			} else if name, err = pickSiding(app, true); err != nil {
+			} else if name, err = pickSiding(ctx, app, true); err != nil {
 				return err
 			}
 			return switchTo(ctx, &app, name)
@@ -64,8 +65,8 @@ func switchTo(ctx context.Context, app *state.App, target string) error {
 }
 
 // pickSiding lets the user choose a siding — arrow-key navigation on a TTY,
-// numbered prompt otherwise.
-func pickSiding(app state.App, includeHost bool) (string, error) {
+// numbered prompt otherwise. Each entry shows its live/up/idle/stopped status.
+func pickSiding(ctx context.Context, app state.App, includeHost bool) (string, error) {
 	names := make([]string, 0, len(app.Sidings)+1)
 	for n := range app.Sidings {
 		names = append(names, n)
@@ -81,20 +82,44 @@ func pickSiding(app state.App, includeHost bool) (string, error) {
 	if len(names) == 1 {
 		return names[0], nil
 	}
+	statuses := sidingStatuses(ctx, app, names)
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
-		return pickSidingByNumber(app, names)
+		return pickSidingByNumber(app, names, statuses)
 	}
-	return pickSidingInteractive(app, names, fd)
+	return pickSidingInteractive(app, names, statuses, fd)
+}
+
+// sidingStatuses resolves the picker's status label for each name, querying each
+// siding's guest state once (the host has no guest). Errors read as unknown.
+func sidingStatuses(ctx context.Context, app state.App, names []string) map[string]string {
+	m := make(map[string]string, len(names))
+	for _, n := range names {
+		if n == state.HostTarget {
+			if app.LiveSiding == state.HostTarget {
+				m[n] = "live"
+			} else {
+				m[n] = "-"
+			}
+			continue
+		}
+		sd := app.Sidings[n]
+		guestState, err := container.State(ctx, sd.Container)
+		if err != nil {
+			guestState = ""
+		}
+		m[n] = sidingStatus(app, n, sd, guestState)
+	}
+	return m
 }
 
 // pickSidingInteractive is the arrow-key picker: ↑/↓ move, Enter selects, a digit
 // jumps, q/Esc/Ctrl-C cancels. Starts on the live siding. Falls back to the
 // number prompt if raw mode can't be set.
-func pickSidingInteractive(app state.App, names []string, fd int) (string, error) {
+func pickSidingInteractive(app state.App, names []string, statuses map[string]string, fd int) (string, error) {
 	old, err := term.MakeRaw(fd)
 	if err != nil {
-		return pickSidingByNumber(app, names)
+		return pickSidingByNumber(app, names, statuses)
 	}
 	defer term.Restore(fd, old)
 
@@ -115,11 +140,11 @@ func pickSidingInteractive(app state.App, names []string, fd int) (string, error
 				marker = "*"
 			}
 			if i == sel {
-				// Green the live marker, then re-enable inverse-video (\x1b[7m) so the
-				// rest of the selected row stays highlighted after liveMarker's reset.
-				fmt.Fprintf(os.Stdout, "\r\x1b[7m> %d) %s\x1b[7m %s \x1b[0m\x1b[K\r\n", i+1, liveMarker(marker), n)
+				// Colour the marker + status, re-enabling inverse-video (\x1b[7m) after
+				// each colour reset so the rest of the selected row stays highlighted.
+				fmt.Fprintf(os.Stdout, "\r\x1b[7m> %d) %s\x1b[7m %s  (%s\x1b[7m) \x1b[0m\x1b[K\r\n", i+1, liveMarker(marker), n, paintStatus(statuses[n]))
 			} else {
-				fmt.Fprintf(os.Stdout, "\r  %d) %s %s\x1b[K\r\n", i+1, liveMarker(marker), n)
+				fmt.Fprintf(os.Stdout, "\r  %d) %s %s  (%s)\x1b[K\r\n", i+1, liveMarker(marker), n, paintStatus(statuses[n]))
 			}
 		}
 	}
@@ -172,14 +197,14 @@ func liveMarker(m string) string {
 }
 
 // pickSidingByNumber is the non-TTY fallback: print the list, read a number.
-func pickSidingByNumber(app state.App, names []string) (string, error) {
+func pickSidingByNumber(app state.App, names []string, statuses map[string]string) (string, error) {
 	fmt.Println("Select a siding:")
 	for i, n := range names {
 		marker := " "
 		if app.LiveSiding == n {
 			marker = "*"
 		}
-		fmt.Printf("  %d) %s %s\n", i+1, liveMarker(marker), n)
+		fmt.Printf("  %d) %s %s  (%s)\n", i+1, liveMarker(marker), n, paintStatus(statuses[n]))
 	}
 	fmt.Print("> ")
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
