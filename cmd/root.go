@@ -40,6 +40,7 @@ func newRootCmd() *cobra.Command {
 		newGitCmd(),
 		newSyncCmd(),
 		newRunCmd(),
+		newCdCmd(),
 		newDashboardCmd(),
 		newDebugDiscoverCmd(),
 	)
