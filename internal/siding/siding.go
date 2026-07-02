@@ -6,6 +6,7 @@ package siding
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,6 +176,82 @@ func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (
 		RSPort:    guestRSPort,
 		Bridges:   map[string]int{},
 	}, nil
+}
+
+// Up brings a siding online: it makes sure the guest is live, starts the app if
+// it isn't already running, and (when bridge is true) bridges its routes to the
+// host. Progress lines are written to progress (os.Stdout for the CLI, io.Discard
+// for the dashboard, which runs it async and polls status). Returns the updated
+// siding for the caller to persist; it does not switch the front door.
+func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progress io.Writer) (state.Siding, error) {
+	fmt.Fprintln(progress, "• checking the guest is up…")
+	if err := EnsureGuestLive(ctx, sd); err != nil {
+		return sd, err
+	}
+	// The guest is live again — clear any `stopped` marker `kill` left behind.
+	sd.Stopped = false
+
+	// Idempotent: only (re)launch the app if it isn't already running, so re-upping
+	// a live app re-activates instead of starting a second AppHost (port clash).
+	if !AppRunning(ctx, app, sd) {
+		_ = StopApp(ctx, app, sd)
+		_, _ = container.Exec(ctx, sd.Container, "sh", "-c", "> "+appLogPath)
+
+		fmt.Fprintln(progress, "• checking the in-guest Docker daemon…")
+		if e := EnsureDockerd(ctx, sd); e != nil {
+			return sd, e
+		}
+		if e := CreateBindVolumes(ctx, app, sd); e != nil {
+			fmt.Fprintf(progress, "  (data volume bind failed: %v — continuing with empty volumes)\n", e)
+		}
+		// Keep the host as the canonical cache: warm the project tar from the host
+		// once, then load it into the guest so the siding never pulls from the net.
+		tar := WarmTarPath(app)
+		if len(app.PrebakeImages) > 0 && hostdocker.Available(ctx) {
+			if _, statErr := os.Stat(tar); statErr != nil {
+				fmt.Fprintln(progress, "• warming the host image cache (one-time)…")
+				if _, e := hostdocker.Ensure(ctx, app.PrebakeImages); e != nil {
+					return sd, fmt.Errorf("warm host cache: %w", e)
+				}
+				if e := os.MkdirAll(filepath.Dir(tar), 0o755); e != nil {
+					return sd, e
+				}
+				if e := hostdocker.Save(ctx, app.PrebakeImages, tar); e != nil {
+					return sd, e
+				}
+			}
+		}
+		if loaded, e := LoadWarm(ctx, app, sd); e != nil {
+			fmt.Fprintf(progress, "  (warm load failed: %v)\n", e)
+		} else if loaded {
+			fmt.Fprintln(progress, "• loaded dependency images from cache (no pull)")
+		} else {
+			fmt.Fprintln(progress, "• no warm cache — declare prebakeImages + run `warm`, or it'll build/pull cold")
+		}
+
+		fmt.Fprintf(progress, "• starting the app in %q…\n", sd.Name)
+		if err := StartApp(ctx, app, sd); err != nil {
+			return sd, err
+		}
+		// Non-blocking: the app keeps building in the background; the eager bridges
+		// serve each route as it comes up.
+		fmt.Fprintln(progress, "• starting the app (it keeps building in the background)…")
+		_ = WaitReady(ctx, app, sd, 45*time.Second)
+	} else {
+		fmt.Fprintf(progress, "• the app is already running in %q\n", sd.Name)
+	}
+
+	if !bridge {
+		if ip, e := container.IP(ctx, sd.Container); e == nil {
+			sd.LastIP = ip
+		}
+		return sd, nil
+	}
+	fmt.Fprintln(progress, "• discovering endpoints + bridging to the host…")
+	if err := Activate(ctx, app, &sd); err != nil {
+		return sd, err
+	}
+	return sd, nil
 }
 
 // appLogPath is where StartApp redirects the AppHost output inside the guest, so

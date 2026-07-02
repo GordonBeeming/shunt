@@ -71,6 +71,8 @@
   .sidings .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--text2); margin-bottom: 6px; }
   .siding { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-top: 1px solid var(--ui); }
   .siding:first-of-type { border-top: none; }
+  .sinfo { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .sline1, .sline2 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .siding .nm { font-family: var(--mono); font-size: 13px; font-weight: 600; }
   .badge { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; padding: 2px 8px; border-radius: 999px; }
   .badge.live { background: var(--up); color: #fff; }
@@ -104,7 +106,7 @@
   <span class="dot-legend"><span class="dot up" style="display:inline-block;width:9px;height:9px;border-radius:50%;box-shadow:none"></span> up &nbsp; <span class="dot down" style="display:inline-block;width:9px;height:9px;border-radius:50%;box-shadow:none"></span> down</span>
 </header>
 <main id="apps"><div class="empty">Loading…</div></main>
-<footer>Live status polls every few seconds · switch is an instant Caddy rebind · restart runs the configured stop+start in the guest</footer>
+<footer>Live status polls every few seconds · switch is an instant Caddy rebind · start builds + runs a siding, stop halts its guest</footer>
 
 <script>
 const $ = (s) => document.querySelector(s);
@@ -134,24 +136,37 @@ function sidingHTML(appName, s){
   const status = s.status ? `<span class="status">${esc(s.status)}</span>` : '';
   const guest = s.guest ? `<span class="guest">${esc(s.guest)}</span>` : '';
   const running = s.guest === 'running';
-  // IP + one link to the guest's Aspire dashboard, once per siding (opens in the
-  // browser — Local Network access). The dashboard link is only live when the guest
-  // is running; otherwise it's shown disabled since you can't reach it.
-  let addr = '';
+  // Second line: the guest's Aspire dashboard link first, then its IP. The link is
+  // only live when the app is actually running (opens in the browser — Local Network
+  // access); otherwise it's shown disabled since you can't reach it.
+  let line2 = '';
   if (s.ip) {
-    const dash = (s.dashboard && running)
-      ? `<a class="direct" href="${esc(s.dashboard)}" target="_blank" rel="noopener">dashboard</a>`
-      : (s.dashboard ? `<span class="direct off" title="start the siding to reach its dashboard">dashboard</span>` : '');
-    addr = `<span class="guest">${esc(s.ip)}</span> ${dash}`;
+    const dash = s.dashboard
+      ? (running
+          ? `<a class="direct" href="${esc(s.dashboard)}" target="_blank" rel="noopener">dashboard</a>`
+          : `<span class="direct off" title="start the siding to reach its dashboard">dashboard</span>`)
+      : '';
+    line2 = `<div class="sline2">${dash}<span class="guest">${esc(s.ip)}</span></div>`;
   }
   const busy = s.status && s.status.indexOf('…') >= 0;
   // esc(JSON.stringify(...)) produces a valid, attribute-safe JS string literal:
   // a name containing ' or " can't break out of the inline handler or inject.
   const a = esc(JSON.stringify(appName)), n = esc(JSON.stringify(s.name));
   const sw = s.live ? '' : `<button onclick="doSwitch(${a},${n})" ${busy?'disabled':''}>Switch</button>`;
-  return `<div class="siding"><span class="nm">${esc(s.name)}</span> ${badge} ${guest} ${addr} ${status}
-    <span class="spacer"></span>${sw}
-    <button class="primary" onclick="doRestart(${a},${n})" ${busy?'disabled':''}>Restart</button></div>`;
+  // Start/Stop toggle by state: running → Stop; idle/stopped → Start. "local" (the
+  // host when it isn't live) shows neither — switch to it first so Caddy steps aside.
+  let action = '';
+  if (running) {
+    action = `<button class="primary" onclick="doStop(${a},${n})" ${busy?'disabled':''}>Stop</button>`;
+  } else if (s.guest === 'idle' || s.guest === 'stopped') {
+    action = `<button class="primary" onclick="doStart(${a},${n})" ${busy?'disabled':''}>Start</button>`;
+  }
+  return `<div class="siding">
+    <div class="sinfo">
+      <div class="sline1"><span class="nm">${esc(s.name)}</span> ${badge} ${guest} ${status}</div>
+      ${line2}
+    </div>
+    <span class="spacer"></span>${sw}${action}</div>`;
 }
 
 function appHTML(a){
@@ -170,9 +185,12 @@ async function doSwitch(app, sd){
   if(!confirm(`Switch the ${app} front door to "${sd}"?\n\nThis repoints the shared ports away from the current live siding — it can interrupt another session/agent working against it.`)) return;
   if(await post('/api/switch', {project:app, siding:sd})) refresh();
 }
-async function doRestart(app, sd){
-  if(!confirm(`Restart "${sd}"?\n\nThis stops and rebuilds the app in that siding — it can interrupt anyone using it.`)) return;
-  if(await post('/api/restart', {project:app, siding:sd})) refresh();
+async function doStart(app, sd){
+  if(await post('/api/start', {project:app, siding:sd})) refresh();
+}
+async function doStop(app, sd){
+  if(!confirm(`Stop "${sd}"?\n\nThis stops the app${sd==='host'?'':' + its guest'} — it can interrupt anyone using it.`)) return;
+  if(await post('/api/stop', {project:app, siding:sd})) refresh();
 }
 
 function applyChannel(ch){
