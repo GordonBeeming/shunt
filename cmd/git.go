@@ -8,41 +8,40 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// newGitCmd groups git pass-through commands. A siding's source is a git
-// worktree on the host; git doesn't resolve inside the guest (the worktree's
-// gitdir lives outside the mount), so these run host git in the worktree — where
-// it signs with your usual key and pushes the siding's shunt/<name> branch.
+// newGitCmd is a full git pass-through in a siding's worktree. A siding's source
+// is a git worktree on the host; git doesn't resolve inside the guest (the
+// worktree's gitdir lives outside the mount), so every git verb runs host git in
+// the worktree — where it signs with your usual key and acts on the siding's
+// shunt/<name> branch. Everything after `git` is forwarded verbatim, so beyond
+// commit/push this covers the conflict-resolution set — status, diff, add,
+// restore, rebase --continue|--abort, merge --continue|--abort — that `shunt sync`
+// hands off to when a rebase hits conflicts.
 func newGitCmd() *cobra.Command {
 	c := &cobra.Command{
-		Use:   "git",
-		Short: "Run git (commit/push) in a siding's worktree on the host",
+		Use:   "git [git args...]",
+		Short: "Run any git command in a siding's worktree on the host",
 		Long: "A siding's source is a git worktree on the host; git doesn't resolve inside the guest.\n" +
-			"These pass commit/push straight through to host git in that worktree, so commits\n" +
-			"sign with your usual key and push the siding's shunt/<name> branch.\n\n" +
+			"`shunt git <args...>` forwards everything to host git in that worktree, so commits\n" +
+			"sign with your usual key and act on the siding's shunt/<name> branch.\n\n" +
+			"Beyond commit/push this is the full git surface for resolving a `shunt sync` conflict\n" +
+			"in the worktree: status, diff, add, restore, rebase --continue|--abort, merge --abort.\n\n" +
 			"The siding is taken from cwd (when inside one) or the app's live siding.",
-	}
-	c.AddCommand(newGitPassthroughCmd("commit"))
-	c.AddCommand(newGitPassthroughCmd("push"))
-	return c
-}
-
-// newGitPassthroughCmd builds `shunt git <sub> [git args...]` — everything after
-// the subcommand is forwarded verbatim to `git -C <worktree> <sub> ...`.
-func newGitPassthroughCmd(sub string) *cobra.Command {
-	return &cobra.Command{
-		Use:   sub + " [git args...]",
-		Short: "Run `git " + sub + "` in the siding's worktree",
-		// Forward flags (e.g. -m, --amend) to git instead of parsing them here.
+		// Forward flags (e.g. -m, --amend, --continue) to git instead of parsing here.
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Keep our own help for the bare/`--help` invocation; forward everything else.
+			if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+				return cmd.Help()
+			}
 			src, err := resolveSidingWorktree()
 			if err != nil {
 				return err
 			}
-			full := append([]string{"-C", src, sub}, args...)
+			full := append([]string{"-C", src}, args...)
 			return proc.RunPassthrough(cmd.Context(), "git", full...)
 		},
 	}
+	return c
 }
 
 // resolveSidingWorktree returns the host worktree path of the siding to act on:

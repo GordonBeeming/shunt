@@ -52,3 +52,29 @@ This is a common miss: a siding built before the edit keeps running the **old** 
 - both `true` → it's already serving; nothing to do
 
 `scripts/status.sh` wraps this and prints the recommended next command.
+
+## Pulling `main` into a siding — `shunt sync`
+
+A siding starts off the repo HEAD on its own `shunt/<name>` branch. When it's drifted
+behind, pull the latest default branch into it:
+
+- `shunt-dev sync` — `fetch origin` then **merge** `origin/main` (auto-detected from
+  `origin/HEAD`) into the current siding's branch: a 2-parent merge that keeps the
+  siding's history intact (the safe default). `--rebase` rebases onto it instead
+  (rewrites history); `--all` syncs every siding; `--from <branch>` targets a branch
+  other than main.
+- **On conflicts** it stops and lists the conflicted files. Resolve them in the
+  worktree through the full `shunt-dev git` pass-through, then finish the merge:
+
+  ```bash
+  # edit the conflicted files, then:
+  shunt-dev git add <files>
+  shunt-dev git commit                 # completes the merge (or: shunt-dev git merge --abort)
+  shunt-dev git push
+  ```
+
+  With `--rebase` instead: `shunt-dev git rebase --continue` (or `--abort`), then
+  `shunt-dev git push --force-with-lease` (a rebase rewrote the branch).
+- `--all` keeps going past a conflicted siding and prints a summary — resolve each in
+  turn. Prefer the default merge; reach for `--rebase` only when you specifically want
+  linear history and know the branch isn't shared.

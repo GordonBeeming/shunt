@@ -1,6 +1,7 @@
 package caddy
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 
@@ -18,7 +19,7 @@ func TestRouteIDAndServerName(t *testing.T) {
 
 func TestServerForRouteHTTP(t *testing.T) {
 	r := state.Route{Key: "frontend", Kind: state.KindHTTP, ListenPort: 5000, CaddyID: "app_x_http_frontend"}
-	path, body, err := ServerForRoute("x", r)
+	path, body, err := ServerForRoute("x", r, true) // disableCache: true
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,6 +36,11 @@ func TestServerForRouteHTTP(t *testing.T) {
 				Upstreams []struct {
 					Dial string `json:"dial"`
 				} `json:"upstreams"`
+				Headers struct {
+					Response struct {
+						Set map[string][]string `json:"set"`
+					} `json:"response"`
+				} `json:"headers"`
 			} `json:"handle"`
 		} `json:"routes"`
 	}
@@ -55,11 +61,27 @@ func TestServerForRouteHTTP(t *testing.T) {
 	if h.Upstreams[0].Dial != state.PlaceholderDial {
 		t.Errorf("dial = %q, want placeholder %q", h.Upstreams[0].Dial, state.PlaceholderDial)
 	}
+	// disableCache: true -> Cache-Control: no-store on responses.
+	if got := h.Headers.Response.Set["Cache-Control"]; len(got) != 1 || got[0] != "no-store" {
+		t.Errorf("Cache-Control = %v, want [no-store]", got)
+	}
+}
+
+func TestServerForRouteHTTPNoDisableCache(t *testing.T) {
+	r := state.Route{Key: "frontend", Kind: state.KindHTTP, ListenPort: 5000, CaddyID: "app_x_http_frontend"}
+	_, body, err := ServerForRoute("x", r, false) // disableCache: false
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No `headers` block when caching isn't disabled.
+	if bytes.Contains(body, []byte("Cache-Control")) {
+		t.Errorf("did not expect Cache-Control header when disableCache=false: %s", body)
+	}
 }
 
 func TestServerForRouteLayer4(t *testing.T) {
 	r := state.Route{Key: "db", Kind: state.KindLayer4, ListenPort: 15432, CaddyID: "app_x_layer4_db"}
-	path, body, err := ServerForRoute("x", r)
+	path, body, err := ServerForRoute("x", r, false)
 	if err != nil {
 		t.Fatal(err)
 	}

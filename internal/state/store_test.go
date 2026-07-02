@@ -46,3 +46,29 @@ func TestSaveAppRequiresConfigDir(t *testing.T) {
 		t.Error("expected error when ConfigDir is empty")
 	}
 }
+
+func TestRegistryFindProjectCaseInsensitive(t *testing.T) {
+	reg := Registry{Projects: map[string]string{"HubX": "/cfg/HubX"}}
+	cases := []struct {
+		name          string
+		wantCanonical string
+		wantOK        bool
+	}{
+		{"HubX", "HubX", true},   // exact
+		{"hubX", "HubX", true},   // cwd basename with different case (macOS)
+		{"HUBX", "HubX", true},   // fold match
+		{"Other", "", false},     // genuinely absent
+	}
+	for _, c := range cases {
+		gotName, gotDir, ok := reg.FindProject(c.name)
+		if ok != c.wantOK {
+			t.Errorf("FindProject(%q) ok = %v, want %v", c.name, ok, c.wantOK)
+		}
+		if gotName != c.wantCanonical {
+			t.Errorf("FindProject(%q) canonical = %q, want %q", c.name, gotName, c.wantCanonical)
+		}
+		if c.wantOK && gotDir != "/cfg/HubX" {
+			t.Errorf("FindProject(%q) dir = %q, want /cfg/HubX", c.name, gotDir)
+		}
+	}
+}

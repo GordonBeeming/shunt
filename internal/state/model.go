@@ -37,6 +37,22 @@ type Registry struct {
 	Projects map[string]string `json:"projects"` // project name -> config dir
 }
 
+// FindProject looks up a project by name — exact first, then case-insensitively.
+// macOS paths are case-insensitive, so a cwd basename or arg like "hubX" must still
+// resolve the registered "HubX". Returns the canonical registered name, its config
+// dir, and whether it was found.
+func (r Registry) FindProject(name string) (canonical, dir string, ok bool) {
+	if d, found := r.Projects[name]; found {
+		return name, d, true
+	}
+	for k, d := range r.Projects {
+		if strings.EqualFold(k, name) {
+			return k, d, true
+		}
+	}
+	return "", "", false
+}
+
 // App is the per-project runtime state, derived from the committed in-repo
 // .shunt.app.json contract and persisted to <configDir>/state.json.
 type App struct {
@@ -60,10 +76,20 @@ type App struct {
 	// Docker on `new`, so sidings start with the host's test data.
 	Volumes []string `json:"volumes,omitempty"`
 	// Per-guest resource caps (Apple `container`); empty uses shunt's defaults.
-	Memory  string            `json:"memory,omitempty"`
-	CPUs    string            `json:"cpus,omitempty"`
-	Sidings map[string]Siding `json:"sidings"`
-	LiveSiding    string            `json:"liveSiding"` // "" = nothing live
+	Memory string `json:"memory,omitempty"`
+	CPUs   string `json:"cpus,omitempty"`
+	// HealthPort/HealthPath are the endpoint the dashboard hits (from inside the
+	// guest) to decide whether a siding is actually "running" vs merely booted.
+	// Empty HealthPort defaults to the Aspire dashboard's home page. Path defaults
+	// to "/".
+	HealthPort int    `json:"healthPort,omitempty"`
+	HealthPath string `json:"healthPath,omitempty"`
+	// DisableCache makes the front door send `Cache-Control: no-store` on every
+	// HTTP response — for Blazor/SPA apps that serve stale assets across a siding
+	// switch on the shared port.
+	DisableCache bool              `json:"disableCache,omitempty"`
+	Sidings      map[string]Siding `json:"sidings"`
+	LiveSiding   string            `json:"liveSiding"` // "" = nothing live
 }
 
 // Route is a stable front-door entry. The upstream target is NOT stored — it's

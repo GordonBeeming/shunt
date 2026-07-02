@@ -331,10 +331,12 @@ func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 		// instances on the fixed ports.) Each project still binds its launchSettings
 		// ports, which the contract front-doors host==guest.
 		// Raise the CLI's start timeout well past its 120s default — a heavy app's
-		// cold start (restore + build + many resources) blows through 120s and
+		// cold start (restore + build + many resources) blows through it, and
 		// `aspire start` would otherwise give up with "Timed out waiting … for
-		// AppHost to start" before the front door has anything to serve.
-		runCmd = fmt.Sprintf(`export PATH="$PATH:/root/.dotnet/tools"; export ASPIRE_CLI_START_TIMEOUT=900; cd /workspace && aspire start --apphost "%s" --non-interactive > %s 2>&1`,
+		// AppHost to start" before the front door has anything to serve. Default 1800s
+		// (30m) for big solutions; overridable via ASPIRE_CLI_START_TIMEOUT in the
+		// contract's env (the ${VAR:-default} keeps a contract-set value winning).
+		runCmd = fmt.Sprintf(`export PATH="$PATH:/root/.dotnet/tools"; export ASPIRE_CLI_START_TIMEOUT="${ASPIRE_CLI_START_TIMEOUT:-1800}"; cd /workspace && aspire start --apphost "%s" --non-interactive > %s 2>&1`,
 			app.AppHostPath, appLogPath)
 	} else {
 		wd := "/workspace"
@@ -376,7 +378,14 @@ func StopApp(ctx context.Context, app state.App, sd state.Siding) error {
 		_, _ = container.Exec(ctx, sd.Container, "/bin/sh", "-lc", fmt.Sprintf("cd %s && %s", wd, app.Stop))
 	}
 	script := `
-for p in 'dotnet watch' 'dotnet-watch' 'dotnet run'; do pkill -9 -f "$p" 2>/dev/null; done
+# Reap the whole managed app tree. ` + "`aspire start`" + ` detaches the AppHost plus its
+# dotnet build / MSBuild worker nodes / VBCSCompiler, which aren't ` + "`dotnet run`/`watch`" + ` and
+# don't hold the app ports while still building — so the old targeted kill left them
+# to pile up across re-ups (26 deep once), thrashing the guest until nothing could
+# finish. In a shunt guest every dotnet/aspire process is the app, so a broad kill is
+# safe and actually reaps the tree.
+pkill -9 -f dotnet 2>/dev/null
+pkill -9 -f aspire 2>/dev/null
 for hex in ` + aspirePortHex + `; do
   for f in /proc/net/tcp /proc/net/tcp6; do
     ino=$(awk -v h=":$hex" '$2 ~ h"$" {print $10; exit}' "$f" 2>/dev/null)
@@ -730,6 +739,60 @@ func allPortsListening(ctx context.Context, app state.App, sd state.Siding) bool
 		}
 	}
 	return true
+}
+
+// HealthOK reports whether the app is actually serving, for the dashboard's
+// running/idle status. It hits the app's health endpoint from *inside* the guest
+// (container exec, not a guest-IP dial), so it works for any siding from the
+// launchd dashboard without Local Network access. Unlike AppRunning — which probes
+// the Aspire resource-service port to decide whether to (re)start, and reads false
+// once the AppHost orchestrator exits even while the services keep serving — this
+// asks the real endpoint, so a booted-and-serving app reads as up.
+func HealthOK(ctx context.Context, app state.App, sd state.Siding) bool {
+	port, path, tls := healthTarget(app)
+	if port == 0 {
+		return false
+	}
+	scheme := "http"
+	if tls {
+		scheme = "https"
+	}
+	url := fmt.Sprintf("%s://localhost:%d%s", scheme, port, path)
+	// -f: non-2xx/3xx -> nonzero exit; -k: the app's dev cert is self-signed;
+	// -m 2: keep the poll snappy. `echo ok` only fires on success.
+	out, _ := container.Exec(ctx, sd.Container, "sh", "-c",
+		fmt.Sprintf("curl -sfk -m 2 -o /dev/null %s && echo ok", url))
+	return strings.Contains(out, "ok")
+}
+
+// healthTarget resolves the health check's guest port, path, and whether it's TLS.
+// Explicit contract config (HealthPort/HealthPath) wins; TLS is inferred from the
+// front-door route that binds that guest port. Empty HealthPort falls back to the
+// Aspire dashboard route's guest port (its home page serves whenever the AppHost is
+// up) — same resolution as DashboardURL, over http.
+func healthTarget(app state.App) (port int, path string, tls bool) {
+	path = "/"
+	if app.HealthPath != "" {
+		path = app.HealthPath
+	}
+	if app.HealthPort != 0 {
+		for _, r := range app.FrontDoor {
+			if r.GuestPort == app.HealthPort {
+				tls = r.TLS
+				break
+			}
+		}
+		return app.HealthPort, path, tls
+	}
+	port = guestDashboardPort
+	for _, r := range app.FrontDoor {
+		if r.Kind == state.KindHTTP && r.GuestPort != 0 &&
+			(r.Resource == "aspire-dashboard" || r.Key == "aspire-dashboard" || r.Key == "dashboard") {
+			port = r.GuestPort
+			break
+		}
+	}
+	return port, path, false
 }
 
 // AppRunning reports whether the app is already up in the guest, so a re-run of
