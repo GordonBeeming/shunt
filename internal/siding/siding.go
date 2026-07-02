@@ -186,6 +186,11 @@ func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (
 func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progress io.Writer) (state.Siding, error) {
 	fmt.Fprintln(progress, "• checking the guest is up…")
 	if err := EnsureGuestLive(ctx, sd); err != nil {
+		// A cancelled/timed-out context is the caller giving up, not a broken guest —
+		// surface it rather than recreating.
+		if ctx.Err() != nil {
+			return sd, err
+		}
 		// The guest container is missing or wedged (e.g. a cgroup-kill wedge left it
 		// un-startable). Recreate it in place from saved settings — keeps the worktree,
 		// branch, and data clones — so `up` self-heals instead of making the user
@@ -196,6 +201,10 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 			return sd, fmt.Errorf("%w; auto-recreate also failed: %v", err, rerr)
 		}
 		sd = healed
+		// Persist the new container reference + cleared bridges now, so a failure in a
+		// later step doesn't leave disk state pointing at the old (removed) guest.
+		app.Sidings[sd.Name] = sd
+		_ = state.SaveApp(app)
 		if err := EnsureGuestLive(ctx, sd); err != nil {
 			return sd, err
 		}
@@ -272,6 +281,14 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 	fmt.Fprintln(progress, "• discovering endpoints + bridging to the host…")
 	if err := Activate(ctx, app, &sd); err != nil {
 		return sd, err
+	}
+	// If this siding is the live one, re-point Caddy at the (possibly new) guest IP.
+	// A self-heal recreate can change the IP, and the dashboard Start path has no
+	// separate live-refresh like the CLI's `up` does — so do it here for both callers.
+	if app.LiveSiding == sd.Name {
+		if err := PointCaddy(ctx, app, &sd); err != nil {
+			fmt.Fprintf(progress, "  (front-door refresh failed: %v — run `switch` to fix)\n", err)
+		}
 	}
 	return sd, nil
 }
@@ -795,18 +812,18 @@ func HealthOK(ctx context.Context, app state.App, sd state.Siding) bool {
 // AppHost runs) this only distinguishes a fully-dead AppHost; set healthPort to a
 // real app route to catch a half-dead child stack.
 func healthyWithin(ctx context.Context, app state.App, sd state.Siding, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 	for {
 		if HealthOK(ctx, app, sd) {
 			return true
 		}
-		if time.Now().After(deadline) {
-			return false
-		}
 		select {
 		case <-ctx.Done():
 			return false
-		case <-time.After(2 * time.Second):
+		case <-ticker.C:
 		}
 	}
 }

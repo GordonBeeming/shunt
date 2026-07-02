@@ -38,7 +38,7 @@ func newUpCmd() *cobra.Command {
 				// reapply recreates just the guest from saved settings (keeps the worktree,
 				// branch, and data) — the non-destructive recovery when the container is
 				// missing/wedged. rm+new is the last resort because it destroys the worktree.
-				return fmt.Errorf("%w — if it persists, recreate the guest with `%s reapply %s` then `%s up %s` (keeps your worktree, branch, and data); only if that still fails, `%s rm %s && %s new %s` (this destroys the worktree + data)",
+				return fmt.Errorf("%w — if it persists, recreate the guest with `%s reapply %q` then `%s up %q` (keeps your worktree, branch, and data); only if that still fails, `%s rm %q && %s new %q` (this destroys the worktree + data)",
 					err, b, name, b, name, b, name, b, name)
 			}
 			app.Sidings[name] = sd
