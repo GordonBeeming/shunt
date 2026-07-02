@@ -55,15 +55,16 @@ type routeView struct {
 	Kind       string `json:"kind"`
 	ListenPort int    `json:"listenPort"`
 	URL        string `json:"url"`
-	GuestURL   string `json:"guestUrl,omitempty"` // direct guest address (live siding), bypassing Caddy
 	Up         bool   `json:"up"`
 }
 
 type sidingView struct {
-	Name   string `json:"name"`
-	Live   bool   `json:"live"`
-	Guest  string `json:"guest"`  // running | stopped | …
-	Status string `json:"status"` // async action feedback
+	Name      string `json:"name"`
+	Live      bool   `json:"live"`
+	Guest     string `json:"guest"`               // running | stopped | …
+	Status    string `json:"status"`              // async action feedback
+	IP        string `json:"ip,omitempty"`        // guest IP (empty until activated)
+	Dashboard string `json:"dashboard,omitempty"` // guest Aspire dashboard URL (empty if no IP)
 }
 
 type appView struct {
@@ -100,26 +101,14 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		av := appView{Name: app.Name, LiveSiding: app.LiveSiding, Routes: []routeView{}, Sidings: []sidingView{}}
 
 		// Liveness is a front-door dial (through Caddy) — see routeUp for why we
-		// can't dial the guest directly from the launchd dashboard. When a siding
-		// is live, also surface its guest-direct URL so you can browse past Caddy
-		// in a real browser to tell "app down" from "front-door misrouted".
-		// Comma-ok so a "host"/empty LiveSiding (not a real siding key) leaves liveIP
-		// empty rather than relying on the zero-value Siding's LastIP.
-		liveIP := ""
-		if ls, ok := app.Sidings[app.LiveSiding]; ok {
-			liveIP = ls.LastIP
-		}
+		// can't dial the guest directly from the launchd dashboard. The guest's own
+		// IP + dashboard link live on the siding row below, not per-route.
 		for _, rt := range app.FrontDoor {
-			guestURL := ""
-			if liveIP != "" {
-				guestURL = guestRouteURL(rt, liveIP)
-			}
 			av.Routes = append(av.Routes, routeView{
 				Key:        rt.Key,
 				Kind:       rt.Kind,
 				ListenPort: rt.ListenPort,
 				URL:        routeURL(rt),
-				GuestURL:   guestURL,
 				Up:         routeUp(rt),
 			})
 		}
@@ -139,12 +128,15 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		}
 		sort.Strings(snames)
 		for _, sn := range snames {
-			st, _ := container.State(ctx, app.Sidings[sn].Container)
+			sd := app.Sidings[sn]
+			st, _ := container.State(ctx, sd.Container)
 			av.Sidings = append(av.Sidings, sidingView{
-				Name:   sn,
-				Live:   app.LiveSiding == sn,
-				Guest:  st,
-				Status: s.getStatus(name, sn),
+				Name:      sn,
+				Live:      app.LiveSiding == sn,
+				Guest:     st,
+				Status:    s.getStatus(name, sn),
+				IP:        sd.LastIP,
+				Dashboard: siding.DashboardURL(app, sd), // "" when no IP; front-end enables it only when running
 			})
 		}
 		view.Apps = append(view.Apps, av)
@@ -270,18 +262,6 @@ func routeUp(r state.Route) bool {
 	}
 	_ = conn.Close()
 	return true
-}
-
-// guestRouteURL is the direct guest address for a route, bypassing Caddy — meant
-// to be opened in a real browser (which has macOS Local Network access) to verify
-// the app past the front door. The guest is exposed on the same port Caddy
-// listens on (host==guest port); http mirrors the CLI's DashboardURL convention
-// (guest apps usually serve http behind an https front door).
-func guestRouteURL(r state.Route, ip string) string {
-	if r.Kind == state.KindHTTP {
-		return fmt.Sprintf("http://%s:%d", ip, r.ListenPort)
-	}
-	return fmt.Sprintf("%s:%d", ip, r.ListenPort)
 }
 
 func routeURL(r state.Route) string {

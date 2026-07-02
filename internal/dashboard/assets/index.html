@@ -61,8 +61,9 @@
   .rmeta { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
   .route .key { font-weight: 600; font-size: 13px; }
   .route a, .route .addr { color: var(--primary); font-family: var(--mono); font-size: 11.5px; text-decoration: none; word-break: break-all; }
-  .route .direct { color: var(--text2); font-size: 10.5px; }
-  .route a.direct:hover { color: var(--primary); }
+  .direct { color: var(--text2); font-size: 11px; font-family: var(--mono); text-decoration: none; }
+  a.direct:hover { color: var(--primary); text-decoration: underline; }
+  .direct.off { opacity: .5; cursor: default; }
   .route a:hover { text-decoration: underline; }
   .route a:focus-visible, button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: 5px; }
 
@@ -118,35 +119,37 @@ async function post(path, body){
 }
 
 function routeHTML(r){
-  // The dot is a front-door check (a 502/503/504 or no response reads as down),
-  // so "down" can be the app OR the front door. Only point at the guest link when
-  // there is one (a siding is live).
-  const downTip = r.guestUrl ? 'not serving via the front door — app down or a front-door issue; try the guest link' : 'not serving via the front door';
-  const dot = `<span class="dot ${r.up?'up':'down'}" title="${r.up?'serving via the front door':downTip}"></span>`;
+  // The dot is a front-door check (a 502/503/504 or no response reads as down), so
+  // "down" means the app OR the front door itself. The guest IP + dashboard link on
+  // the siding row let you check the app past Caddy in a real browser.
+  const dot = `<span class="dot ${r.up?'up':'down'}" title="${r.up?'serving via the front door':'not serving via the front door'}"></span>`;
   const target = r.kind === 'http'
     ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url)}</a>`
     : `<span class="addr">${esc(r.url)}</span>`;
-  // Direct-to-guest address (live siding) to check the app past Caddy: it opens in
-  // a real browser (Local Network access). Front-door dot down + guest link up =>
-  // front-door/bridge issue; both down => the app itself is down.
-  const guest = r.guestUrl
-    ? (r.kind === 'http'
-        ? `<a class="direct" href="${esc(r.guestUrl)}" target="_blank" rel="noopener" title="direct to the guest, bypassing the front door">guest: ${esc(r.guestUrl)}</a>`
-        : `<span class="direct addr" title="direct to the guest, bypassing the front door">guest: ${esc(r.guestUrl)}</span>`)
-    : '';
-  return `<div class="route">${dot}<div class="rmeta"><span class="key">${esc(r.key)}</span>${target}${guest}</div></div>`;
+  return `<div class="route">${dot}<div class="rmeta"><span class="key">${esc(r.key)}</span>${target}</div></div>`;
 }
 
 function sidingHTML(appName, s){
   const badge = s.live ? '<span class="badge live">live</span>' : '';
   const status = s.status ? `<span class="status">${esc(s.status)}</span>` : '';
   const guest = s.guest ? `<span class="guest">${esc(s.guest)}</span>` : '';
+  const running = s.guest === 'running';
+  // IP + one link to the guest's Aspire dashboard, once per siding (opens in the
+  // browser — Local Network access). The dashboard link is only live when the guest
+  // is running; otherwise it's shown disabled since you can't reach it.
+  let addr = '';
+  if (s.ip) {
+    const dash = (s.dashboard && running)
+      ? `<a class="direct" href="${esc(s.dashboard)}" target="_blank" rel="noopener">dashboard</a>`
+      : (s.dashboard ? `<span class="direct off" title="start the siding to reach its dashboard">dashboard</span>` : '');
+    addr = `<span class="guest">${esc(s.ip)}</span> ${dash}`;
+  }
   const busy = s.status && s.status.indexOf('…') >= 0;
   // esc(JSON.stringify(...)) produces a valid, attribute-safe JS string literal:
   // a name containing ' or " can't break out of the inline handler or inject.
   const a = esc(JSON.stringify(appName)), n = esc(JSON.stringify(s.name));
   const sw = s.live ? '' : `<button onclick="doSwitch(${a},${n})" ${busy?'disabled':''}>Switch</button>`;
-  return `<div class="siding"><span class="nm">${esc(s.name)}</span> ${badge} ${guest} ${status}
+  return `<div class="siding"><span class="nm">${esc(s.name)}</span> ${badge} ${guest} ${addr} ${status}
     <span class="spacer"></span>${sw}
     <button class="primary" onclick="doRestart(${a},${n})" ${busy?'disabled':''}>Restart</button></div>`;
 }
