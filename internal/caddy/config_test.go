@@ -26,8 +26,9 @@ func TestServerForRouteHTTP(t *testing.T) {
 		t.Errorf("path = %q, want %q", path, want)
 	}
 	var srv struct {
-		Listen []string `json:"listen"`
-		Routes []struct {
+		Listen    []string `json:"listen"`
+		Protocols []string `json:"protocols"`
+		Routes    []struct {
 			Handle []struct {
 				Handler   string `json:"handler"`
 				ID        string `json:"@id"`
@@ -42,6 +43,10 @@ func TestServerForRouteHTTP(t *testing.T) {
 	}
 	if len(srv.Listen) != 1 || srv.Listen[0] != "127.0.0.1:5000" {
 		t.Errorf("listen = %v, want [127.0.0.1:5000]", srv.Listen)
+	}
+	// HTTP/3 disabled — protocols must be h1/h2 only (no h3), so no QUIC Alt-Svc.
+	if len(srv.Protocols) != 2 || srv.Protocols[0] != "h1" || srv.Protocols[1] != "h2" {
+		t.Errorf("protocols = %v, want [h1 h2] (no h3)", srv.Protocols)
 	}
 	h := srv.Routes[0].Handle[0]
 	if h.Handler != "reverse_proxy" || h.ID != "app_x_http_frontend" {

@@ -126,6 +126,12 @@ func ServerForRoute(app string, r state.Route) (path string, body []byte, err er
 	case state.KindHTTP:
 		handler["handler"] = "reverse_proxy"
 		handler["upstreams"] = []any{map[string]any{"dial": state.PlaceholderDial}}
+		// Serve only HTTP/1.1 + HTTP/2, no HTTP/3 (QUIC). Under a heavy concurrent
+		// boot flood — e.g. Blazor pulling ~1000 _framework files at once — some h3
+		// streams flake and Caddy 502s them, which surfaces as a broken/tampered app
+		// boot; h1/h2 is reliable. This also drops the `Alt-Svc: h3` advertisement so
+		// browsers don't upgrade to QUIC on their own.
+		server["protocols"] = []string{"h1", "h2"}
 		// shunt serves its own (loaded) dev cert, so Caddy must not add the
 		// automatic HTTP->HTTPS redirect vhost — that binds :80, which needs root
 		// and fails ("permission denied") when servers are re-created one by one.
