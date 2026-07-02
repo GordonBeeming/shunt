@@ -1,10 +1,10 @@
 // Package dashboard is shunt's local web UI: one always-on page (per channel,
 // on its own port) to browse every app's front-door ports with live up/down
-// status, and switch/restart sidings with a click. Switch is a fast Caddy rebind
-// (siding.Switch); restart runs the configured stop+start in the guest
-// (siding.Restart) to bring a down route up. Liveness is a host-side TCP dial of
-// each front-door port — no guest round-trip — so the page reflects what you'd
-// actually reach.
+// status, and switch / start / stop sidings with a click. Switch is a fast Caddy
+// rebind (siding.Switch); Start runs the same build+start+bridge flow as `shunt up`
+// (siding.Up); Stop stops the siding's guest (container.Stop). Liveness is a
+// host-side dial of each front-door port — no guest round-trip — so the page
+// reflects what you'd actually reach.
 package dashboard
 
 import (
@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sort"
@@ -24,12 +25,12 @@ import (
 	"github.com/gordonbeeming/shunt/internal/state"
 )
 
-// Server holds the in-memory action status (restart is async, so its progress is
-// surfaced back through /api/state) and a per-siding lock so double-clicks can't
-// overlap a stop/start.
+// Server holds the in-memory action status (start/stop are async, so their
+// progress is surfaced back through /api/state) and a per-siding lock so
+// double-clicks can't overlap a stop/start.
 type Server struct {
 	mu     sync.Mutex
-	status map[string]string // "project/siding" -> "switching"|"restarting"|"error: …"|""
+	status map[string]string // "project/siding" -> "switching"|"starting…"|"stopping…"|"error: …"|""
 	busy   map[string]bool
 }
 
@@ -43,7 +44,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/state", s.handleState)
 	mux.HandleFunc("/api/switch", s.handleSwitch)
-	mux.HandleFunc("/api/restart", s.handleRestart)
+	mux.HandleFunc("/api/start", s.handleStart)
+	mux.HandleFunc("/api/stop", s.handleStop)
 	mux.HandleFunc("/", handleIndex)
 	return mux
 }
@@ -113,11 +115,26 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 
-		// The host (your local copy) is a switch target too — list it first.
+		// The host (your local copy) is a switch target too — list it first. Its
+		// "running" state can't be probed like a guest, so infer it from the front
+		// door: the host can only serve once it's the live target (Caddy steps aside),
+		// so when it's live we read its routes — any up means the native app is
+		// running, none up means it's live but idle (start it). Not live → "local",
+		// which the UI treats as "switch to it first" (no start/stop).
+		hostGuest := "local"
+		if app.LiveSiding == state.HostTarget {
+			hostGuest = "idle"
+			for _, rt := range av.Routes {
+				if rt.Up {
+					hostGuest = "running"
+					break
+				}
+			}
+		}
 		av.Sidings = append(av.Sidings, sidingView{
 			Name:   state.HostTarget,
 			Live:   app.LiveSiding == state.HostTarget,
-			Guest:  "local",
+			Guest:  hostGuest,
 			Status: s.getStatus(name, state.HostTarget),
 		})
 
@@ -130,10 +147,23 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		for _, sn := range snames {
 			sd := app.Sidings[sn]
 			st, _ := container.State(ctx, sd.Container)
+			// "running" must mean the app itself is up — its Aspire AppHost/dashboard
+			// is actually serving — not merely that the guest container exists, or a
+			// booted-but-dead app reads as running (and its dashboard link looks live
+			// when it isn't). Probe the app only when the container is up, since the
+			// probe execs into it. "idle" = guest up but no app yet.
+			guest := st
+			if st == "running" {
+				if siding.AppRunning(ctx, app, sd) {
+					guest = "running"
+				} else {
+					guest = "idle"
+				}
+			}
 			av.Sidings = append(av.Sidings, sidingView{
 				Name:      sn,
 				Live:      app.LiveSiding == sn,
-				Guest:     st,
+				Guest:     guest,
 				Status:    s.getStatus(name, sn),
 				IP:        sd.LastIP,
 				Dashboard: siding.DashboardURL(app, sd), // "" when no IP; front-end enables it only when running
@@ -162,10 +192,12 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"ok": "switched to " + sd})
 }
 
-// handleRestart runs stop+start in the guest. It's slow, so it runs in the
-// background and the page polls /api/state for the "restarting" status; liveness
-// dots go green when the route comes back up.
-func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
+// handleStart brings a siding online — the same guest-liveness + build/start +
+// bridge flow as `shunt up` (siding.Up), so the Start button and the CLI behave
+// identically. It's slow, so it runs detached and the page polls /api/state for
+// the "starting…" status; the liveness dots go green as routes come up. Host →
+// HostStart (launch the native app).
+func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	project, sdName, ok := decodeAction(w, r)
 	if !ok {
 		return
@@ -181,13 +213,11 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
-	// Restarting the host target bounces the native app (stop+start), not a guest.
 	if sdName == state.HostTarget {
-		s.setStatus(project, sdName, "restarting…")
+		s.setStatus(project, sdName, "starting…")
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
-			siding.HostStop(ctx, app)
 			msg := ""
 			if err := siding.HostStart(ctx, app); err != nil {
 				msg = "error: " + err.Error()
@@ -195,7 +225,7 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 			s.release(key, msg)
 		}()
 		w.WriteHeader(http.StatusAccepted)
-		writeJSON(w, map[string]string{"ok": "restarting host"})
+		writeJSON(w, map[string]string{"ok": "starting host"})
 		return
 	}
 	sd, ok := app.Sidings[sdName]
@@ -204,20 +234,82 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no siding "+sdName, http.StatusNotFound)
 		return
 	}
-	s.setStatus(project, sdName, "restarting…")
+	s.setStatus(project, sdName, "starting…")
 	go func() {
-		// Detached from the request; give a full rebuild + recovery room to run.
+		// Detached from the request; give a full build + bridge room to run. The
+		// dashboard polls status, so progress lines are discarded.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
-		err := siding.Restart(ctx, app, sd)
 		msg := ""
-		if err != nil {
+		if updated, err := siding.Up(ctx, app, sd, true, io.Discard); err != nil {
 			msg = "error: " + err.Error()
+		} else {
+			app.Sidings[sdName] = updated
+			if e := state.SaveApp(app); e != nil {
+				msg = "error: " + e.Error()
+			}
 		}
 		s.release(key, msg)
 	}()
 	w.WriteHeader(http.StatusAccepted)
-	writeJSON(w, map[string]string{"ok": "restarting " + sdName})
+	writeJSON(w, map[string]string{"ok": "starting " + sdName})
+}
+
+// handleStop stops a siding's guest, keeping its worktree + data so Start can
+// bring it back; the `stopped` marker keeps `ls`/the picker honest. It's quick but
+// still async so the page stays responsive. Host → HostStop (kill the native app).
+func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
+	project, sdName, ok := decodeAction(w, r)
+	if !ok {
+		return
+	}
+	key := project + "/" + sdName
+	if !s.acquire(key) {
+		http.Error(w, "an action is already running for this siding", http.StatusConflict)
+		return
+	}
+	app, err := loadApp(project)
+	if err != nil {
+		s.release(key, "")
+		httpErr(w, err)
+		return
+	}
+	if sdName == state.HostTarget {
+		s.setStatus(project, sdName, "stopping…")
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			siding.HostStop(ctx, app)
+			s.release(key, "")
+		}()
+		w.WriteHeader(http.StatusAccepted)
+		writeJSON(w, map[string]string{"ok": "stopping host"})
+		return
+	}
+	sd, ok := app.Sidings[sdName]
+	if !ok {
+		s.release(key, "")
+		http.Error(w, "no siding "+sdName, http.StatusNotFound)
+		return
+	}
+	s.setStatus(project, sdName, "stopping…")
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		msg := ""
+		if err := container.Stop(ctx, sd.Container); err != nil {
+			msg = "error: " + err.Error()
+		} else {
+			sd.Stopped = true
+			app.Sidings[sdName] = sd
+			if e := state.SaveApp(app); e != nil {
+				msg = "error: " + e.Error()
+			}
+		}
+		s.release(key, msg)
+	}()
+	w.WriteHeader(http.StatusAccepted)
+	writeJSON(w, map[string]string{"ok": "stopping " + sdName})
 }
 
 // --- helpers ---
