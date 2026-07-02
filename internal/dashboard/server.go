@@ -190,15 +190,22 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// A new action supersedes any stale status for this siding immediately — so the
+	// error shown always relates to the action you just took, not a previous one
+	// (switch is synchronous, so "switching…" is momentary; the point is the clear).
+	s.setStatus(project, sd, "switching…")
 	app, err := loadApp(project)
 	if err != nil {
+		s.setStatus(project, sd, "error: "+err.Error())
 		httpErr(w, err)
 		return
 	}
 	if err := siding.Switch(r.Context(), &app, sd); err != nil {
+		s.setStatus(project, sd, "error: "+err.Error())
 		httpErr(w, err)
 		return
 	}
+	s.setStatus(project, sd, "")
 	writeJSON(w, map[string]string{"ok": "switched to " + sd})
 }
 
@@ -308,7 +315,20 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		msg := ""
 		if err := container.Stop(ctx, sd.Container); err != nil {
-			msg = "error: " + err.Error()
+			// A graceful stop can wedge on the guest's cgroup.kill (errno 95); force-
+			// remove the container as the escape. It's gone rather than kept-to-restart,
+			// but `up` self-heals by recreating the guest from saved settings.
+			if e := container.Remove(ctx, sd.Container); e != nil {
+				msg = "error: stop failed (" + err.Error() + ") and force-remove failed: " + e.Error()
+			} else {
+				sd.Stopped = true
+				app.Sidings[sdName] = sd
+				if e := state.SaveApp(app); e != nil {
+					msg = "error: " + e.Error()
+				} else {
+					msg = "stopped (forced)"
+				}
+			}
 		} else {
 			sd.Stopped = true
 			app.Sidings[sdName] = sd
