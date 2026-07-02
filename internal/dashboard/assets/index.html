@@ -118,12 +118,17 @@ async function post(path, body){
 }
 
 function routeHTML(r){
-  const dot = `<span class="dot ${r.up?'up':'down'}" title="${r.up?'serving via the front door':'not serving — app down or front-door issue; try the guest link'}"></span>`;
+  // The dot is a front-door check (a 502/503/504 or no response reads as down),
+  // so "down" can be the app OR the front door. Only point at the guest link when
+  // there is one (a siding is live).
+  const downTip = r.guestUrl ? 'not serving via the front door — app down or a front-door issue; try the guest link' : 'not serving via the front door';
+  const dot = `<span class="dot ${r.up?'up':'down'}" title="${r.up?'serving via the front door':downTip}"></span>`;
   const target = r.kind === 'http'
     ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url)}</a>`
     : `<span class="addr">${esc(r.url)}</span>`;
-  // Direct-to-guest address (live siding), so you can verify the app past Caddy:
-  // dot green + front-door link dead => front-door issue; dot red => app is down.
+  // Direct-to-guest address (live siding) to check the app past Caddy: it opens in
+  // a real browser (Local Network access). Front-door dot down + guest link up =>
+  // front-door/bridge issue; both down => the app itself is down.
   const guest = r.guestUrl
     ? (r.kind === 'http'
         ? `<a class="direct" href="${esc(r.guestUrl)}" target="_blank" rel="noopener" title="direct to the guest, bypassing the front door">guest: ${esc(r.guestUrl)}</a>`

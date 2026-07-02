@@ -103,7 +103,12 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		// can't dial the guest directly from the launchd dashboard. When a siding
 		// is live, also surface its guest-direct URL so you can browse past Caddy
 		// in a real browser to tell "app down" from "front-door misrouted".
-		liveIP := app.Sidings[app.LiveSiding].LastIP
+		// Comma-ok so a "host"/empty LiveSiding (not a real siding key) leaves liveIP
+		// empty rather than relying on the zero-value Siding's LastIP.
+		liveIP := ""
+		if ls, ok := app.Sidings[app.LiveSiding]; ok {
+			liveIP = ls.LastIP
+		}
 		for _, rt := range app.FrontDoor {
 			guestURL := ""
 			if liveIP != "" {
@@ -231,7 +236,8 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 // macOS Local Network privacy blocks a launchd process from reaching the guest's
 // 192.168.64.x address (loopback is fine). Caddy's listener is always up, so a
 // raw TCP dial is a false positive — for HTTP we make a real request and treat
-// 502/503/504 (Caddy can't reach the app = app down) or no response as down; for
+// 502/503/504 (the front door couldn't reach the app — it's down, or the bridge/
+// routing is off) or no response as down; for
 // layer4 we fall back to a TCP dial. For app-vs-Caddy disambiguation, use the
 // guest-direct link (opened in a real browser, which has Local Network access).
 func routeUp(r state.Route) bool {
