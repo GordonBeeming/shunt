@@ -9,16 +9,26 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
 // When shunt runs under a launchd agent (the dashboard LaunchAgent), the process
 // inherits a minimal PATH (roughly /usr/bin:/bin:/usr/sbin:/sbin) that excludes
-// the usual install dirs — so a bare `container`/`docker`/`dotnet` fails to exec
-// even though the tools are installed. Appending the standard install dirs once
-// at startup fixes every subprocess here, regardless of who launched shunt.
+// the usual install dirs — so a bare `container`/`docker` (system installs) or
+// `aspire`/dotnet global tools (under $HOME) fail to exec even though they're
+// installed. A host-side `sh -lc` inherits this PATH too, and macOS path_helper
+// preserves appended entries, so fixing PATH once at startup covers every
+// subprocess here, regardless of who launched shunt.
 func init() {
-	_ = os.Setenv("PATH", augmentPath(os.Getenv("PATH"), []string{"/usr/local/bin", "/opt/homebrew/bin"}, dirExists))
+	dirs := []string{"/usr/local/bin", "/opt/homebrew/bin"}
+	if home, err := os.UserHomeDir(); err == nil {
+		// The Aspire CLI (~/.aspire/bin) and dotnet global tools (~/.dotnet/tools)
+		// live under $HOME and aren't on launchd's PATH or in /etc/paths.d, so the
+		// host runner (`aspire start`) fails from the dashboard agent without these.
+		dirs = append(dirs, filepath.Join(home, ".dotnet", "tools"), filepath.Join(home, ".aspire", "bin"))
+	}
+	_ = os.Setenv("PATH", augmentPath(os.Getenv("PATH"), dirs, dirExists))
 }
 
 func dirExists(d string) bool {
