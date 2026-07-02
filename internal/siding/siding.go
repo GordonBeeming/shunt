@@ -732,28 +732,27 @@ func CreateBindVolumes(ctx context.Context, app state.App, sd state.Siding) erro
 	return nil
 }
 
-// Switch points the front door at a siding: it activates it (bridges) if not yet
-// done, repoints Caddy, marks it live, and persists. This is the fast path — a
-// Caddy rebind, no app restart — and assumes the siding is running on its ports.
-// Shared by `shunt switch` and the dashboard.
 // Switch points the app's stable front door at a target: either a siding or the
 // special `host` target (the local app running natively from the main repo).
-// Every switch first stops the host app best-effort, so it isn't holding the
-// shared ports — whether we're going to the host or a siding.
+// Switch only repoints — it never starts or builds the app. Bringing the app up
+// is `up`/`restart` (or `restart host` for the native app); keeping the two
+// independent lets you, say, switch to the host to run just the DB yourself.
 func Switch(ctx context.Context, app *state.App, target string) error {
 	admin := caddy.NewAdmin()
 	wasHost := app.LiveSiding == state.HostTarget
 
-	HostStop(ctx, *app) // best-effort: free the ports in case the local app is running
-
 	if target == state.HostTarget {
-		// Step the front door aside so the native app binds the real ports directly.
-		if err := caddy.RemoveFrontDoor(ctx, admin, *app); err != nil {
-			return err
-		}
-		if err := HostStart(ctx, *app); err != nil {
-			_ = caddy.EnsureFrontDoor(ctx, admin, *app) // don't leave it with no front door
-			return err
+		// Step the front door aside so the native app can bind the real ports
+		// directly. We deliberately don't start it — that's `restart host` (or you,
+		// e.g. running only the database). Ports stay dead until something binds them.
+		// Only tear it down when coming FROM a siding: if the host is already live the
+		// front door is already aside, and deleting absent servers would error. When
+		// it does run, a failure (e.g. Caddy admin down) propagates so we don't mark
+		// the host live while Caddy still holds the ports.
+		if !wasHost {
+			if err := caddy.RemoveFrontDoor(ctx, admin, *app); err != nil {
+				return err
+			}
 		}
 		app.LiveSiding = state.HostTarget
 		return state.SaveApp(*app)
@@ -763,12 +762,22 @@ func Switch(ctx context.Context, app *state.App, target string) error {
 	if !ok {
 		return fmt.Errorf("no siding %q", target)
 	}
-	// Coming back from the host, the front-door servers were removed — re-create
-	// them so Caddy re-binds the ports before pointing them at the guest.
+	// Coming back from the host, the local app may still hold the real ports and
+	// the front-door servers were removed — stop it (best-effort) so it releases
+	// them, then re-create the servers so Caddy re-binds before pointing at the guest.
 	if wasHost {
+		HostStop(ctx, *app)
 		if err := caddy.EnsureFrontDoor(ctx, admin, *app); err != nil {
 			return err
 		}
+		// If the switch fails after we've re-bound the front door, step it aside
+		// again — otherwise state still says host while Caddy holds the ports with
+		// nothing behind them. On success LiveSiding is the target, so this is a no-op.
+		defer func() {
+			if app.LiveSiding == state.HostTarget {
+				_ = caddy.RemoveFrontDoor(ctx, admin, *app)
+			}
+		}()
 	}
 	if len(sd.Bridges) == 0 {
 		if err := Activate(ctx, *app, &sd); err != nil {

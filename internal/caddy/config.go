@@ -3,6 +3,7 @@ package caddy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -194,14 +195,21 @@ func EnsureFrontDoor(ctx context.Context, a *Admin, app state.App) error {
 }
 
 // RemoveFrontDoor deletes every one of the app's front-door Caddy servers,
-// releasing the stable ports so the native (host) app can bind them directly.
+// releasing the stable ports so the native (host) app can bind them directly. It
+// aggregates and returns delete failures so a caller (Switch → host) doesn't mark
+// the host live while Caddy is still holding the ports — e.g. when the admin API
+// is down. Call it only when the servers actually exist (Switch guards this with
+// `!wasHost`), so a "not found" delete can't cause a spurious failure.
 func RemoveFrontDoor(ctx context.Context, a *Admin, app state.App) error {
+	var errs []error
 	for _, r := range app.FrontDoor {
 		if path, _, err := ServerForRoute(app.Name, r); err == nil {
-			_ = a.Delete(ctx, path)
+			if e := a.Delete(ctx, path); e != nil {
+				errs = append(errs, e)
+			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // CurrentDial reads a route's live upstream dial from Caddy (e.g. "192.168.64.5:7022"),
