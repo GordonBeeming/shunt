@@ -42,6 +42,9 @@ func newUpCmd() *cobra.Command {
 			if err := siding.EnsureGuestLive(ctx, sd); err != nil {
 				return fmt.Errorf("%w — if it persists, recreate: `%s rm %s && %s new %s`", err, bin(), name, bin(), name)
 			}
+			// The guest is live again — clear any `stopped` marker `kill` left behind
+			// so `ls`/the picker stop showing it as stopped once it's saved below.
+			sd.Stopped = false
 
 			// Idempotent: only (re)launch the app if it isn't already running in the
 			// guest. Checking the running app — not the log marker — means re-running
@@ -123,7 +126,7 @@ func newUpCmd() *cobra.Command {
 				if u := siding.DashboardURL(app, sd); u != "" {
 					fmt.Printf("  check it on the guest's Aspire dashboard: %s\n", u)
 				}
-				fmt.Printf("  when it looks good: `%s up %s` bridges it, then `%s switch %s` (or `up %s --switch`) goes live\n", bin(), name, bin(), name, name)
+				fmt.Printf("  when it looks good: `%s up %s` bridges it, then `%s switch %s` (or `%s up %s --switch`) goes live\n", bin(), name, bin(), name, bin(), name)
 				return nil
 			}
 
@@ -139,8 +142,14 @@ func newUpCmd() *cobra.Command {
 			// front door where it is, so it can't yank the shared ports away from
 			// whatever's currently live. Going live is a deliberate `switch`.
 			if !doSwitch {
+				// Re-upping the siding that's already live: its guest IP may have
+				// changed on restart, so refresh the front door (re-point Caddy at the
+				// current bridge). This isn't a user-visible switch — it's already live.
+				if name == app.LiveSiding {
+					return switchTo(ctx, &app, name)
+				}
 				fmt.Printf("%s %q is up and bridged — not live yet\n", tick(), name)
-				fmt.Printf("  run `%s switch %s` to point the front door at it (or `up %s --switch` to go live now)\n", bin(), name, name)
+				fmt.Printf("  run `%s switch %s` to point the front door at it (or `%s up %s --switch` to go live now)\n", bin(), name, bin(), name)
 				if u := siding.DashboardURL(app, sd); u != "" {
 					fmt.Printf("  dashboard (guest): %s\n", u)
 				}

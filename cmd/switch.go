@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/siding"
@@ -94,8 +95,14 @@ func pickSiding(ctx context.Context, app state.App, includeHost bool) (string, e
 // siding's guest state once (the host has no guest). Errors read as unknown.
 func sidingStatuses(ctx context.Context, app state.App, names []string) map[string]string {
 	m := make(map[string]string, len(names))
+	// Each siding's status needs a `container.State` inspect; query them
+	// concurrently so the picker doesn't stall serially on N guests.
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	for _, n := range names {
 		if n == state.HostTarget {
+			// The host isn't a guest — "-" means "not the live target" (its status
+			// isn't tracked); it's always switchable regardless.
 			if app.LiveSiding == state.HostTarget {
 				m[n] = "live"
 			} else {
@@ -103,13 +110,21 @@ func sidingStatuses(ctx context.Context, app state.App, names []string) map[stri
 			}
 			continue
 		}
-		sd := app.Sidings[n]
-		guestState, err := container.State(ctx, sd.Container)
-		if err != nil {
-			guestState = ""
-		}
-		m[n] = sidingStatus(app, n, sd, guestState)
+		wg.Add(1)
+		go func(n string) {
+			defer wg.Done()
+			sd := app.Sidings[n]
+			guestState, err := container.State(ctx, sd.Container)
+			if err != nil {
+				guestState = ""
+			}
+			st := sidingStatus(app, n, sd, guestState)
+			mu.Lock()
+			m[n] = st
+			mu.Unlock()
+		}(n)
 	}
+	wg.Wait()
 	return m
 }
 

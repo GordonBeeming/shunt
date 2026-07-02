@@ -78,6 +78,8 @@ func printFrontDoor(app state.App, sd state.Siding) {
 //	stopped — killed (the clone/volume is kept, the guest is stopped)
 //	idle    — exists but not ready to switch (freshly `new`d, or running unbridged)
 //
+// The special `host` row is not a siding and has no guest state — its callers
+// show "live" when it's the live target, else "-" (always switchable regardless).
 // guestState is the raw container.State string ("running", "stopped", …), or "" when unknown.
 func sidingStatus(app state.App, name string, sd state.Siding, guestState string) string {
 	switch {
