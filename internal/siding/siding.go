@@ -758,11 +758,12 @@ func HealthOK(ctx context.Context, app state.App, sd state.Siding) bool {
 		scheme = "https"
 	}
 	url := fmt.Sprintf("%s://localhost:%d%s", scheme, port, path)
-	// -f: non-2xx/3xx -> nonzero exit; -k: the app's dev cert is self-signed;
-	// -m 2: keep the poll snappy. `echo ok` only fires on success.
-	out, _ := container.Exec(ctx, sd.Container, "sh", "-c",
-		fmt.Sprintf("curl -sfk -m 2 -o /dev/null %s && echo ok", url))
-	return strings.Contains(out, "ok")
+	// Invoke curl directly (NOT via `sh -c`) so a contract-provided health path can't
+	// inject shell metacharacters — the URL is passed as a single argv element. -f
+	// makes a non-2xx/3xx a non-zero exit, which container.Exec surfaces as an error;
+	// -k for the self-signed dev cert; -m 2 keeps the poll snappy.
+	_, err := container.Exec(ctx, sd.Container, "curl", "-sfk", "-m", "2", "-o", "/dev/null", url)
+	return err == nil
 }
 
 // healthTarget resolves the health check's guest port, path, and whether it's TLS.
@@ -774,6 +775,11 @@ func healthTarget(app state.App) (port int, path string, tls bool) {
 	path = "/"
 	if app.HealthPath != "" {
 		path = app.HealthPath
+	}
+	// A contract path like "healthz" (no leading slash) would glue onto the port
+	// ("localhost:15072healthz"); normalize so the URL is always well-formed.
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
 	}
 	if app.HealthPort != 0 {
 		for _, r := range app.FrontDoor {

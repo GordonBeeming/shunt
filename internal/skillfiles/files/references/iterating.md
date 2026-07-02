@@ -59,7 +59,7 @@ A siding starts off the repo HEAD on its own `shunt/<name>` branch. When it's dr
 behind, pull the latest default branch into it:
 
 - `shunt-dev sync` — `fetch origin` then **merge** `origin/main` (auto-detected from
-  `origin/HEAD`) into the current siding's branch: a 2-parent merge that keeps the
+  `origin/HEAD`) into the current siding's branch: a non-rewriting merge that keeps the
   siding's history intact (the safe default). `--rebase` rebases onto it instead
   (rewrites history); `--all` syncs every siding; `--from <branch>` targets a branch
   other than main.

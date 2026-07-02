@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/resolve"
@@ -20,7 +21,8 @@ func newSyncCmd() *cobra.Command {
 		Use:   "sync [name]",
 		Short: "Pull the latest default branch (main) into a siding's worktree — merge (--rebase to rebase)",
 		Long: "Fetches origin and **merges** the repo's default branch (main, auto-detected from\n" +
-			"origin/HEAD) into the siding's shunt/<name> branch — a plain 2-parent merge that picks\n" +
+			"origin/HEAD) into the siding's shunt/<name> branch — a non-rewriting merge (fast-\n" +
+			"forwards when the siding has no local commits, else a merge commit) that picks\n" +
 			"up the latest code without rewriting the siding's history.\n" +
 			"`--rebase` rebases onto the default instead (rewrites history — force-push afterwards);\n" +
 			"`--all` syncs every siding; `--from <branch>` syncs from a branch other than the default.\n\n" +
@@ -40,10 +42,26 @@ func newSyncCmd() *cobra.Command {
 				return err
 			}
 
+			// Sync sidings concurrently — git fetch/merge is network-bound, so a serial
+			// --all stalls on each. Outcomes stay indexed so the summary prints in a
+			// deterministic order regardless of which siding finishes first.
+			if len(names) > 1 {
+				fmt.Printf("• syncing %d sidings…\n", len(names))
+			}
+			outcomes := make([]syncOutcome, len(names))
+			var wg sync.WaitGroup
+			for i, name := range names {
+				wg.Add(1)
+				go func(i int, name string) {
+					defer wg.Done()
+					outcomes[i] = syncSiding(ctx, app, name, from, rebase)
+				}(i, name)
+			}
+			wg.Wait()
+
 			var conflicted, failed []string
-			for _, name := range names {
-				fmt.Printf("• syncing %q…\n", name)
-				res := syncSiding(ctx, app, name, from, rebase)
+			for _, res := range outcomes {
+				name := res.name
 				switch res.kind {
 				case syncOK:
 					switch {
@@ -72,6 +90,9 @@ func newSyncCmd() *cobra.Command {
 				case syncError:
 					failed = append(failed, name)
 					fmt.Printf("✗ %q: %v\n", name, res.err)
+					if res.log != "" {
+						fmt.Printf("    %s\n", strings.ReplaceAll(res.log, "\n", "\n    "))
+					}
 				}
 			}
 
@@ -136,10 +157,12 @@ const (
 
 type syncOutcome struct {
 	kind    syncKind
+	name    string
 	base    string   // default branch synced from
 	changed bool     // the target had commits we didn't — the sync integrated something
 	ahead   bool     // the branch had local commits (a rebase rewrites them => force-push)
 	files   []string // conflicted files (syncConflict)
+	log     string   // captured git output (fetch + merge/rebase) — shown on conflict/error
 	src     string
 	err     error
 }
@@ -153,25 +176,33 @@ func syncSiding(ctx context.Context, app state.App, name, fromOverride string, r
 	src, _ := siding.Paths(app, name)
 	base := defaultBranch(ctx, src, fromOverride)
 	target := "origin/" + base
+	out := syncOutcome{name: name, src: src, base: base}
 
-	if err := proc.RunPassthrough(ctx, "git", "-C", src, "fetch", "origin"); err != nil {
-		return syncOutcome{kind: syncError, src: src, base: base, err: fmt.Errorf("fetch origin: %w", err)}
+	// Capture (not stream) the git output so `--all` can run these concurrently
+	// without interleaving each siding's output.
+	res, err := proc.RunInDir(ctx, src, "git", "fetch", "origin")
+	out.log = gitLog(res)
+	if err != nil {
+		out.kind, out.err = syncError, fmt.Errorf("fetch origin: %w", err)
+		return out
 	}
 	// Measured before the operation: whether the target moved ahead of us (did the
 	// sync bring anything in) and whether we carry local commits (a rebase rewrites
 	// those, so a prior push then needs --force-with-lease).
-	out := syncOutcome{src: src, base: base,
-		changed: commitsBehind(ctx, src, target) > 0,
-		ahead:   commitsAhead(ctx, src, target) > 0,
-	}
+	out.changed = commitsBehind(ctx, src, target) > 0
+	out.ahead = commitsAhead(ctx, src, target) > 0
 
-	args := []string{"-C", src, "merge", "--no-edit", target}
+	gitArgs := []string{"merge", "--no-edit", target}
 	if rebase {
-		args = []string{"-C", src, "rebase", target}
+		gitArgs = []string{"rebase", target}
 	}
-	if err := proc.RunPassthrough(ctx, "git", args...); err != nil {
+	res, err = proc.RunInDir(ctx, src, "git", gitArgs...)
+	if l := gitLog(res); l != "" {
+		out.log = strings.TrimSpace(out.log + "\n" + l)
+	}
+	if err != nil {
 		// Unmerged paths => real conflicts to resolve; anything else (e.g. a dirty
-		// worktree) is a plain failure — git's streamed output already explained it.
+		// worktree) is a plain failure (git's captured output explains it).
 		if files := conflictedFiles(ctx, src); len(files) > 0 {
 			out.kind, out.files = syncConflict, files
 			return out
@@ -183,6 +214,11 @@ func syncSiding(ctx context.Context, app state.App, name, fromOverride string, r
 	return out
 }
 
+// gitLog joins a git command's captured stdout+stderr, trimmed.
+func gitLog(res proc.Result) string {
+	return strings.TrimSpace(res.Stdout + "\n" + res.Stderr)
+}
+
 // defaultBranch resolves the repo's default branch from the worktree (origin/HEAD),
 // honouring an explicit override; falls back to "main".
 func defaultBranch(ctx context.Context, src, override string) string {
@@ -190,7 +226,11 @@ func defaultBranch(ctx context.Context, src, override string) string {
 		return override
 	}
 	if res, err := proc.RunInDir(ctx, src, "git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
-		return strings.TrimPrefix(strings.TrimSpace(res.Stdout), "origin/")
+		// Guard the empty/unexpected case: a bare "origin/" or non-origin output would
+		// trim to "" and build an invalid "origin/" target — fall back to main.
+		if b := strings.TrimPrefix(strings.TrimSpace(res.Stdout), "origin/"); b != "" {
+			return b
+		}
 	}
 	return "main"
 }
