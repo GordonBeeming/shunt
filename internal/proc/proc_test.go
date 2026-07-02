@@ -30,6 +30,12 @@ func TestAugmentPath(t *testing.T) {
 			want: "/usr/bin",
 		},
 		{
+			desc: "empty PATH gets no leading separator (no empty cwd element)",
+			path: "",
+			dirs: []string{"/usr/local/bin", "/opt/homebrew/bin"},
+			want: "/usr/local/bin:/opt/homebrew/bin",
+		},
+		{
 			desc: "no change when all present",
 			path: "/usr/local/bin:/opt/homebrew/bin",
 			dirs: []string{"/usr/local/bin", "/opt/homebrew/bin"},

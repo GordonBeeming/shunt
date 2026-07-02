@@ -48,7 +48,13 @@ func augmentPath(path string, dirs []string, exists func(string) bool) string {
 		if present[d] || !exists(d) {
 			continue
 		}
-		path += string(os.PathListSeparator) + d
+		// Don't prepend a separator to an empty PATH — a leading separator makes an
+		// empty element, which Unix treats as the current directory (a security risk).
+		if path == "" {
+			path = d
+		} else {
+			path += string(os.PathListSeparator) + d
+		}
 		present[d] = true
 	}
 	return path
