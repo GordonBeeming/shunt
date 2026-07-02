@@ -48,6 +48,18 @@ type Contract struct {
 	// default. CPUs similarly caps cores (e.g. "4"); empty uses the default.
 	Memory string `json:"memory"`
 	CPUs   string `json:"cpus"`
+	// HealthPort/HealthPath define the endpoint the dashboard hits (from inside the
+	// guest) to decide whether a siding is actually "running" vs merely booted. Empty
+	// HealthPort defaults to the Aspire dashboard's home page, which serves whenever
+	// the AppHost is up. For non-Aspire apps, point it at a real health route (e.g.
+	// port 8080, path "/healthz"). HealthPath defaults to "/".
+	HealthPort int    `json:"healthPort"`
+	HealthPath string `json:"healthPath"`
+	// DisableCache, when true, makes the front door send `Cache-Control: no-store`
+	// on every HTTP response for this app. Use it for Blazor/SPA apps that serve
+	// stale assets when you switch sidings on the shared front-door port — the whole
+	// environment then goes through uncached.
+	DisableCache bool `json:"disableCache"`
 }
 
 // FrontDoorRoute is one stable port mapping in the contract.

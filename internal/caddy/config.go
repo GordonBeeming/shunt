@@ -113,7 +113,7 @@ func Bootstrap() ([]byte, error) {
 // goes live. The handler carries the route's @id for live PATCHing.
 //
 // Returns the admin config path to PUT it at and the JSON body.
-func ServerForRoute(app string, r state.Route) (path string, body []byte, err error) {
+func ServerForRoute(app string, r state.Route, disableCache bool) (path string, body []byte, err error) {
 	handler := map[string]any{"@id": r.CaddyID}
 	server := map[string]any{
 		// Bind loopback only: these are localhost dev ports (the CLI and dashboard
@@ -132,6 +132,14 @@ func ServerForRoute(app string, r state.Route) (path string, body []byte, err er
 		// boot; h1/h2 is reliable. This also drops the `Alt-Svc: h3` advertisement so
 		// browsers don't upgrade to QUIC on their own.
 		server["protocols"] = []string{"h1", "h2"}
+		// Opt-in per app: send `Cache-Control: no-store` on every response so the
+		// browser never caches assets across a siding switch on the shared port —
+		// the fix for Blazor/SPA apps that boot stale after switching environments.
+		if disableCache {
+			handler["headers"] = map[string]any{
+				"response": map[string]any{"set": map[string]any{"Cache-Control": []string{"no-store"}}},
+			}
+		}
 		// shunt serves its own (loaded) dev cert, so Caddy must not add the
 		// automatic HTTP->HTTPS redirect vhost — that binds :80, which needs root
 		// and fails ("permission denied") when servers are re-created one by one.
@@ -188,7 +196,7 @@ func DialPatch(r state.Route, hostPort string) (path string, body []byte, err er
 // the ports after they were released for the host (see RemoveFrontDoor).
 func EnsureFrontDoor(ctx context.Context, a *Admin, app state.App) error {
 	for _, r := range app.FrontDoor {
-		path, body, err := ServerForRoute(app.Name, r)
+		path, body, err := ServerForRoute(app.Name, r, app.DisableCache)
 		if err != nil {
 			return err
 		}
@@ -209,7 +217,8 @@ func EnsureFrontDoor(ctx context.Context, a *Admin, app state.App) error {
 func RemoveFrontDoor(ctx context.Context, a *Admin, app state.App) error {
 	var errs []error
 	for _, r := range app.FrontDoor {
-		if path, _, err := ServerForRoute(app.Name, r); err == nil {
+		// Only the path is used here; disableCache doesn't affect it.
+		if path, _, err := ServerForRoute(app.Name, r, false); err == nil {
 			if e := a.Delete(ctx, path); e != nil {
 				errs = append(errs, e)
 			}

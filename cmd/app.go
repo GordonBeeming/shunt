@@ -84,6 +84,9 @@ func newAppAddCmd() *cobra.Command {
 				Volumes:       ct.Volumes,
 				Memory:        ct.Memory,
 				CPUs:          ct.CPUs,
+				HealthPort:    ct.HealthPort,
+				HealthPath:    ct.HealthPath,
+				DisableCache:  ct.DisableCache,
 				Sidings:       map[string]state.Siding{},
 			}
 			if updating {
@@ -109,7 +112,7 @@ func newAppAddCmd() *cobra.Command {
 					if keep[r.Kind+"/"+r.Key] {
 						continue
 					}
-					if p, _, perr := caddy.ServerForRoute(loc.Project, r); perr == nil {
+					if p, _, perr := caddy.ServerForRoute(loc.Project, r, false); perr == nil {
 						_ = admin.Delete(ctx, p)
 					}
 				}

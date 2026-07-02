@@ -24,10 +24,11 @@ func newAppSwitchCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			dir, ok := reg.Projects[target]
+			canonical, dir, ok := reg.FindProject(target)
 			if !ok {
 				return fmt.Errorf("no registered app %q — see `%s ls -a`", target, bin())
 			}
+			target = canonical // use the registered case for server names etc.
 			app, err := state.LoadApp(dir)
 			if err != nil {
 				return err
@@ -56,7 +57,7 @@ func newAppSwitchCmd() *cobra.Command {
 					if !want[r.ListenPort] {
 						continue
 					}
-					if path, _, e := caddy.ServerForRoute(name, r); e == nil {
+					if path, _, e := caddy.ServerForRoute(name, r, false); e == nil {
 						_ = admin.Delete(ctx, path)
 						fmt.Printf("• parked %s/%s (freed :%d — its guest keeps running)\n", name, r.Key, r.ListenPort)
 					}
@@ -65,7 +66,7 @@ func newAppSwitchCmd() *cobra.Command {
 
 			// Claim the target's front-door servers.
 			for _, r := range app.FrontDoor {
-				path, body, err := caddy.ServerForRoute(target, r)
+				path, body, err := caddy.ServerForRoute(target, r, app.DisableCache)
 				if err != nil {
 					return err
 				}

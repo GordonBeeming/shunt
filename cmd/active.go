@@ -54,7 +54,7 @@ func newActiveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			dir, registered := reg.Projects[loc.Project]
+			_, dir, registered := reg.FindProject(loc.Project)
 			if !registered {
 				return emitInactive(res, asJSON)
 			}

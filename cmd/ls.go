@@ -58,14 +58,15 @@ func newLsCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				if _, ok := reg.Projects[loc.Project]; !ok {
+				canonical, _, ok := reg.FindProject(loc.Project)
+				if !ok {
 					if asJSON {
 						return printJSON([]lsApp{})
 					}
 					fmt.Printf("%q isn't a shunt app here — cd into a registered repo, or `%s ls -a` for all projects\n", loc.Project, bin())
 					return nil
 				}
-				names = []string{loc.Project}
+				names = []string{canonical}
 			}
 
 			apps := make([]lsApp, 0, len(names))

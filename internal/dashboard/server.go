@@ -147,27 +147,37 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		for _, sn := range snames {
 			sd := app.Sidings[sn]
 			st, _ := container.State(ctx, sd.Container)
-			// "running" must mean the app itself is up — its Aspire AppHost/dashboard
-			// is actually serving — not merely that the guest container exists, or a
-			// booted-but-dead app reads as running (and its dashboard link looks live
-			// when it isn't). Probe the app only when the container is up, since the
-			// probe execs into it. "idle" = guest up but no app yet.
+			// Map the raw container state to a display status:
+			//   running + HealthOK -> "running"  (the app's health endpoint answers)
+			//   running + !HealthOK -> "idle"     (guest up, app not serving yet)
+			//   "" (guest gone, or the container runtime is down after a crash/reboot)
+			//     -> "stopped", so the row still offers Start instead of going blank
+			//     with a stale IP.
 			guest := st
-			if st == "running" {
-				if siding.AppRunning(ctx, app, sd) {
+			switch st {
+			case "running":
+				if siding.HealthOK(ctx, app, sd) {
 					guest = "running"
 				} else {
 					guest = "idle"
 				}
+			case "":
+				guest = "stopped"
 			}
-			av.Sidings = append(av.Sidings, sidingView{
-				Name:      sn,
-				Live:      app.LiveSiding == sn,
-				Guest:     guest,
-				Status:    s.getStatus(name, sn),
-				IP:        sd.LastIP,
-				Dashboard: siding.DashboardURL(app, sd), // "" when no IP; front-end enables it only when running
-			})
+			sv := sidingView{
+				Name:   sn,
+				Live:   app.LiveSiding == sn,
+				Guest:  guest,
+				Status: s.getStatus(name, sn),
+			}
+			// Only surface the guest IP + dashboard link when the app is actually
+			// serving. A stopped/idle siding's saved LastIP is stale and unreachable,
+			// so showing it reads as "up" when it isn't (exactly the post-crash trap).
+			if guest == "running" {
+				sv.IP = sd.LastIP
+				sv.Dashboard = siding.DashboardURL(app, sd)
+			}
+			av.Sidings = append(av.Sidings, sv)
 		}
 		view.Apps = append(view.Apps, av)
 	}

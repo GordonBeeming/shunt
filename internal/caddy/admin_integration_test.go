@@ -26,7 +26,7 @@ func TestAdminRoundTrip(t *testing.T) {
 		ListenPort: 59999, // unlikely to collide
 		CaddyID:    "app_itest_http_itest",
 	}
-	path, body, err := ServerForRoute("itest", route)
+	path, body, err := ServerForRoute("itest", route, false)
 	if err != nil {
 		t.Fatal(err)
 	}
