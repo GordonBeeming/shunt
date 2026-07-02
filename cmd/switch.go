@@ -53,7 +53,8 @@ func switchTo(ctx context.Context, app *state.App, target string) error {
 		return err
 	}
 	if target == state.HostTarget {
-		fmt.Println(tick() + " switched to the host — started your local app; it now serves the front-door ports (Caddy stepped aside)")
+		fmt.Println(tick() + " switched to the host — front door stepped aside so your local app can serve the ports")
+		fmt.Printf("  it isn't started for you: run `%s restart host` (or start it yourself, e.g. just the DB)\n", bin())
 		fmt.Printf("  switch back to a siding any time with `%s switch <name>`\n", bin())
 		return nil
 	}

@@ -738,21 +738,18 @@ func CreateBindVolumes(ctx context.Context, app state.App, sd state.Siding) erro
 // Shared by `shunt switch` and the dashboard.
 // Switch points the app's stable front door at a target: either a siding or the
 // special `host` target (the local app running natively from the main repo).
-// Every switch first stops the host app best-effort, so it isn't holding the
-// shared ports — whether we're going to the host or a siding.
+// Switch only repoints — it never starts or builds the app. Bringing the app up
+// is `up`/`restart` (or `restart host` for the native app); keeping the two
+// independent lets you, say, switch to the host to run just the DB yourself.
 func Switch(ctx context.Context, app *state.App, target string) error {
 	admin := caddy.NewAdmin()
 	wasHost := app.LiveSiding == state.HostTarget
 
-	HostStop(ctx, *app) // best-effort: free the ports in case the local app is running
-
 	if target == state.HostTarget {
-		// Step the front door aside so the native app binds the real ports directly.
+		// Step the front door aside so the native app can bind the real ports
+		// directly. We deliberately don't start it — that's `restart host` (or you,
+		// e.g. running only the database). Ports stay dead until something binds them.
 		if err := caddy.RemoveFrontDoor(ctx, admin, *app); err != nil {
-			return err
-		}
-		if err := HostStart(ctx, *app); err != nil {
-			_ = caddy.EnsureFrontDoor(ctx, admin, *app) // don't leave it with no front door
 			return err
 		}
 		app.LiveSiding = state.HostTarget
@@ -763,9 +760,11 @@ func Switch(ctx context.Context, app *state.App, target string) error {
 	if !ok {
 		return fmt.Errorf("no siding %q", target)
 	}
-	// Coming back from the host, the front-door servers were removed — re-create
-	// them so Caddy re-binds the ports before pointing them at the guest.
+	// Coming back from the host, the local app may still hold the real ports and
+	// the front-door servers were removed — stop it (best-effort) so it releases
+	// them, then re-create the servers so Caddy re-binds before pointing at the guest.
 	if wasHost {
+		HostStop(ctx, *app)
 		if err := caddy.EnsureFrontDoor(ctx, admin, *app); err != nil {
 			return err
 		}
