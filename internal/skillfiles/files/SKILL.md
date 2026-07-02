@@ -12,12 +12,12 @@ CLI: **`shunt-dev`**. Full command list and the `.shunt.app.json` contract are i
 ## When you start a substantial dev task
 
 1. Run `bash scripts/status.sh` (or `shunt-dev active --json`) from the repo to see whether it's a shunt app and list any existing sidings.
-2. **Ask the user how to work — always, using your agent's question/choice tool (e.g. AskUserQuestion); never assume.** It's a multi-level choice:
-   - **Level 1** — present three options:
-     - **Use the main repo** — work in the main working copy, no siding.
-     - **Use an existing siding** — an isolated instance that already exists.
-     - **Create a new siding** — a fresh isolated instance.
-   - **Level 2** — based on the answer:
+2. **Before you plan anything or run any command, ask the user where this runs — using the interactive question tool (AskUserQuestion). This is a standalone question you ask out loud, NOT a line buried in a plan, and NEVER a choice you make for them.** A siding is a full container guest (its own RAM/CPU/disk + a copy of the app's dependency images), so **creating or starting one costs real machine resources** — you must not spin one up on your own initiative. Ask first:
+   - **Level 1 — present all three options, every time.** Do not drop one because the existing sidings "don't look like they're for this task" — that just means the user may want the main repo or a brand-new siding; it's their call, not yours:
+     - **The main repo (host)** — work in the main working copy. No siding, no extra machine load. (Often the right default when the user is already working on the host.)
+     - **An existing siding** — reuse an isolated instance that already exists (no new guest).
+     - **A new siding** — a fresh isolated instance (spins up a new guest — costs resources).
+   - **Level 2 — based on the answer:**
      - *existing* → ask **which siding** (list the names from the status output).
      - *new* → ask for a **siding name**, then `shunt-dev new <name>` (fast — a worktree off HEAD + idle guest, no build).
      - *main repo* → nothing more; proceed in the main repo.
@@ -27,6 +27,7 @@ CLI: **`shunt-dev`**. Full command list and the `.shunt.app.json` contract are i
 
 ## Rules
 
+- **Never create or start a siding without the user's explicit choice via the question tool.** Sidings cost real machine resources (a whole container + its dependency images); "the existing ones don't fit my task" is a reason to *ask*, not to spin up a new one. When in doubt, the main repo (host) is the low-cost default — offer it.
 - Code edits go in the siding's `src`, not the main repo — that's the whole point.
 - A siding `src` is a **git worktree off your current HEAD** on a `shunt/<name>` branch. **Commit + push with `shunt-dev git commit …` / `shunt-dev git push …`, not raw `git`** — they run host git in the right worktree (resolved from cwd or the live siding), sign with the repo's usual key, and push the `shunt/<name>` branch, so you never hand-type the worktree path or fumble the push refspec. A fresh siding's branch has no upstream, so the **first** push must set one: `shunt-dev git push -u origin <branch>` (args pass straight through to git); after that a bare `shunt-dev git push` works. GitButler manages the *main* repo, not sidings; read-only `git` (`status`/`log`/`diff`) in the worktree is fine. (Inside the guest git won't resolve the worktree — edit + commit on the host.)
 - Never start the app locally (e.g. `aspire start`, `dotnet run`, `pnpm dev`). Use `up` / `restart`.
