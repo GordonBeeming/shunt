@@ -20,8 +20,9 @@ func newCdCmd() *cobra.Command {
 			"jump into it. A process can't cd its parent shell, so this prints the path:\n\n" +
 			"  cd \"$(" + bin() + " cd <name>)\"\n\n" +
 			"Handy as a shell function: `scd() { cd \"$(" + bin() + " cd \"$@\")\"; }`.\n" +
-			"Siding is taken from the name arg, else the one your cwd is inside, else the live one;\n" +
-			"`host` prints the original repo checkout.",
+			"Siding is taken from the name arg, else the one your cwd is inside, else the live\n" +
+			"target. `host` (passed explicitly, or when it's the live target) prints the original\n" +
+			"repo checkout rather than a siding.",
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -39,7 +40,7 @@ func newCdCmd() *cobra.Command {
 				name = app.LiveSiding
 			}
 			if name == "" {
-				return fmt.Errorf("which siding? pass a name or make one live (`%s ls`)", bin())
+				return fmt.Errorf("which siding? pass a name, or make one live with `%s switch`", bin())
 			}
 			// "host" isn't a siding — it's the original repo checkout.
 			dir := app.RepoPath
