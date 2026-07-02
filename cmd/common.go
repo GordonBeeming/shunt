@@ -71,12 +71,48 @@ func printFrontDoor(app state.App, sd state.Siding) {
 	}
 }
 
+// sidingStatus summarises a siding for the ls table + the switch picker:
+//
+//	live    — the front door points here
+//	up      — guest running and bridged, so `switch` can point at it right away
+//	stopped — killed (the clone/volume is kept, the guest is stopped)
+//	idle    — exists but not ready to switch (freshly `new`d, or running unbridged)
+//
+// The special `host` row is not a siding and has no guest state — its callers
+// show "live" when it's the live target, else "-" (always switchable regardless).
+// guestState is the raw container.State string ("running", "stopped", …), or "" when unknown.
+func sidingStatus(app state.App, name string, sd state.Siding, guestState string) string {
+	switch {
+	case app.LiveSiding == name:
+		return "live"
+	case sd.Stopped:
+		return "stopped"
+	case guestState == "running" && len(sd.Bridges) > 0:
+		return "up"
+	default:
+		return "idle"
+	}
+}
+
+// paintStatus colours a sidingStatus for non-tabwriter output (the picker):
+// green for live (brand: green = live only), cyan for up, plain otherwise.
+func paintStatus(status string) string {
+	switch status {
+	case "live":
+		return ui.Live(status)
+	case "up":
+		return ui.Cyan(status)
+	default:
+		return status
+	}
+}
+
 // sidingArg resolves the siding name from the first positional arg, or prompts
 // with the interactive picker when none is given (like `switch`). Lets commands
 // that act on a siding be run bare and pick from the list.
-func sidingArg(app state.App, args []string) (string, error) {
+func sidingArg(ctx context.Context, app state.App, args []string) (string, error) {
 	if len(args) > 0 {
 		return args[0], nil
 	}
-	return pickSiding(app, false) // guest ops (up/restart/kill/logs) — host isn't a target
+	return pickSiding(ctx, app, false) // guest ops (up/restart/kill/logs) — host isn't a target
 }

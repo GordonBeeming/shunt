@@ -16,6 +16,7 @@ import (
 type lsSiding struct {
 	Name      string `json:"name"`
 	Live      bool   `json:"live"`
+	Status    string `json:"status"` // live / up / idle / stopped (see sidingStatus)
 	Guest     string `json:"guest"`
 	IP        string `json:"ip,omitempty"`
 	Dashboard string `json:"dashboard,omitempty"`
@@ -76,10 +77,16 @@ func newLsCmd() *cobra.Command {
 				}
 				la := lsApp{Name: app.Name, Sidings: []lsSiding{}}
 				// The host (your local copy) is a switch target too — list it first.
+				hostLive := app.LiveSiding == state.HostTarget
+				hostStatus := "-"
+				if hostLive {
+					hostStatus = "live"
+				}
 				la.Sidings = append(la.Sidings, lsSiding{
-					Name:  state.HostTarget,
-					Live:  app.LiveSiding == state.HostTarget,
-					Guest: "local",
+					Name:   state.HostTarget,
+					Live:   hostLive,
+					Status: hostStatus,
+					Guest:  "local",
 				})
 				sidingNames := make([]string, 0, len(app.Sidings))
 				for sn := range app.Sidings {
@@ -96,6 +103,7 @@ func newLsCmd() *cobra.Command {
 					la.Sidings = append(la.Sidings, lsSiding{
 						Name:      sn,
 						Live:      app.LiveSiding == sn,
+						Status:    sidingStatus(app, sn, s, guestState),
 						Guest:     guestState,
 						IP:        s.LastIP,
 						Dashboard: siding.DashboardURL(app, s),
@@ -110,19 +118,17 @@ func newLsCmd() *cobra.Command {
 			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-			fmt.Fprintln(w, "APP\tSIDING\tLIVE\tGUEST\tIP\tDASHBOARD")
+			fmt.Fprintln(w, "APP\tSIDING\tSTATUS\tGUEST\tIP\tDASHBOARD")
 			for _, a := range apps {
 				if len(a.Sidings) == 0 {
 					fmt.Fprintf(w, "%s\t-\t\t\t\t\n", a.Name)
 					continue
 				}
 				for _, s := range a.Sidings {
-					live := ""
-					if s.Live {
-						live = "*"
-					}
+					// Plain text (no colour): tabwriter counts ANSI bytes as width
+					// and would misalign the columns.
 					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-						a.Name, s.Name, live, s.Guest, s.IP, s.Dashboard)
+						a.Name, s.Name, s.Status, s.Guest, s.IP, s.Dashboard)
 				}
 			}
 			return w.Flush()

@@ -23,7 +23,7 @@ func newKillCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			name, err := sidingArg(app, args)
+			name, err := sidingArg(ctx, app, args)
 			if err != nil {
 				return err
 			}
@@ -63,7 +63,7 @@ func newRmCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			name, err := sidingArg(app, args)
+			name, err := sidingArg(ctx, app, args)
 			if err != nil {
 				return err
 			}

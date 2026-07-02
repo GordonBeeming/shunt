@@ -30,7 +30,7 @@ func newRestartCmd() *cobra.Command {
 			var name string
 			if len(args) > 0 {
 				name = args[0]
-			} else if name, err = pickSiding(app, true); err != nil {
+			} else if name, err = pickSiding(ctx, app, true); err != nil {
 				return err
 			}
 			if name == state.HostTarget {
