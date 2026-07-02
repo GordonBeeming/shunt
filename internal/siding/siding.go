@@ -186,14 +186,47 @@ func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (
 func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progress io.Writer) (state.Siding, error) {
 	fmt.Fprintln(progress, "• checking the guest is up…")
 	if err := EnsureGuestLive(ctx, sd); err != nil {
-		return sd, err
+		// A cancelled/timed-out context is the caller giving up, not a broken guest —
+		// surface it rather than recreating.
+		if ctx.Err() != nil {
+			return sd, err
+		}
+		// The guest container is missing or wedged (e.g. a cgroup-kill wedge left it
+		// un-startable). Recreate it in place from saved settings — keeps the worktree,
+		// branch, and data clones — so `up` self-heals instead of making the user
+		// reapply by hand.
+		fmt.Fprintf(progress, "• guest wouldn't come up (%v) — recreating it (keeps code + data)…\n", err)
+		healed, rerr := Recreate(ctx, app, sd)
+		if rerr != nil {
+			return sd, fmt.Errorf("%w; auto-recreate also failed: %v", err, rerr)
+		}
+		sd = healed
+		// Persist the new container reference + cleared bridges now, so a failure in a
+		// later step doesn't leave disk state pointing at the old (removed) guest.
+		app.Sidings[sd.Name] = sd
+		_ = state.SaveApp(app)
+		if err := EnsureGuestLive(ctx, sd); err != nil {
+			return sd, err
+		}
 	}
 	// The guest is live again — clear any `stopped` marker `kill` left behind.
 	sd.Stopped = false
 
-	// Idempotent: only (re)launch the app if it isn't already running, so re-upping
-	// a live app re-activates instead of starting a second AppHost (port clash).
-	if !AppRunning(ctx, app, sd) {
+	// Only (re)launch the app when it isn't already serving. A running AppHost that
+	// never becomes healthy (its child projects all crashed) is half-dead — rebuild
+	// it rather than skip. A genuinely healthy live app is left alone so a re-up just
+	// re-activates instead of starting a second AppHost (port clash).
+	needStart := !AppRunning(ctx, app, sd)
+	if !needStart {
+		fmt.Fprintln(progress, "• app process is up — checking it's actually serving…")
+		if healthyWithin(ctx, app, sd, 20*time.Second) {
+			fmt.Fprintf(progress, "• the app is already running + serving in %q\n", sd.Name)
+		} else {
+			fmt.Fprintln(progress, "• app is up but not serving (health check failed) — rebuilding it")
+			needStart = true
+		}
+	}
+	if needStart {
 		_ = StopApp(ctx, app, sd)
 		_, _ = container.Exec(ctx, sd.Container, "sh", "-c", "> "+appLogPath)
 
@@ -237,8 +270,6 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		// serve each route as it comes up.
 		fmt.Fprintln(progress, "• starting the app (it keeps building in the background)…")
 		_ = WaitReady(ctx, app, sd, 45*time.Second)
-	} else {
-		fmt.Fprintf(progress, "• the app is already running in %q\n", sd.Name)
 	}
 
 	if !bridge {
@@ -250,6 +281,14 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 	fmt.Fprintln(progress, "• discovering endpoints + bridging to the host…")
 	if err := Activate(ctx, app, &sd); err != nil {
 		return sd, err
+	}
+	// If this siding is the live one, re-point Caddy at the (possibly new) guest IP.
+	// A self-heal recreate can change the IP, and the dashboard Start path has no
+	// separate live-refresh like the CLI's `up` does — so do it here for both callers.
+	if app.LiveSiding == sd.Name {
+		if err := PointCaddy(ctx, app, &sd); err != nil {
+			fmt.Fprintf(progress, "  (front-door refresh failed: %v — run `switch` to fix)\n", err)
+		}
 	}
 	return sd, nil
 }
@@ -764,6 +803,29 @@ func HealthOK(ctx context.Context, app state.App, sd state.Siding) bool {
 	// -k for the self-signed dev cert; -m 2 keeps the poll snappy.
 	_, err := container.Exec(ctx, sd.Container, "curl", "-sfk", "-m", "2", "-o", "/dev/null", url)
 	return err == nil
+}
+
+// healthyWithin polls the app's health endpoint until it answers or the window
+// elapses — used by `up` to tell a still-booting app (goes healthy inside the
+// window) from a half-dead one (AppHost up, children crashed → never healthy).
+// Note: with the default health target (the Aspire dashboard, up whenever the
+// AppHost runs) this only distinguishes a fully-dead AppHost; set healthPort to a
+// real app route to catch a half-dead child stack.
+func healthyWithin(ctx context.Context, app state.App, sd state.Siding, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		if HealthOK(ctx, app, sd) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
 }
 
 // healthTarget resolves the health check's guest port, path, and whether it's TLS.

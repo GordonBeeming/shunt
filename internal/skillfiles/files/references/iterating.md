@@ -32,7 +32,7 @@ The guest, its Docker daemon, and the dependency containers (SQL etc.) are separ
 
 1. **Edit → hot reload.** `up` runs the app with hot reload where the runner supports it (e.g. .NET `dotnet watch`), so most code edits reload live (it's mounted from the host). Watch is best-effort — it won't catch everything.
 2. **`shunt restart <name>` → full rebuild, env preserved.** When watch misses a change or you want a clean build: this kills only the app process and re-runs it, leaving the guest, dockerd, dependency containers, and their data up. No pull, no data loss.
-3. **`shunt up` → cold start.** Only `rm` + `new` is a real teardown (fresh worktree + data).
+3. **`shunt up` → cold start / self-heal.** `up` is also the recovery button: if the guest is missing or wedged it recreates it from saved settings (keeps code + data — no manual `reapply`), and if the app is up but not serving (health endpoint fails) it rebuilds it. Only `rm` + `new` is a real teardown (fresh worktree + data).
 
 So the loop is: `up` once, then edit-and-hot-reload, and reach for `restart` when watch falls short. You should rarely pay the cold start again on a warmed project.
 
