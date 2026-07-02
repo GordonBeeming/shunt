@@ -59,10 +59,12 @@ type routeView struct {
 }
 
 type sidingView struct {
-	Name   string `json:"name"`
-	Live   bool   `json:"live"`
-	Guest  string `json:"guest"`  // running | stopped | …
-	Status string `json:"status"` // async action feedback
+	Name      string `json:"name"`
+	Live      bool   `json:"live"`
+	Guest     string `json:"guest"`               // running | stopped | …
+	Status    string `json:"status"`              // async action feedback
+	IP        string `json:"ip,omitempty"`        // guest IP (empty until activated)
+	Dashboard string `json:"dashboard,omitempty"` // guest Aspire dashboard URL (empty if no IP)
 }
 
 type appView struct {
@@ -98,8 +100,9 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		}
 		av := appView{Name: app.Name, LiveSiding: app.LiveSiding, Routes: []routeView{}, Sidings: []sidingView{}}
 
-		// Routes + host-side liveness (only meaningful when something is live, but
-		// the dial is harmless either way — a refused port just reads as down).
+		// Liveness is a front-door dial (through Caddy) — see routeUp for why we
+		// can't dial the guest directly from the launchd dashboard. The guest's own
+		// IP + dashboard link live on the siding row below, not per-route.
 		for _, rt := range app.FrontDoor {
 			av.Routes = append(av.Routes, routeView{
 				Key:        rt.Key,
@@ -125,12 +128,15 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		}
 		sort.Strings(snames)
 		for _, sn := range snames {
-			st, _ := container.State(ctx, app.Sidings[sn].Container)
+			sd := app.Sidings[sn]
+			st, _ := container.State(ctx, sd.Container)
 			av.Sidings = append(av.Sidings, sidingView{
-				Name:   sn,
-				Live:   app.LiveSiding == sn,
-				Guest:  st,
-				Status: s.getStatus(name, sn),
+				Name:      sn,
+				Live:      app.LiveSiding == sn,
+				Guest:     st,
+				Status:    s.getStatus(name, sn),
+				IP:        sd.LastIP,
+				Dashboard: siding.DashboardURL(app, sd), // "" when no IP; front-end enables it only when running
 			})
 		}
 		view.Apps = append(view.Apps, av)
@@ -216,10 +222,16 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 
 // --- helpers ---
 
-// routeUp reports whether a front-door route actually serves right now. Caddy's
-// listener is always up, so a raw TCP dial is a false positive — for HTTP we make
-// a real request and treat 502/503/504 (or no response) as down; for layer4 we
-// fall back to a TCP dial (a true upstream check would need a protocol handshake).
+// routeUp reports whether a front-door route actually serves right now, dialing
+// the stable localhost port through Caddy. We deliberately go through the front
+// door rather than the guest IP: the dashboard runs as a launchd agent, and
+// macOS Local Network privacy blocks a launchd process from reaching the guest's
+// 192.168.64.x address (loopback is fine). Caddy's listener is always up, so a
+// raw TCP dial is a false positive — for HTTP we make a real request and treat
+// 502/503/504 (the front door couldn't reach the app — it's down, or the bridge/
+// routing is off) or no response as down; for
+// layer4 we fall back to a TCP dial. For app-vs-Caddy disambiguation, use the
+// guest-direct link (opened in a real browser, which has Local Network access).
 func routeUp(r state.Route) bool {
 	addr := fmt.Sprintf("127.0.0.1:%d", r.ListenPort)
 	if r.Kind == state.KindHTTP {
