@@ -10,7 +10,9 @@ import (
 	"github.com/gordonbeeming/shunt/internal/proc"
 )
 
-// Bin is the Apple container CLI binary name.
+// Bin is the Apple container CLI binary name. proc augments PATH at startup with
+// the standard install dirs, so the bare name resolves even under launchd's
+// minimal PATH (the dashboard agent).
 const Bin = "container"
 
 // EnsureSystemStarted starts the container runtime (apiserver + default

@@ -12,6 +12,38 @@ import (
 	"strings"
 )
 
+// When shunt runs under a launchd agent (the dashboard LaunchAgent), the process
+// inherits a minimal PATH (roughly /usr/bin:/bin:/usr/sbin:/sbin) that excludes
+// the usual install dirs — so a bare `container`/`docker`/`dotnet` fails to exec
+// even though the tools are installed. Appending the standard install dirs once
+// at startup fixes every subprocess here, regardless of who launched shunt.
+func init() {
+	_ = os.Setenv("PATH", augmentPath(os.Getenv("PATH"), []string{"/usr/local/bin", "/opt/homebrew/bin"}, dirExists))
+}
+
+func dirExists(d string) bool {
+	fi, err := os.Stat(d)
+	return err == nil && fi.IsDir()
+}
+
+// augmentPath appends each of dirs that exists and isn't already on path. Order
+// is preserved and existing entries win, so this only adds fallbacks — it never
+// shadows a binary the caller could already resolve.
+func augmentPath(path string, dirs []string, exists func(string) bool) string {
+	present := make(map[string]bool)
+	for _, d := range strings.Split(path, string(os.PathListSeparator)) {
+		present[d] = true
+	}
+	for _, d := range dirs {
+		if present[d] || !exists(d) {
+			continue
+		}
+		path += string(os.PathListSeparator) + d
+		present[d] = true
+	}
+	return path
+}
+
 // Result captures a finished command's output and exit status.
 type Result struct {
 	Stdout   string
