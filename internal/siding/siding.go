@@ -732,10 +732,6 @@ func CreateBindVolumes(ctx context.Context, app state.App, sd state.Siding) erro
 	return nil
 }
 
-// Switch points the front door at a siding: it activates it (bridges) if not yet
-// done, repoints Caddy, marks it live, and persists. This is the fast path — a
-// Caddy rebind, no app restart — and assumes the siding is running on its ports.
-// Shared by `shunt switch` and the dashboard.
 // Switch points the app's stable front door at a target: either a siding or the
 // special `host` target (the local app running natively from the main repo).
 // Switch only repoints — it never starts or builds the app. Bringing the app up
@@ -749,8 +745,14 @@ func Switch(ctx context.Context, app *state.App, target string) error {
 		// Step the front door aside so the native app can bind the real ports
 		// directly. We deliberately don't start it — that's `restart host` (or you,
 		// e.g. running only the database). Ports stay dead until something binds them.
-		if err := caddy.RemoveFrontDoor(ctx, admin, *app); err != nil {
-			return err
+		// Only tear it down when coming FROM a siding: if the host is already live the
+		// front door is already aside, and deleting absent servers would error. When
+		// it does run, a failure (e.g. Caddy admin down) propagates so we don't mark
+		// the host live while Caddy still holds the ports.
+		if !wasHost {
+			if err := caddy.RemoveFrontDoor(ctx, admin, *app); err != nil {
+				return err
+			}
 		}
 		app.LiveSiding = state.HostTarget
 		return state.SaveApp(*app)
@@ -768,6 +770,14 @@ func Switch(ctx context.Context, app *state.App, target string) error {
 		if err := caddy.EnsureFrontDoor(ctx, admin, *app); err != nil {
 			return err
 		}
+		// If the switch fails after we've re-bound the front door, step it aside
+		// again — otherwise state still says host while Caddy holds the ports with
+		// nothing behind them. On success LiveSiding is the target, so this is a no-op.
+		defer func() {
+			if app.LiveSiding == state.HostTarget {
+				_ = caddy.RemoveFrontDoor(ctx, admin, *app)
+			}
+		}()
 	}
 	if len(sd.Bridges) == 0 {
 		if err := Activate(ctx, *app, &sd); err != nil {

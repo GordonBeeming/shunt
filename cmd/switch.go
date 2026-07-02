@@ -40,9 +40,10 @@ func newSwitchCmd() *cobra.Command {
 	}
 }
 
-// switchTo repoints the front door at a siding or the host, via siding.Switch
-// (which stops the host app first, then either bridges a guest or steps the
-// front door aside for the native app), and reports the result.
+// switchTo repoints the front door at a siding or the host, via siding.Switch —
+// which only moves the front door: it steps the front door aside for the host, or
+// bridges + points at a siding (stopping the host app only when switching away
+// from it). It never starts the app. Reports the result.
 func switchTo(ctx context.Context, app *state.App, target string) error {
 	if target != state.HostTarget {
 		if _, ok := app.Sidings[target]; !ok {
