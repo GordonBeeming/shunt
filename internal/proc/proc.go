@@ -9,8 +9,56 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
+
+// When shunt runs under a launchd agent (the dashboard LaunchAgent), the process
+// inherits a minimal PATH (roughly /usr/bin:/bin:/usr/sbin:/sbin) that excludes
+// the usual install dirs — so a bare `container`/`docker` (system installs) or
+// `aspire`/dotnet global tools (under $HOME) fail to exec even though they're
+// installed. A host-side `sh -lc` inherits this PATH too, and macOS path_helper
+// preserves appended entries, so fixing PATH once at startup covers every
+// subprocess here, regardless of who launched shunt.
+func init() {
+	dirs := []string{"/usr/local/bin", "/opt/homebrew/bin"}
+	if home, err := os.UserHomeDir(); err == nil {
+		// The Aspire CLI (~/.aspire/bin) and dotnet global tools (~/.dotnet/tools)
+		// live under $HOME and aren't on launchd's PATH or in /etc/paths.d, so the
+		// host runner (`aspire start`) fails from the dashboard agent without these.
+		dirs = append(dirs, filepath.Join(home, ".dotnet", "tools"), filepath.Join(home, ".aspire", "bin"))
+	}
+	_ = os.Setenv("PATH", augmentPath(os.Getenv("PATH"), dirs, dirExists))
+}
+
+func dirExists(d string) bool {
+	fi, err := os.Stat(d)
+	return err == nil && fi.IsDir()
+}
+
+// augmentPath appends each of dirs that exists and isn't already on path. Order
+// is preserved and existing entries win, so this only adds fallbacks — it never
+// shadows a binary the caller could already resolve.
+func augmentPath(path string, dirs []string, exists func(string) bool) string {
+	present := make(map[string]bool)
+	for _, d := range strings.Split(path, string(os.PathListSeparator)) {
+		present[d] = true
+	}
+	for _, d := range dirs {
+		if present[d] || !exists(d) {
+			continue
+		}
+		// Don't prepend a separator to an empty PATH — a leading separator makes an
+		// empty element, which Unix treats as the current directory (a security risk).
+		if path == "" {
+			path = d
+		} else {
+			path += string(os.PathListSeparator) + d
+		}
+		present[d] = true
+	}
+	return path
+}
 
 // Result captures a finished command's output and exit status.
 type Result struct {
