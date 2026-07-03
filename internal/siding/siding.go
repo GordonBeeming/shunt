@@ -1084,24 +1084,35 @@ func orDefaultStr(v, def string) string {
 // start the app (the guest's Docker is fresh, so bind volumes + bridges rebuild).
 func Recreate(ctx context.Context, app state.App, sd state.Siding, freshData bool) (state.Siding, error) {
 	src, volRoot := Paths(app, sd.Name)
+	// Remove the old guest first: with --fresh-data we clear + re-clone the host data
+	// dirs below, and doing that while the guest still bind-mounts them risks EBUSY /
+	// partial deletes. (Without --fresh-data this is just the plain container swap.)
+	if err := container.Remove(ctx, sd.Container); err != nil {
+		return sd, err
+	}
 	mounts := []container.Mount{{Host: src, Guest: "/workspace"}}
 	for _, vol := range app.Volumes {
 		host := filepath.Join(volRoot, vol)
-		// --fresh-data: reset this volume to the project baseline — drop the current
-		// clone and cp -c a fresh one, so the siding restarts with the seeded data
-		// while its worktree (code) is left untouched.
+		// --fresh-data: reset this volume to the project baseline while the worktree
+		// (code) is left untouched.
 		if freshData {
-			base := baselineDir(app, vol)
-			if _, err := os.Stat(base); err == nil {
-				if err := os.RemoveAll(host); err != nil {
-					return sd, fmt.Errorf("reset data volume %q: %w", vol, err)
-				}
-				if err := os.MkdirAll(volRoot, 0o755); err != nil {
-					return sd, err
-				}
-				if err := fsclone.CloneVolume(ctx, base, host); err != nil {
-					return sd, fmt.Errorf("re-clone data volume %q from baseline: %w", vol, err)
-				}
+			// `vol` comes from the contract, so refuse anything that isn't a plain name
+			// before it reaches RemoveAll — a value like "../x" must never escape volRoot.
+			if vol != filepath.Base(vol) || vol == "." || vol == ".." {
+				return sd, fmt.Errorf("refusing to reset data volume with unsafe name %q", vol)
+			}
+			// Always clear the current clone, then re-clone from the baseline. CloneVolume
+			// no-ops when the baseline is absent (leaving the volume empty — exactly how
+			// `new` starts a siding whose host lacked this volume) and surfaces real stat /
+			// cp errors rather than swallowing them.
+			if err := os.RemoveAll(host); err != nil {
+				return sd, fmt.Errorf("reset data volume %q: %w", vol, err)
+			}
+			if err := os.MkdirAll(volRoot, 0o755); err != nil {
+				return sd, err
+			}
+			if err := fsclone.CloneVolume(ctx, baselineDir(app, vol), host); err != nil {
+				return sd, fmt.Errorf("re-clone data volume %q from baseline: %w", vol, err)
 			}
 		}
 		if _, err := os.Stat(host); err == nil {
@@ -1122,9 +1133,6 @@ func Recreate(ctx context.Context, app state.App, sd state.Siding, freshData boo
 	}
 	if IsWarmed(app) {
 		mounts = append(mounts, container.Mount{Host: WarmTarPath(app), Guest: guestWarmTar, ReadOnly: true})
-	}
-	if err := container.Remove(ctx, sd.Container); err != nil {
-		return sd, err
 	}
 	if err := container.Run(ctx, container.RunOpts{
 		Name:      sd.Container,
