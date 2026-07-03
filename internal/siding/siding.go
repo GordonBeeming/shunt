@@ -196,7 +196,7 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		// branch, and data clones — so `up` self-heals instead of making the user
 		// reapply by hand.
 		fmt.Fprintf(progress, "• guest wouldn't come up (%v) — recreating it (keeps code + data)…\n", err)
-		healed, rerr := Recreate(ctx, app, sd)
+		healed, rerr := Recreate(ctx, app, sd, false)
 		if rerr != nil {
 			return sd, fmt.Errorf("%w; auto-recreate also failed: %v", err, rerr)
 		}
@@ -1082,11 +1082,28 @@ func orDefaultStr(v, def string) string {
 // worktree, branch, and data (the on-disk src + cp -c volume clones), replacing
 // only the container, so guest-creation settings take effect. Run `up` after to
 // start the app (the guest's Docker is fresh, so bind volumes + bridges rebuild).
-func Recreate(ctx context.Context, app state.App, sd state.Siding) (state.Siding, error) {
+func Recreate(ctx context.Context, app state.App, sd state.Siding, freshData bool) (state.Siding, error) {
 	src, volRoot := Paths(app, sd.Name)
 	mounts := []container.Mount{{Host: src, Guest: "/workspace"}}
 	for _, vol := range app.Volumes {
 		host := filepath.Join(volRoot, vol)
+		// --fresh-data: reset this volume to the project baseline — drop the current
+		// clone and cp -c a fresh one, so the siding restarts with the seeded data
+		// while its worktree (code) is left untouched.
+		if freshData {
+			base := baselineDir(app, vol)
+			if _, err := os.Stat(base); err == nil {
+				if err := os.RemoveAll(host); err != nil {
+					return sd, fmt.Errorf("reset data volume %q: %w", vol, err)
+				}
+				if err := os.MkdirAll(volRoot, 0o755); err != nil {
+					return sd, err
+				}
+				if err := fsclone.CloneVolume(ctx, base, host); err != nil {
+					return sd, fmt.Errorf("re-clone data volume %q from baseline: %w", vol, err)
+				}
+			}
+		}
 		if _, err := os.Stat(host); err == nil {
 			mounts = append(mounts, container.Mount{Host: host, Guest: "/mnt/dvol/" + vol})
 		}

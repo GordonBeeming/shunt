@@ -12,13 +12,17 @@ import (
 // mounts, env) — guest-creation settings can't change on a live guest, so this
 // replaces the container while keeping the worktree, branch, and data.
 func newReapplyCmd() *cobra.Command {
-	return &cobra.Command{
+	var freshData bool
+	c := &cobra.Command{
 		Use:   "reapply [name]",
 		Short: "Recreate a siding's guest with the current config (memory/cpus/mounts), keeping its code + data",
 		Long: "Guest resource caps and mounts are fixed when the guest is created, so changing them\n" +
 			"(e.g. `shunt config memory` or a contract `memory`/`cpus`) needs the guest recreated.\n" +
 			"This removes + recreates only the container — your worktree, branch, and data clones stay.\n" +
-			"Run `up` afterwards to start the app (the fresh guest re-clones bind volumes + bridges).",
+			"Run `up` afterwards to start the app (the fresh guest re-clones bind volumes + bridges).\n\n" +
+			"With --fresh-data, each data volume is reset to the project baseline (the current\n" +
+			"clone is dropped and cp -c re-cloned), so the siding restarts with the seeded data\n" +
+			"while your worktree (code) is left untouched.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -34,8 +38,12 @@ func newReapplyCmd() *cobra.Command {
 			if !ok {
 				return fmt.Errorf("no siding %q", name)
 			}
-			fmt.Printf("• recreating the guest for %q with current config (keeps code + data)…\n", name)
-			newSd, err := siding.Recreate(ctx, app, sd)
+			kept := "keeps code + data"
+			if freshData {
+				kept = "keeps code, resets data to baseline"
+			}
+			fmt.Printf("• recreating the guest for %q with current config (%s)…\n", name, kept)
+			newSd, err := siding.Recreate(ctx, app, sd, freshData)
 			if err != nil {
 				return err
 			}
@@ -51,4 +59,6 @@ func newReapplyCmd() *cobra.Command {
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&freshData, "fresh-data", false, "reset each data volume to the project baseline (keeps the worktree; discards data changes)")
+	return c
 }
