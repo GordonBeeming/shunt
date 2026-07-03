@@ -196,7 +196,7 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		// branch, and data clones — so `up` self-heals instead of making the user
 		// reapply by hand.
 		fmt.Fprintf(progress, "• guest wouldn't come up (%v) — recreating it (keeps code + data)…\n", err)
-		healed, rerr := Recreate(ctx, app, sd)
+		healed, rerr := Recreate(ctx, app, sd, false)
 		if rerr != nil {
 			return sd, fmt.Errorf("%w; auto-recreate also failed: %v", err, rerr)
 		}
@@ -1082,11 +1082,39 @@ func orDefaultStr(v, def string) string {
 // worktree, branch, and data (the on-disk src + cp -c volume clones), replacing
 // only the container, so guest-creation settings take effect. Run `up` after to
 // start the app (the guest's Docker is fresh, so bind volumes + bridges rebuild).
-func Recreate(ctx context.Context, app state.App, sd state.Siding) (state.Siding, error) {
+func Recreate(ctx context.Context, app state.App, sd state.Siding, freshData bool) (state.Siding, error) {
 	src, volRoot := Paths(app, sd.Name)
+	// Remove the old guest first: with --fresh-data we clear + re-clone the host data
+	// dirs below, and doing that while the guest still bind-mounts them risks EBUSY /
+	// partial deletes. (Without --fresh-data this is just the plain container swap.)
+	if err := container.Remove(ctx, sd.Container); err != nil {
+		return sd, err
+	}
 	mounts := []container.Mount{{Host: src, Guest: "/workspace"}}
 	for _, vol := range app.Volumes {
 		host := filepath.Join(volRoot, vol)
+		// --fresh-data: reset this volume to the project baseline while the worktree
+		// (code) is left untouched.
+		if freshData {
+			// `vol` comes from the contract, so refuse anything that isn't a plain name
+			// before it reaches RemoveAll — a value like "../x" must never escape volRoot.
+			if vol != filepath.Base(vol) || vol == "." || vol == ".." {
+				return sd, fmt.Errorf("refusing to reset data volume with unsafe name %q", vol)
+			}
+			// Always clear the current clone, then re-clone from the baseline. CloneVolume
+			// no-ops when the baseline is absent (leaving the volume empty — exactly how
+			// `new` starts a siding whose host lacked this volume) and surfaces real stat /
+			// cp errors rather than swallowing them.
+			if err := os.RemoveAll(host); err != nil {
+				return sd, fmt.Errorf("reset data volume %q: %w", vol, err)
+			}
+			if err := os.MkdirAll(volRoot, 0o755); err != nil {
+				return sd, err
+			}
+			if err := fsclone.CloneVolume(ctx, baselineDir(app, vol), host); err != nil {
+				return sd, fmt.Errorf("re-clone data volume %q from baseline: %w", vol, err)
+			}
+		}
 		if _, err := os.Stat(host); err == nil {
 			mounts = append(mounts, container.Mount{Host: host, Guest: "/mnt/dvol/" + vol})
 		}
@@ -1105,9 +1133,6 @@ func Recreate(ctx context.Context, app state.App, sd state.Siding) (state.Siding
 	}
 	if IsWarmed(app) {
 		mounts = append(mounts, container.Mount{Host: WarmTarPath(app), Guest: guestWarmTar, ReadOnly: true})
-	}
-	if err := container.Remove(ctx, sd.Container); err != nil {
-		return sd, err
 	}
 	if err := container.Run(ctx, container.RunOpts{
 		Name:      sd.Container,
