@@ -16,6 +16,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/container"
+	"github.com/gordonbeeming/shunt/internal/contract"
 	"github.com/gordonbeeming/shunt/internal/fsclone"
 	"github.com/gordonbeeming/shunt/internal/hostdocker"
 	"github.com/gordonbeeming/shunt/internal/proc"
@@ -212,6 +213,16 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 	// The guest is live again — clear any `stopped` marker `kill` left behind.
 	sd.Stopped = false
 
+	// Resolve this siding's own front door from its worktree contract (the guest runs
+	// the siding's code), so a route it declares applies without an `app add` in root.
+	// Always assign — nil (no contract) clears a stale set so EffRoutes falls back to
+	// the app-level routes; a broken contract is a warning here, not a hard failure.
+	fd, ferr := resolveSidingFrontDoor(app, sd)
+	if ferr != nil {
+		fmt.Fprintf(progress, "  (siding front door: %v — using the app-level routes)\n", ferr)
+	}
+	sd.FrontDoor = fd
+
 	// Only (re)launch the app when it isn't already serving. A running AppHost that
 	// never becomes healthy (its child projects all crashed) is half-dead — rebuild
 	// it rather than skip. A genuinely healthy live app is left alone so a re-up just
@@ -286,7 +297,11 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 	// A self-heal recreate can change the IP, and the dashboard Start path has no
 	// separate live-refresh like the CLI's `up` does — so do it here for both callers.
 	if app.LiveSiding == sd.Name {
-		if err := PointCaddy(ctx, app, &sd); err != nil {
+		// A siding-added route (one the app-level set lacks) has no Caddy server yet —
+		// create it before pointing, or PointCaddy would have nothing to aim at.
+		if err := ensureSidingRoutes(ctx, caddy.NewAdmin(), app, sd); err != nil {
+			fmt.Fprintf(progress, "  (couldn't create siding-added front-door route(s): %v — run `switch` to fix)\n", err)
+		} else if err := PointCaddy(ctx, app, &sd); err != nil {
 			fmt.Fprintf(progress, "  (front-door refresh failed: %v — run `switch` to fix)\n", err)
 		}
 	}
@@ -531,6 +546,126 @@ func guestNameToSiding(guestName string) string {
 // Activate sets up the loopback->guest-IP bridges and discovers the app's
 // endpoints, recording each front-door route's external bridge port on the
 // siding. Idempotent re-bridging is avoided by only running once per guest.
+// EffRoutes returns the front-door routes to use for a siding: the siding's own
+// resolved set (from its worktree .shunt.app.json) when present, else the app-level
+// set. The guest runs the siding's worktree, so its contract is authoritative for
+// that siding — a route it adds (or drops) applies without an `app add` in the root
+// repo. Host-level callers (no siding) keep using app.FrontDoor directly.
+func EffRoutes(app state.App, sd state.Siding) []state.Route {
+	if len(sd.FrontDoor) > 0 {
+		return sd.FrontDoor
+	}
+	return app.FrontDoor
+}
+
+// RouteFromContract builds a front-door state.Route from a contract route and an
+// already-resolved host listen port. Shared with `app add` so the field mapping
+// (CaddyID, TLS, guestPort) can't drift between the two derivations.
+func RouteFromContract(appName string, r contract.FrontDoorRoute, listenPort int) state.Route {
+	return state.Route{
+		Key:        r.Key,
+		Kind:       r.Kind,
+		ListenPort: listenPort,
+		Resource:   r.Resource,
+		Endpoint:   r.Endpoint,
+		GuestPort:  r.GuestPort,
+		TLS:        r.TLS,
+		CaddyID:    caddy.RouteID(appName, r.Kind, r.Key),
+	}
+}
+
+// resolveSidingFrontDoor reads the siding worktree's .shunt.app.json and derives
+// its front-door routes. It reuses the app-level assigned host port for any route
+// the app already knows (matched by kind+key) so stable ports never move, and
+// honors the contract's declared listenPort for a route only the siding adds.
+// Returns nil when the siding has no readable/valid contract, so the caller falls
+// back to the app-level set rather than failing an `up`/`switch`.
+func resolveSidingFrontDoor(app state.App, sd state.Siding) ([]state.Route, error) {
+	src, _ := Paths(app, sd.Name)
+	path := filepath.Join(src, contract.FileName)
+	if _, err := os.Stat(path); err != nil {
+		return nil, nil // no siding contract → the app-level set (not an error)
+	}
+	ct, err := contract.Load(src)
+	if err != nil {
+		return nil, fmt.Errorf("load siding contract %s: %w", path, err)
+	}
+	prev := make(map[string]int, len(app.FrontDoor))
+	for _, r := range app.FrontDoor {
+		prev[r.Kind+"/"+r.Key] = r.ListenPort
+	}
+	routes := make([]state.Route, 0, len(ct.FrontDoor))
+	for _, r := range ct.FrontDoor {
+		lp := r.ListenPort
+		if p, ok := prev[r.Kind+"/"+r.Key]; ok {
+			lp = p // keep the app-assigned host port; only siding-new routes use the declared one
+		}
+		routes = append(routes, RouteFromContract(app.Name, r, lp))
+	}
+	return routes, nil
+}
+
+// extraRoutes returns the siding's front-door routes that go beyond the app-level
+// set (matched by kind+key) — i.e. routes a siding introduces on its own.
+func extraRoutes(app state.App, sd state.Siding) []state.Route {
+	known := make(map[string]bool, len(app.FrontDoor))
+	for _, r := range app.FrontDoor {
+		known[r.Kind+"/"+r.Key] = true
+	}
+	var extra []state.Route
+	for _, r := range EffRoutes(app, sd) {
+		if !known[r.Kind+"/"+r.Key] {
+			extra = append(extra, r)
+		}
+	}
+	return extra
+}
+
+// ensureSidingRoutes creates Caddy front-door servers for any route this siding
+// adds beyond the app-level set, so PointCaddy has a server to aim at. It touches
+// ONLY the extra routes — the shared app-level servers (from `app add`) are left
+// as-is, so a re-up/switch never resets the routes another live siding depends on.
+func ensureSidingRoutes(ctx context.Context, admin *caddy.Admin, app state.App, sd state.Siding) error {
+	for _, r := range extraRoutes(app, sd) {
+		// Skip a route whose server already exists — EnsureFrontDoor does delete-then-put,
+		// which would reset a live route's upstream dial to the placeholder (a brief drop,
+		// and it clobbers PointCaddy's rollback capture). Only CREATE the missing ones.
+		if _, err := admin.GetID(ctx, r.CaddyID); err == nil {
+			continue
+		}
+		ea := app
+		ea.FrontDoor = []state.Route{r}
+		if err := caddy.EnsureFrontDoor(ctx, admin, ea); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// routesToRemove returns front-door routes currently bound for the outgoing target
+// (the app-level set plus whatever the outgoing siding added) that the incoming
+// siding's set no longer includes — so a switch can tear down servers that would
+// otherwise keep serving the old siding on their ports (a route the previous siding
+// added, or an app-level route the incoming siding's contract drops).
+func routesToRemove(app state.App, outgoing, incoming state.Siding) []state.Route {
+	want := make(map[string]bool)
+	for _, r := range EffRoutes(app, incoming) {
+		want[r.Kind+"/"+r.Key] = true
+	}
+	seen := make(map[string]bool)
+	var stale []state.Route
+	bound := append(append([]state.Route{}, app.FrontDoor...), EffRoutes(app, outgoing)...)
+	for _, r := range bound {
+		k := r.Kind + "/" + r.Key
+		if want[k] || seen[k] {
+			continue
+		}
+		seen[k] = true
+		stale = append(stale, r)
+	}
+	return stale
+}
+
 func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 	ip, err := container.IP(ctx, sd.Container)
 	if err != nil {
@@ -547,7 +682,7 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 	// auto-serves the moment each service starts — no discovery, no waiting on a
 	// slow/unhealthy resource, no re-switch.
 	var needDiscovery []state.Route
-	for _, r := range app.FrontDoor {
+	for _, r := range EffRoutes(app, *sd) {
 		if r.GuestPort == 0 {
 			needDiscovery = append(needDiscovery, r)
 			continue
@@ -660,7 +795,7 @@ func PointCaddy(ctx context.Context, app state.App, sd *state.Siding) error {
 			}
 		}
 	}
-	for _, r := range app.FrontDoor {
+	for _, r := range EffRoutes(app, *sd) {
 		ext, ok := sd.Bridges[r.Key]
 		if !ok {
 			// Route not up yet (partial activation) — leave it on the placeholder
@@ -691,7 +826,7 @@ func DashboardURL(app state.App, sd state.Siding) string {
 		return ""
 	}
 	port := guestDashboardPort
-	for _, r := range app.FrontDoor {
+	for _, r := range EffRoutes(app, sd) {
 		if r.Kind == state.KindHTTP && r.GuestPort != 0 &&
 			(r.Resource == "aspire-dashboard" || r.Key == "aspire-dashboard" || r.Key == "dashboard") {
 			port = r.GuestPort
@@ -767,7 +902,7 @@ func WaitReady(ctx context.Context, app state.App, sd state.Siding, timeout time
 // allPortsListening reports whether every front-door route's guestPort accepts a
 // connection inside the guest (socat is in the base image; sh has no /dev/tcp).
 func allPortsListening(ctx context.Context, app state.App, sd state.Siding) bool {
-	for _, r := range app.FrontDoor {
+	for _, r := range EffRoutes(app, sd) {
 		if r.GuestPort == 0 {
 			return false
 		}
@@ -958,7 +1093,14 @@ func Switch(ctx context.Context, app *state.App, target string) error {
 		// it does run, a failure (e.g. Caddy admin down) propagates so we don't mark
 		// the host live while Caddy still holds the ports.
 		if !wasHost {
-			if err := caddy.RemoveFrontDoor(ctx, admin, *app); err != nil {
+			// Tear down the front-door servers for whatever's live now — use the live
+			// siding's own route set so a route it added (beyond the app-level set) is
+			// removed too.
+			out := *app
+			if live, ok := app.Sidings[app.LiveSiding]; ok {
+				out.FrontDoor = EffRoutes(*app, live)
+			}
+			if err := caddy.RemoveFrontDoor(ctx, admin, out); err != nil {
 				return err
 			}
 		}
@@ -970,12 +1112,24 @@ func Switch(ctx context.Context, app *state.App, target string) error {
 	if !ok {
 		return fmt.Errorf("no siding %q", target)
 	}
-	// Coming back from the host, the local app may still hold the real ports and
-	// the front-door servers were removed — stop it (best-effort) so it releases
-	// them, then re-create the servers so Caddy re-binds before pointing at the guest.
+	// The guest runs this siding's worktree, so its own .shunt.app.json is
+	// authoritative for its front door — resolve it (a route it adds/drops applies
+	// without an `app add` in root). A broken contract fails the switch fast rather
+	// than silently serving a stale set; nil (no contract) clears any stale set.
+	fd, ferr := resolveSidingFrontDoor(*app, sd)
+	if ferr != nil {
+		return fmt.Errorf("switch to %q: %w", target, ferr)
+	}
+	sd.FrontDoor = fd
 	if wasHost {
+		// Coming back from the host, the local app may still hold the real ports and
+		// the front-door servers were removed — stop it (best-effort) so it releases
+		// them, then re-create every server (this siding's full set, incl. any it adds)
+		// so Caddy re-binds before pointing at the guest.
 		HostStop(ctx, *app)
-		if err := caddy.EnsureFrontDoor(ctx, admin, *app); err != nil {
+		eff := *app
+		eff.FrontDoor = EffRoutes(*app, sd)
+		if err := caddy.EnsureFrontDoor(ctx, admin, eff); err != nil {
 			return err
 		}
 		// If the switch fails after we've re-bound the front door, step it aside
@@ -983,9 +1137,27 @@ func Switch(ctx context.Context, app *state.App, target string) error {
 		// nothing behind them. On success LiveSiding is the target, so this is a no-op.
 		defer func() {
 			if app.LiveSiding == state.HostTarget {
-				_ = caddy.RemoveFrontDoor(ctx, admin, *app)
+				_ = caddy.RemoveFrontDoor(ctx, admin, eff)
 			}
 		}()
+	} else {
+		// Already on a siding: the shared app-level servers are up. First tear down any
+		// server the target no longer wants — the previously-live siding's extra routes,
+		// or app-level routes this siding's contract drops — so they don't keep serving
+		// the old siding on their ports.
+		if outgoing, ok := app.Sidings[app.LiveSiding]; ok {
+			if stale := routesToRemove(*app, outgoing, sd); len(stale) > 0 {
+				so := *app
+				so.FrontDoor = stale
+				if err := caddy.RemoveFrontDoor(ctx, admin, so); err != nil {
+					return err
+				}
+			}
+		}
+		// Then create any route THIS siding adds beyond the shared set.
+		if err := ensureSidingRoutes(ctx, admin, *app, sd); err != nil {
+			return err
+		}
 	}
 	if len(sd.Bridges) == 0 {
 		if err := Activate(ctx, *app, &sd); err != nil {
