@@ -34,18 +34,36 @@ func newKillCmd() *cobra.Command {
 			if !ok {
 				return fmt.Errorf("no siding %q", name)
 			}
-			if err := container.Stop(ctx, sd.Container); err != nil {
+			// StopOrForce gracefully stops, and only when the graceful stop wedges on the
+			// guest's cgroup.kill (errno 95) does it force-remove as the escape — the one
+			// failure `stop` can't clear. A transient failure comes back as an error (no
+			// force), so we never nuke a guest the user could have retried.
+			forced, err := container.StopOrForce(ctx, sd.Container)
+			if err != nil {
 				return err
 			}
 			sd.Stopped = true
+			if forced {
+				// Force-removed: the guest is gone (not just stopped), so its bridges are
+				// stale and `up` must recreate it rather than `start` it.
+				sd.Bridges = nil // match markStopped: a cleared bridges map serializes as null
+			}
 			app.Sidings[name] = sd
 			if app.LiveSiding == name {
-				fmt.Printf("⚠ %q was live — the front door now points at a stopped guest; switch to another siding\n", name)
+				gone := "stopped"
+				if forced {
+					gone = "force-removed"
+				}
+				fmt.Printf("⚠ %q was live — the front door now points at a %s guest; switch to another siding\n", name, gone)
 			}
 			if err := state.SaveApp(app); err != nil {
 				return err
 			}
-			fmt.Printf("%s stopped %q\n", tick(), name)
+			if forced {
+				fmt.Printf("%s %q was wedged on its cgroup — force-removed it; run `%s up %s` to recreate it (worktree + data are kept)\n", tick(), name, bin(), name)
+			} else {
+				fmt.Printf("%s stopped %q\n", tick(), name)
+			}
 			return nil
 		},
 	}
