@@ -61,7 +61,7 @@ func switchTo(ctx context.Context, app *state.App, target string) error {
 	}
 	sd := app.Sidings[target]
 	fmt.Printf("%s switched to %q\n", tick(), target)
-	for _, r := range app.FrontDoor {
+	for _, r := range siding.EffRoutes(*app, sd) {
 		fmt.Printf("  %s  ->  %s:%d  (%s)\n", ui.Cyan(fmt.Sprintf("localhost:%d", r.ListenPort)), sd.LastIP, sd.Bridges[r.Key], r.Key)
 	}
 	return nil

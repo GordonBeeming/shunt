@@ -165,4 +165,9 @@ type Siding struct {
 	// Bridges maps each front-door route key to the guest-external port shunt's
 	// in-guest socat exposes (Aspire binds the real endpoint to loopback).
 	Bridges map[string]int `json:"bridges"`
+	// FrontDoor is this siding's own resolved front-door route set, read from the
+	// siding worktree's .shunt.app.json (the guest runs that code). Empty falls back
+	// to the app-level set — so a siding that adds/drops a route applies it on
+	// `up`/`switch` without an `app add` in the root repo. Set by `up`/`switch`.
+	FrontDoor []Route `json:"frontDoor,omitempty"`
 }

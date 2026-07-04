@@ -136,19 +136,9 @@ func newAppAddCmd() *cobra.Command {
 					}
 				}
 				assigned[port] = true
-				route := state.Route{
-					Key:        r.Key,
-					Kind:       r.Kind,
-					ListenPort: port,
-					Resource:   r.Resource,
-					Endpoint:   r.Endpoint,
-					GuestPort:  r.GuestPort,
-					// TLS is config-driven: terminate TLS at the front door only when
-					// the route says so (services are https; the dashboard is http).
-					TLS:     r.TLS,
-					CaddyID: caddy.RouteID(loc.Project, r.Kind, r.Key),
-				}
-				app.FrontDoor = append(app.FrontDoor, route)
+				// Build the route via the shared helper so the field mapping (CaddyID, TLS,
+				// guestPort) stays identical to the siding-contract path in internal/siding.
+				app.FrontDoor = append(app.FrontDoor, siding.RouteFromContract(loc.Project, r, port))
 			}
 			// Register (delete-then-put) every front-door server in one place, shared
 			// with the switch-back-from-host path (caddy.EnsureFrontDoor).
