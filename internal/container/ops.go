@@ -277,14 +277,18 @@ func StopOrForce(ctx context.Context, name string) (forced bool, err error) {
 	if serr == nil {
 		return false, nil
 	}
-	if !strings.Contains(serr.Error(), "cgroup") {
+	// Match the kernel's cgroup.kill diagnostic specifically, not a bare "cgroup":
+	// Stop wraps its error as `container stop <name>: …`, so a bare match would also
+	// scan the container name and misfire the force-remove for any siding whose name
+	// contains "cgroup". cgroup.kill is the wedge's actual signature.
+	if !strings.Contains(strings.ToLower(serr.Error()), "cgroup.kill") {
 		return false, serr
 	}
 	if _, rerr := proc.Run(ctx, Bin, "rm", "-f", name); rerr != nil {
 		if isAbsentErr(rerr) {
 			return true, nil
 		}
-		return false, fmt.Errorf("stop wedged on cgroup and force-remove failed: %w", rerr)
+		return false, fmt.Errorf("stop %q wedged on cgroup.kill and force-remove failed: %w", name, rerr)
 	}
 	return true, nil
 }

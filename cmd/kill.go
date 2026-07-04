@@ -46,11 +46,15 @@ func newKillCmd() *cobra.Command {
 			if forced {
 				// Force-removed: the guest is gone (not just stopped), so its bridges are
 				// stale and `up` must recreate it rather than `start` it.
-				sd.Bridges = map[string]int{}
+				sd.Bridges = nil // match markStopped: a cleared bridges map serializes as null
 			}
 			app.Sidings[name] = sd
 			if app.LiveSiding == name {
-				fmt.Printf("⚠ %q was live — the front door now points at a dead guest; switch to another siding\n", name)
+				gone := "stopped"
+				if forced {
+					gone = "force-removed"
+				}
+				fmt.Printf("⚠ %q was live — the front door now points at a %s guest; switch to another siding\n", name, gone)
 			}
 			if err := state.SaveApp(app); err != nil {
 				return err
