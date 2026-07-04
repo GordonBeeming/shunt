@@ -262,6 +262,33 @@ func Stop(ctx context.Context, name string) error {
 	return nil
 }
 
+// StopOrForce stops a running guest gracefully, but escapes the one failure a
+// graceful stop can't clear: the guest's cgroup.kill wedging with errno 95, where
+// `container stop` jams and can never reap the guest. In that case it force-removes
+// the guest and reports forced=true — the guest is then *gone* (not merely stopped),
+// so callers must recreate it (e.g. `up` self-heals) rather than `start` it. The
+// worktree + data clones are host bind mounts, so they survive the force-remove.
+//
+// A non-cgroup stop failure (timeout, runtime hiccup) is returned as-is with
+// forced=false: force is reserved for the wedge, so a transient error never nukes a
+// guest the user could have retried.
+func StopOrForce(ctx context.Context, name string) (forced bool, err error) {
+	serr := Stop(ctx, name)
+	if serr == nil {
+		return false, nil
+	}
+	if !strings.Contains(serr.Error(), "cgroup") {
+		return false, serr
+	}
+	if _, rerr := proc.Run(ctx, Bin, "rm", "-f", name); rerr != nil {
+		if isAbsentErr(rerr) {
+			return true, nil
+		}
+		return false, fmt.Errorf("stop wedged on cgroup and force-remove failed: %w", rerr)
+	}
+	return true, nil
+}
+
 // Start boots a stopped guest, re-running its entrypoint (dockerd + dev cert,
 // then the idle keep-alive). The guest's own disk and its host bind mounts (the
 // worktree + data volumes) persist across stop/start, so nothing is lost.

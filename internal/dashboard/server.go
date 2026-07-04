@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -315,23 +314,13 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 		msg := ""
-		if err := container.Stop(ctx, sd.Container); err != nil {
-			// A graceful stop can wedge on the guest's cgroup.kill (errno 95). Only then
-			// force-remove as the escape — a transient Stop failure (timeout, runtime
-			// hiccup) shouldn't nuke the guest; surface it so the user can retry. After a
-			// force-remove `up` self-heals by recreating the guest from saved settings.
-			switch {
-			case !strings.Contains(err.Error(), "cgroup"):
-				msg = "error: " + err.Error()
-			default:
-				if e := container.Remove(ctx, sd.Container); e != nil {
-					msg = "error: stop failed (" + err.Error() + ") and force-remove failed: " + e.Error()
-				} else {
-					msg = s.markStopped(project, sdName, true) // forced: guest gone, bridges stale
-				}
-			}
+		// StopOrForce gracefully stops; only the cgroup.kill wedge (errno 95) triggers the
+		// force-remove escape. A transient failure comes back as an error so the user can
+		// retry rather than lose the guest; `up` self-heals a force-removed guest.
+		if forced, err := container.StopOrForce(ctx, sd.Container); err != nil {
+			msg = "error: " + err.Error()
 		} else {
-			msg = s.markStopped(project, sdName, false)
+			msg = s.markStopped(project, sdName, forced) // forced: guest gone, bridges stale
 		}
 		s.release(key, msg)
 	}()
