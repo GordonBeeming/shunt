@@ -35,6 +35,93 @@ ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
     PATH="/root/.dotnet/tools:${PATH}"
 
+# playwright-cli + the playwright library it drives, pinned to the exact pair
+# @playwright/cli@0.1.9 depends on (`npm view @playwright/cli@0.1.9
+# dependencies`) so the CLI's own browser management and any ad-hoc script
+# calling into the library resolve the same install. Node only searches
+# node_modules up from a script's own path by default, so NODE_PATH points
+# ad-hoc `node -e "require('playwright')"` snippets at the global install;
+# playwright-cli.js additionally requires playwright-core directly, which
+# npm installs nested under playwright's own node_modules rather than
+# hoisting to the shared global root, so that nested dir needs to be on
+# NODE_PATH too or playwright-cli itself fails with MODULE_NOT_FOUND.
+RUN npm install -g @playwright/cli@0.1.9 playwright@1.60.0-alpha-1777077614000
+ENV NODE_PATH=/usr/lib/node_modules:/usr/lib/node_modules/playwright/node_modules
+
+# Chromium, installed once into a fixed, world-readable path so every guest
+# process (any user, any working directory) resolves the same browser
+# binaries instead of each re-downloading into a per-user cache.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN playwright install --with-deps chromium
+
+# A compact real-web-rendering font set so screenshots/recordings show actual
+# glyphs (including emoji) instead of tofu boxes.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fonts-liberation fonts-noto-color-emoji \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# certutil for trusting the ASP.NET dev cert into Chromium's NSS database —
+# Chromium reads trust from sql:$HOME/.pki/nssdb, not the system CA bundle,
+# so this only provides the tool; the entrypoint does the per-guest import
+# once the dev cert exists (see shunt-entrypoint.sh). Kept even though it
+# isn't sufficient on its own (next block) — it's harmless, helps any
+# non-Chromium NSS consumer, and future-proofs against a Chromium that
+# starts honouring leaf trust anchors again.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libnss3-tools \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# The ASP.NET dev cert is a self-signed LEAF certificate (Basic Constraints:
+# not a CA) — that's normal for `dotnet dev-certs`, but Chromium's builtin
+# cert verifier (Chrome Root Store path builder) requires CA:true on
+# anything used as a trust anchor, so the NSS import above is not enough by
+# itself: Chromium still throws net::ERR_CERT_INVALID against it. The fix is
+# the `--allow-insecure-localhost` launch arg, which waives cert errors only
+# on literal localhost/127.0.0.1 origins — exactly where the guest's own
+# apps live — rather than a blanket ignoreHTTPSErrors. There's no env var
+# for it (playwright-cli's args-passthrough is config-file-only), but its
+# config resolution always merges in $HOME/.playwright/cli.config.json as
+# the lowest-priority layer with no flag or env needed to opt in, so baking
+# it there (root's home — no USER directive changes that) applies the flag
+# to every playwright-cli invocation in every guest automatically. Merge
+# order (lowest to highest): this global file, then any --config/
+# PLAYWRIGHT_MCP_CONFIG file, then individual PLAYWRIGHT_MCP_* env vars,
+# then CLI flags — so a field added here always loses to the same field set
+# by an env var or flag. Intended: this file is a baseline default, not an
+# override.
+#
+# Second field, same file: playwright-cli's own default browser resolution
+# (when nothing sets `browser.browserName`) targets Chromium's "chrome"
+# channel — a system/branded Google Chrome install — not the plain
+# playwright-managed Chromium `playwright install --with-deps chromium`
+# just put on this image, so a bare `playwright-cli open <url>` with no
+# `--browser` flag dies with "Chromium distribution 'chrome' is not found
+# at /opt/google/chrome/chrome". Setting `browser.browserName: "chromium"`
+# here skips that channel defaulting entirely, so bare invocations resolve
+# to the Chromium this image actually ships.
+#
+# Third field, same file: once `browserName` is explicitly "chromium" (the
+# fix above), playwright-cli's own sandbox default kicks in — on Linux, an
+# unset `chromiumSandbox` resolves to `true` for any channel other than a
+# playwright-installed testing channel, i.e. exactly the channel this image
+# uses — and Chromium's sandbox needs privileges this root, unprivileged
+# guest doesn't have ("Running as root without --no-sandbox is not
+# supported"). Setting `chromiumSandbox: false` here (not an env var: this
+# is the raw config field `PLAYWRIGHT_MCP_SANDBOX` maps to, and only the
+# CLI's env-var config path reads that env, not the global-file path) skips
+# the auto-default so a bare invocation launches cleanly.
+RUN mkdir -p /root/.playwright && cat > /root/.playwright/cli.config.json <<'EOF'
+{
+  "browser": {
+    "browserName": "chromium",
+    "launchOptions": {
+      "args": ["--allow-insecure-localhost"],
+      "chromiumSandbox": false
+    }
+  }
+}
+EOF
+
 COPY shunt-entrypoint.sh /usr/local/bin/shunt-entrypoint.sh
 RUN chmod +x /usr/local/bin/shunt-entrypoint.sh
 
