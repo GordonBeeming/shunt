@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gordonbeeming/shunt/internal/config"
 )
 
 func TestDashboardResponding(t *testing.T) {
@@ -30,6 +32,28 @@ func TestDashboardRespondingRejectsUnhealthyServer(t *testing.T) {
 	err := dashboardResponding(context.Background(), server.URL)
 	if err == nil || !strings.Contains(err.Error(), "503 Service Unavailable") {
 		t.Fatalf("dashboardResponding error = %v, want 503 status", err)
+	}
+}
+
+func TestDashboardLaunchedByAgent(t *testing.T) {
+	label := config.Current().DashboardLaunchAgentID
+	tests := []struct {
+		name        string
+		ppid        int
+		serviceName string
+		want        bool
+	}{
+		{name: "system launchd parent", ppid: 1, want: true},
+		{name: "launchd job label", ppid: 42, serviceName: label, want: true},
+		{name: "interactive process", ppid: 42, serviceName: "com.example.shell", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := dashboardLaunchedByAgent(tt.ppid, tt.serviceName); got != tt.want {
+				t.Fatalf("dashboardLaunchedByAgent(%d, %q) = %v, want %v", tt.ppid, tt.serviceName, got, tt.want)
+			}
+		})
 	}
 }
 

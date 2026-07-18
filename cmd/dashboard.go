@@ -38,6 +38,10 @@ func dashboardRuntime() (url, cert, key string, useTLS bool) {
 	return fmt.Sprintf("http://localhost:%d", port), cert, key, false
 }
 
+func dashboardLaunchedByAgent(ppid int, serviceName string) bool {
+	return ppid == 1 || serviceName == config.Current().DashboardLaunchAgentID
+}
+
 func dashboardResponding(ctx context.Context, url string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/", nil)
 	if err != nil {
@@ -115,8 +119,9 @@ func newDashboardCmd() *cobra.Command {
 			url, cert, key, useTLS := dashboardRuntime()
 
 			// Older installed plists invoked `dashboard` without --serve. Keep those
-			// agents working after a binary upgrade; launchd agents have PID 1 as parent.
-			if serve || os.Getppid() == 1 {
+			// agents working after a binary upgrade, whether launchd is identified by
+			// its parent PID or the job label it injects into XPC_SERVICE_NAME.
+			if serve || dashboardLaunchedByAgent(os.Getppid(), os.Getenv("XPC_SERVICE_NAME")) {
 				return serveDashboard(url, cert, key, useTLS)
 			}
 
