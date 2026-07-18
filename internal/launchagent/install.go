@@ -17,6 +17,16 @@ func Loaded(ctx context.Context, label string) bool {
 	return err == nil
 }
 
+// KickstartDashboard restarts this channel's loaded dashboard LaunchAgent.
+func KickstartDashboard(ctx context.Context) error {
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	label := config.Current().DashboardLaunchAgentID
+	if _, err := proc.Run(ctx, "launchctl", "kickstart", "-k", domain+"/"+label); err != nil {
+		return fmt.Errorf("launchctl kickstart dashboard: %w", err)
+	}
+	return nil
+}
+
 // Install writes the channel's Caddy plist and (re)loads it into the user's
 // launchd domain, leaving Caddy running. caddyBin and bootstrapPath are baked
 // into the agent's launch command.
@@ -66,8 +76,7 @@ func InstallDashboard(ctx context.Context, binPath string) error {
 		return fmt.Errorf("launchctl bootstrap dashboard: %w", err)
 	}
 	_, _ = proc.Run(ctx, "launchctl", "enable", domain+"/"+label)
-	_, _ = proc.Run(ctx, "launchctl", "kickstart", "-k", domain+"/"+label)
-	return nil
+	return KickstartDashboard(ctx)
 }
 
 func filepathDir(p string) string {
