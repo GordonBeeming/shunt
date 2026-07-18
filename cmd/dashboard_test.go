@@ -45,6 +45,18 @@ func TestWaitForDashboardHonorsTimeoutDuringRequest(t *testing.T) {
 	}
 }
 
+func TestWaitForDashboardReportsTimeoutAndLastHealthError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	err := waitForDashboard(context.Background(), server.URL, 20*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "503 Service Unavailable") {
+		t.Fatalf("waitForDashboard error = %v, want timeout with last 503 status", err)
+	}
+}
+
 func TestWaitForDashboardHonorsParentCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

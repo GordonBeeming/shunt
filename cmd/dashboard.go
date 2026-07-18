@@ -72,7 +72,7 @@ func waitForDashboard(ctx context.Context, url string, timeout time.Duration) er
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return lastErr
+			return fmt.Errorf("dashboard health check timed out after %s (last error: %v): %w", timeout, lastErr, pollCtx.Err())
 		case <-ticker.C:
 		}
 	}
