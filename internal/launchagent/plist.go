@@ -82,7 +82,7 @@ func writePlist(caddyBin, bootstrapPath string) (string, error) {
 	return plistPath, nil
 }
 
-// dashboardPlistTemplate runs `<shunt> dashboard` with KeepAlive so the web UI
+// dashboardPlistTemplate runs `<shunt> dashboard --serve` with KeepAlive so the web UI
 // stays up like Caddy.
 const dashboardPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -93,6 +93,7 @@ const dashboardPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
   <array>
     <string>%s</string>
     <string>dashboard</string>
+    <string>--serve</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
