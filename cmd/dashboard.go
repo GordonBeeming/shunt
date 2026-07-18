@@ -16,7 +16,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const dashboardStartupTimeout = 5 * time.Second
+const (
+	dashboardStartupTimeout = 5 * time.Second
+	dashboardReadTimeout    = 10 * time.Second
+	dashboardWriteTimeout   = 30 * time.Second
+	dashboardIdleTimeout    = 2 * time.Minute
+)
+
+var dashboardHTTPClient = &http.Client{Timeout: time.Second}
 
 // fileExists reports whether a regular file is present at p.
 func fileExists(p string) bool {
@@ -47,8 +54,7 @@ func dashboardResponding(ctx context.Context, url string) error {
 	if err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: time.Second}
-	resp, err := client.Do(req)
+	resp, err := dashboardHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -89,8 +95,19 @@ func openDashboard(ctx context.Context, url string) error {
 	return nil
 }
 
+func newDashboardHTTPServer() *http.Server {
+	return &http.Server{
+		Addr:              config.DashboardAddr(),
+		Handler:           dashboard.NewServer().Handler(),
+		ReadHeaderTimeout: dashboardReadTimeout,
+		ReadTimeout:       dashboardReadTimeout,
+		WriteTimeout:      dashboardWriteTimeout,
+		IdleTimeout:       dashboardIdleTimeout,
+	}
+}
+
 func serveDashboard(url, cert, key string, useTLS bool) error {
-	srv := &http.Server{Addr: config.DashboardAddr(), Handler: dashboard.NewServer().Handler()}
+	srv := newDashboardHTTPServer()
 	if useTLS {
 		fmt.Printf("• shunt dashboard: %s  (%s channel · Ctrl-C to stop)\n", url, config.Current().Channel)
 		if err := srv.ListenAndServeTLS(cert, key); err != nil && err != http.ErrServerClosed {

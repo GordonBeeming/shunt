@@ -57,6 +57,17 @@ func TestDashboardLaunchedByAgent(t *testing.T) {
 	}
 }
 
+func TestDashboardHTTPServerTimeouts(t *testing.T) {
+	srv := newDashboardHTTPServer()
+	if srv.ReadHeaderTimeout != dashboardReadTimeout ||
+		srv.ReadTimeout != dashboardReadTimeout ||
+		srv.WriteTimeout != dashboardWriteTimeout ||
+		srv.IdleTimeout != dashboardIdleTimeout {
+		t.Fatalf("dashboard server timeouts = read-header %s, read %s, write %s, idle %s",
+			srv.ReadHeaderTimeout, srv.ReadTimeout, srv.WriteTimeout, srv.IdleTimeout)
+	}
+}
+
 func TestWaitForDashboardHonorsTimeoutDuringRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
