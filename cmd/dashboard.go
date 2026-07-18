@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"time"
@@ -48,6 +49,7 @@ func dashboardResponding(ctx context.Context, url string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected HTTP status %s", resp.Status)
 	}

@@ -10,7 +10,9 @@ func TestRenderDashboardUsesServeMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(plist, "<string>dashboard</string>\n    <string>--serve</string>") {
+	dashboardIndex := strings.Index(plist, "<string>dashboard</string>")
+	serveIndex := strings.Index(plist, "<string>--serve</string>")
+	if dashboardIndex == -1 || serveIndex <= dashboardIndex {
 		t.Fatalf("dashboard plist does not use --serve mode:\n%s", plist)
 	}
 }
