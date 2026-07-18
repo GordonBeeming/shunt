@@ -59,6 +59,8 @@ func dashboardResponding(ctx context.Context, url string) error {
 func waitForDashboard(ctx context.Context, url string, timeout time.Duration) error {
 	pollCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 
 	var lastErr error
 	for {
@@ -71,7 +73,7 @@ func waitForDashboard(ctx context.Context, url string, timeout time.Duration) er
 				return err
 			}
 			return lastErr
-		case <-time.After(100 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
 }
