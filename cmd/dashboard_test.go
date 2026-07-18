@@ -2,10 +2,12 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDashboardResponding(t *testing.T) {
@@ -28,5 +30,27 @@ func TestDashboardRespondingRejectsUnhealthyServer(t *testing.T) {
 	err := dashboardResponding(context.Background(), server.URL)
 	if err == nil || !strings.Contains(err.Error(), "503 Service Unavailable") {
 		t.Fatalf("dashboardResponding error = %v, want 503 status", err)
+	}
+}
+
+func TestWaitForDashboardHonorsTimeoutDuringRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	err := waitForDashboard(context.Background(), server.URL, 20*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForDashboard error = %v, want context deadline exceeded", err)
+	}
+}
+
+func TestWaitForDashboardHonorsParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := waitForDashboard(ctx, "http://localhost:1", time.Second)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForDashboard error = %v, want context canceled", err)
 	}
 }

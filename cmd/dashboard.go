@@ -55,19 +55,23 @@ func dashboardResponding(ctx context.Context, url string) error {
 }
 
 func waitForDashboard(ctx context.Context, url string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	var lastErr error
-	for time.Now().Before(deadline) {
-		if lastErr = dashboardResponding(ctx, url); lastErr == nil {
+	for {
+		if lastErr = dashboardResponding(pollCtx, url); lastErr == nil {
 			return nil
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-pollCtx.Done():
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return lastErr
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	return lastErr
 }
 
 func openDashboard(ctx context.Context, url string) error {
