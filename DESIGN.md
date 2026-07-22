@@ -62,7 +62,7 @@ An always-on local web page — its own port per channel, served over the dev ce
 
 - `shunt init` — build Caddy, install the always-on Caddy + dashboard LaunchAgents, start the runtime.
 - `shunt app add` — register the repo's `.shunt.app.json` contract: front-door routes, runner, data volumes, guest size.
-- `shunt new <name>` — a siding: a git worktree off HEAD, copy-on-write data clones, and an idle guest (fast, no build).
+- `shunt new <name>` — a siding: a git worktree on its own branch, copy-on-write data clones, and an idle guest (fast, no build). Ordinary repos start from the current HEAD. If HEAD is a GitButler internal workspace ref, shunt starts from the configured default branch on `origin` instead. `--branch` explicitly chooses another starting point; `--from` continues an existing remote branch.
 - `shunt up <name>` — build + start the app in the guest, then bridge and point the front door. `--no-bridge` starts it in the guest only so you can confirm it works before going live; `--no-switch` bridges without repointing the front door.
 - `shunt switch <name>` — repoint the front door at a siding (the instant rebind).
 - `shunt restart <name>` — stop + start the app in the guest with the environment preserved.
@@ -74,7 +74,7 @@ An always-on local web page — its own port per channel, served over the dev ce
 
 ## Gotchas worth remembering
 
-- **Worktrees work now.** The first sketch ruled them out because they share the host network. Inside a per-siding container that no longer applies: each worktree runs in its own guest, so the fixed ports don't collide, and a worktree off HEAD is cheaper than a full clone and signs with the repo's usual key.
+- **Worktrees work now.** The first sketch ruled them out because they share the host network. Inside a per-siding container that no longer applies: each worktree runs in its own guest, so the fixed ports don't collide, and a worktree is cheaper than a full clone and signs with the repo's usual key. Worktrees still share the repo's Git metadata, though. In a GitButler-backed repo, shunt avoids attaching a new siding to GitButler's mutable workspace commit by starting it from `origin`'s configured default branch.
 - **Hot reload across the VM boundary.** Apple `container` is a lightweight VM, so host→guest inotify events don't always propagate; `DOTNET_USE_POLLING_FILE_WATCHER=1` makes `dotnet watch` poll instead of waiting on them.
 - **The dev cert has to be trusted *inside* the guest.** Linux has no per-user trust store, so shunt exports the generated ASP.NET dev cert into the guest's `ca-certificates` bundle. Skip that and service-to-service HTTPS health checks fail with "the SSL connection could not be established," and everything that waits on them hangs.
 - **A guest's IP changes when it restarts.** A live siding that restarts drifts until the next switch; `shunt status` flags it and `--fix` re-points.
