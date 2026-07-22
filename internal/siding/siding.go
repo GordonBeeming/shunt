@@ -105,6 +105,13 @@ func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (
 	}
 
 	mounts := []container.Mount{{Host: src, Guest: "/workspace"}}
+	// Standing per-siding output dir — recordings/logs land here, outside the
+	// worktree so they're never committable.
+	outDir := filepath.Join(filepath.Dir(src), "out")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return state.Siding{}, err
+	}
+	mounts = append(mounts, container.Mount{Host: outDir, Guest: "/out"})
 	// Copy-on-write each declared data volume from the project baseline (cp -c,
 	// instant + shares blocks) and bind-mount it at /mnt/dvol/<vol>; `up` then
 	// points a guest Docker volume at it so Aspire mounts the host's test data.
@@ -1263,6 +1270,14 @@ func Recreate(ctx context.Context, app state.App, sd state.Siding, freshData boo
 		return sd, err
 	}
 	mounts := []container.Mount{{Host: src, Guest: "/workspace"}}
+	// Standing per-siding output dir — recordings/logs land here, outside the
+	// worktree so they're never committable. MkdirAll heals sidings created
+	// before this directory existed.
+	outDir := filepath.Join(filepath.Dir(src), "out")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return sd, err
+	}
+	mounts = append(mounts, container.Mount{Host: outDir, Guest: "/out"})
 	for _, vol := range app.Volumes {
 		host := filepath.Join(volRoot, vol)
 		// --fresh-data: reset this volume to the project baseline while the worktree
