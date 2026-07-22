@@ -60,13 +60,10 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends fonts-liberation fonts-noto-color-emoji \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# certutil for trusting the ASP.NET dev cert into Chromium's NSS database —
-# Chromium reads trust from sql:$HOME/.pki/nssdb, not the system CA bundle,
-# so this only provides the tool; the entrypoint does the per-guest import
-# once the dev cert exists (see shunt-entrypoint.sh). Kept even though it
-# isn't sufficient on its own (next block) — it's harmless, helps any
-# non-Chromium NSS consumer, and future-proofs against a Chromium that
-# starts honouring leaf trust anchors again.
+# certutil imports the ASP.NET dev cert into the NSS database for non-Chromium
+# consumers. The entrypoint does that once the dev cert exists (see
+# shunt-entrypoint.sh). Chromium does not accept this self-signed leaf through
+# NSS, so its localhost handling is configured separately below.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libnss3-tools \
  && apt-get clean && rm -rf /var/lib/apt/lists/*

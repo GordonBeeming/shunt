@@ -103,10 +103,8 @@ func newPlaywrightCmd() *cobra.Command {
 			if term.IsTerminal(int(os.Stdin.Fd())) {
 				execArgs = append(execArgs, "-t")
 			}
-			execArgs = append(execArgs,
-				"-e", pwOutputDirEnv+"="+pwOutputDir,
-				"-e", pwSandboxEnv+"=false",
-				sd.Container, "sh", "-c", `cd "$1" && shift && exec playwright-cli "$@"`, "sh", wd)
+			script := fmt.Sprintf(`cd "$1" && shift && exec env %s=%s %s=false playwright-cli "$@"`, pwOutputDirEnv, pwOutputDir, pwSandboxEnv)
+			execArgs = append(execArgs, sd.Container, "sh", "-c", script, "sh", wd)
 			execArgs = append(execArgs, rest...)
 			return proc.RunPassthrough(ctx, container.Bin, execArgs...)
 		},

@@ -33,11 +33,10 @@ dotnet dev-certs https >/dev/null 2>&1 || true
 if dotnet dev-certs https --export-path /usr/local/share/ca-certificates/aspnetcore-dev.crt --format PEM --no-password >/dev/null 2>&1; then
   update-ca-certificates >/dev/null 2>&1 || true
 
-  # Chromium reads trust from its own NSS database (sql:$HOME/.pki/nssdb via
-  # certutil), not the system CA bundle just updated above, so the same cert
-  # gets a second, separate import here for any non-Chromium NSS consumer in
-  # the guest. This alone does NOT make Chromium accept the cert: the dev
-  # cert is a self-signed leaf (not a CA), and Chromium's builtin verifier
+  # Some non-Chromium clients read trust from the NSS database
+  # (sql:$HOME/.pki/nssdb via certutil), not the system CA bundle just updated
+  # above, so import the same cert there too. This does NOT make Chromium
+  # accept the dev cert: it is a self-signed leaf (not a CA), and Chromium's builtin verifier
   # requires CA:true on a trust anchor regardless of NSS trust flags — the
   # baked playwright-cli config's `--allow-insecure-localhost` launch arg is
   # what actually waives cert errors for Chromium, scoped to localhost
@@ -48,10 +47,10 @@ if dotnet dev-certs https --export-path /usr/local/share/ca-certificates/aspnetc
   if [ ! -f "$HOME/.pki/nssdb/cert9.db" ]; then
     mkdir -p "$HOME/.pki/nssdb"
     certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password </dev/null >/dev/null 2>&1 \
-      || echo "shunt-entrypoint: warning: could not initialize NSS database for Chromium cert trust" >&2
+      || echo "shunt-entrypoint: warning: could not initialize NSS certificate database" >&2
   fi
   certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n aspnetcore-dev -i /usr/local/share/ca-certificates/aspnetcore-dev.crt </dev/null >/dev/null 2>&1 \
-    || echo "shunt-entrypoint: warning: could not trust dev cert in Chromium's NSS database" >&2
+    || echo "shunt-entrypoint: warning: could not trust dev cert in NSS certificate database" >&2
 fi
 
 echo "shunt-entrypoint: dockerd ready; launching command: $*"
