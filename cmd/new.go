@@ -14,7 +14,7 @@ func newNewCmd() *cobra.Command {
 	var branch, from string
 	c := &cobra.Command{
 		Use:   "new <name>",
-		Short: "Create a siding: a worktree + an idle guest (does NOT start the app — use `"+bin()+" up`)",
+		Short: "Create a siding: a worktree + an idle guest (does NOT start the app — use `" + bin() + " up`)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -65,7 +65,7 @@ func newNewCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&branch, "branch", "", "fork a new siding branch off this start point (branch/commit; default: current HEAD)")
+	c.Flags().StringVar(&branch, "branch", "", "fork a new siding branch off this start point (branch/commit; default: current HEAD, or origin's default branch for GitButler workspaces)")
 	c.Flags().StringVar(&from, "from", "", "create the siding ON an existing remote branch (fetched + tracked), so commits push back to it")
 	return c
 }

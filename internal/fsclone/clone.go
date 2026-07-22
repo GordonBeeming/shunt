@@ -7,21 +7,24 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
 )
 
 // AddWorktree creates a git worktree of repoPath at dest, on a fresh branch
-// (newBranch) based on baseBranch. baseBranch defaults to HEAD — the repo's
-// CURRENT state — which for a GitButler repo is the workspace commit (all applied
-// virtual branches merged), i.e. the code you're actually working on. Basing off
-// a long-lived branch like `main` would run stale code, since GitButler only
-// advances main on integrate/push. The new branch is a frozen snapshot, so
-// GitButler's later workspace rewrites don't affect it; it inherits the repo's
-// signing config, and GitButler ignores extra worktrees on their own branches.
+// (newBranch) based on baseBranch. An explicit baseBranch is always honoured.
+// An implicit base normally uses HEAD, except when HEAD is GitButler's volatile
+// workspace branch: refs created at that commit can be advanced by later
+// GitButler workspace rewrites, so the siding starts from origin's default
+// branch instead.
 func AddWorktree(ctx context.Context, repoPath, dest, newBranch, baseBranch string) error {
 	if baseBranch == "" {
-		baseBranch = "HEAD"
+		var err error
+		baseBranch, err = implicitWorktreeBase(ctx, repoPath)
+		if err != nil {
+			return err
+		}
 	}
 	// Clear any existing worktree at this path first — a previous siding of this
 	// name, or a half-finished `new` that failed after creating the worktree,
@@ -37,6 +40,53 @@ func AddWorktree(ctx context.Context, repoPath, dest, newBranch, baseBranch stri
 	if _, err := proc.Run(ctx, "git", "-C", repoPath,
 		"worktree", "add", "--force", "-B", newBranch, dest, baseBranch); err != nil {
 		return fmt.Errorf("git worktree add (base %q): %w", baseBranch, err)
+	}
+	return nil
+}
+
+func implicitWorktreeBase(ctx context.Context, repoPath string) (string, error) {
+	head, err := proc.Run(ctx, "git", "-C", repoPath, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		// Exit 1 means HEAD is detached, where the existing HEAD behaviour is still
+		// correct. Other failures indicate a repository problem worth reporting.
+		if head.ExitCode == 1 {
+			return "HEAD", nil
+		}
+		return "", fmt.Errorf("inspect repository HEAD: %w", err)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(head.Stdout), "refs/heads/gitbutler/") {
+		return "HEAD", nil
+	}
+
+	remoteHead, err := proc.Run(ctx, "git", "-C", repoPath,
+		"symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+	if err == nil {
+		base := strings.TrimSpace(remoteHead.Stdout)
+		if !strings.HasPrefix(base, "origin/") || base == "origin/" {
+			return "", fmt.Errorf("origin/HEAD resolved to unexpected ref %q", base)
+		}
+		if err := verifyCommit(ctx, repoPath, base); err != nil {
+			return "", fmt.Errorf("resolve GitButler siding base %q: %w", base, err)
+		}
+		return base, nil
+	}
+	if remoteHead.ExitCode != 1 {
+		return "", fmt.Errorf("resolve origin/HEAD for GitButler siding: %w", err)
+	}
+
+	// Clones occasionally lack origin/HEAD. origin/main is a safe conventional
+	// fallback only when it actually exists; never fall back to volatile HEAD.
+	const fallback = "origin/main"
+	if err := verifyCommit(ctx, repoPath, fallback); err != nil {
+		return "", fmt.Errorf("GitButler workspace HEAD requires origin/HEAD (or %s); configure the remote default or pass --branch: %w", fallback, err)
+	}
+	return fallback, nil
+}
+
+func verifyCommit(ctx context.Context, repoPath, ref string) error {
+	if _, err := proc.Run(ctx, "git", "-C", repoPath,
+		"rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
+		return fmt.Errorf("verify commit ref %q: %w", ref, err)
 	}
 	return nil
 }

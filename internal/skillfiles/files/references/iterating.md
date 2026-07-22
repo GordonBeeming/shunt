@@ -53,16 +53,20 @@ This is a common miss: a siding built before the edit keeps running the **old** 
 
 `scripts/status.sh` wraps this and prints the recommended next command.
 
-## Pulling `main` into a siding — `shunt sync`
+## Pulling the default branch into a siding — `shunt sync`
 
-A siding starts off the repo HEAD on its own `shunt/<name>` branch. When it's drifted
-behind, pull the latest default branch into it:
+A siding has its own branch. In an ordinary repo, a default `shunt new` starts from the
+current HEAD. If HEAD is a GitButler internal workspace ref, it starts from `origin`'s
+configured default branch instead, avoiding GitButler's mutable workspace commit.
+`--branch <ref>` explicitly chooses another starting point; `--from <branch>` fetches
+and continues an existing remote branch. When the siding has drifted behind, pull the
+latest default branch into it:
 
-- `shunt-dev sync` — `fetch origin` then **merge** `origin/main` (auto-detected from
+- `shunt-dev sync` — `fetch origin` then **merge** `origin/<default-branch>` (auto-detected from
   `origin/HEAD`) into the current siding's branch: a non-rewriting merge that keeps the
   siding's history intact (the safe default). `--rebase` rebases onto it instead
   (rewrites history); `--all` syncs every siding; `--from <branch>` targets a branch
-  other than main.
+  other than the default.
 - **On conflicts** it stops and lists the conflicted files. Resolve them in the
   worktree through the full `shunt-dev git` pass-through, then finish the merge:
 
