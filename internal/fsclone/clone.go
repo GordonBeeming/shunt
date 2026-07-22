@@ -86,7 +86,7 @@ func implicitWorktreeBase(ctx context.Context, repoPath string) (string, error) 
 func verifyCommit(ctx context.Context, repoPath, ref string) error {
 	if _, err := proc.Run(ctx, "git", "-C", repoPath,
 		"rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
-		return err
+		return fmt.Errorf("verify commit ref %q: %w", ref, err)
 	}
 	return nil
 }

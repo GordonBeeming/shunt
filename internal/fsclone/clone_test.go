@@ -63,6 +63,18 @@ func TestAddWorktreeExplicitBaseWinsInGitButlerRepo(t *testing.T) {
 	}
 }
 
+func TestVerifyCommitNamesMissingRef(t *testing.T) {
+	repo, _, _ := newWorktreeTestRepo(t)
+
+	err := verifyCommit(context.Background(), repo, "origin/missing")
+	if err == nil {
+		t.Fatal("verifyCommit() error = nil, want missing ref error")
+	}
+	if !strings.Contains(err.Error(), `verify commit ref "origin/missing"`) {
+		t.Fatalf("verifyCommit() error = %q, want ref-specific message", err)
+	}
+}
+
 func newWorktreeTestRepo(t *testing.T) (repo, mainCommit, workspaceCommit string) {
 	t.Helper()
 	repo = filepath.Join(t.TempDir(), "repo")
