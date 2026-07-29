@@ -157,3 +157,88 @@ func CloneVolume(ctx context.Context, src, dest string) error {
 	}
 	return nil
 }
+
+// CloneVolumeSet creates a complete copy-on-write volume root before replacing
+// destination, so callers never expose a mixture of old and reset volumes.
+func CloneVolumeSet(ctx context.Context, sourceRoot, destinationRoot string, volumes []string) error {
+	if err := validateVolumeNames(volumes); err != nil {
+		return err
+	}
+	parent := filepath.Dir(destinationRoot)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return fmt.Errorf("create volume root parent: %w", err)
+	}
+	stage, err := os.MkdirTemp(parent, ".volumes-stage-")
+	if err != nil {
+		return fmt.Errorf("create volume stage: %w", err)
+	}
+	defer os.RemoveAll(stage)
+
+	for _, volume := range volumes {
+		source := filepath.Join(sourceRoot, volume)
+		destination := filepath.Join(stage, volume)
+		if _, err := os.Stat(source); err != nil {
+			if !os.IsNotExist(err) {
+				return fmt.Errorf("stat source volume %q: %w", volume, err)
+			}
+			if err := os.MkdirAll(destination, 0o755); err != nil {
+				return fmt.Errorf("create empty volume %q: %w", volume, err)
+			}
+			continue
+		}
+		if err := CloneVolume(ctx, source, destination); err != nil {
+			return fmt.Errorf("clone volume %q: %w", volume, err)
+		}
+	}
+
+	if err := validateVolumeRoot(stage, volumes); err != nil {
+		return err
+	}
+	if _, err := os.Stat(destinationRoot); os.IsNotExist(err) {
+		if err := os.Rename(stage, destinationRoot); err != nil {
+			return fmt.Errorf("install volume root: %w", err)
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("stat destination volume root: %w", err)
+	}
+
+	if err := renameSwap(stage, destinationRoot); err != nil {
+		return fmt.Errorf("swap volume root: %w", err)
+	}
+	if err := os.RemoveAll(stage); err != nil {
+		return fmt.Errorf("volume root committed but remove replaced root: %w", err)
+	}
+	return nil
+}
+
+func validateVolumeNames(volumes []string) error {
+	seen := make(map[string]struct{}, len(volumes))
+	for _, volume := range volumes {
+		if volume == "" || volume == "." || volume == ".." || filepath.Base(volume) != volume {
+			return fmt.Errorf("unsafe data volume name %q", volume)
+		}
+		if _, exists := seen[volume]; exists {
+			return fmt.Errorf("duplicate data volume name %q", volume)
+		}
+		seen[volume] = struct{}{}
+	}
+	return nil
+}
+
+func validateVolumeRoot(root string, volumes []string) error {
+	for _, volume := range volumes {
+		info, err := os.Stat(filepath.Join(root, volume))
+		if err != nil {
+			return fmt.Errorf("validate volume %q: %w", volume, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("validate volume %q: not a directory", volume)
+		}
+	}
+	return nil
+}
+
+func renameSwap(from, to string) error {
+	return renamexSwap(from, to)
+}

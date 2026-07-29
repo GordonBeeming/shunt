@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/container"
-	"github.com/gordonbeeming/shunt/internal/hostdocker"
+	"github.com/gordonbeeming/shunt/internal/imagecache"
 	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
@@ -20,10 +20,9 @@ func newWarmCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "warm",
 		Short: "Build the project's dependency-image cache so sidings never pull from the network",
-		Long: "The host Docker daemon is the canonical cache. By default `warm` ensures the images declared in " +
-			"`.shunt.app.json` (prebakeImages) are on the host — pulling only what's missing, the one shared network " +
-			"call — then saves them into a per-project tar that every siding loads. Offline-friendly: if the host " +
-			"already has them, no network is touched. Use --from <siding> to instead capture whatever a running " +
+		Long: "Build a daemon-free cache from the images declared in `.shunt.app.json` (prebakeImages). " +
+			"`warm` always refreshes configured refs from their registries, then writes a per-project Docker archive " +
+			"that every siding loads. Use --from <siding> to instead capture whatever a running " +
 			"siding built/pulled (handy before prebakeImages are declared).",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -42,27 +41,21 @@ func newWarmCmd() *cobra.Command {
 			if len(app.PrebakeImages) == 0 {
 				return fmt.Errorf("no `prebakeImages` in .shunt.app.json — declare the dependency images, or use --from <siding> to capture from a running siding")
 			}
-			if !hostdocker.Available(ctx) {
-				return fmt.Errorf("no host Docker daemon reachable — use --from <siding> to capture from a guest instead")
-			}
-
-			fmt.Printf("• ensuring %d dependency image(s) in the host cache…\n", len(app.PrebakeImages))
-			pulled, err := hostdocker.Ensure(ctx, app.PrebakeImages)
+			fmt.Printf("• refreshing %d dependency image(s)…\n", len(app.PrebakeImages))
+			changes, err := imagecache.Refresh(ctx, tar, app.PrebakeImages)
 			if err != nil {
 				return err
 			}
-			if len(pulled) > 0 {
-				fmt.Printf("  pulled %d (the only network call): %s\n", len(pulled), strings.Join(pulled, ", "))
-			} else {
-				fmt.Println("  all already present — no network needed")
-			}
-
-			fmt.Println("• saving from host into the project cache…")
-			if err := hostdocker.Save(ctx, app.PrebakeImages, tar); err != nil {
-				return err
+			for _, change := range changes {
+				switch change.Action {
+				case "updated":
+					fmt.Printf("  updated %s: %s → %s\n", change.Ref, change.PreviousDigest, change.Digest)
+				default:
+					fmt.Printf("  %s %s: %s\n", change.Action, change.Ref, change.Digest)
+				}
 			}
 			fi, _ := os.Stat(tar)
-			fmt.Printf("%s warmed from host: %s (%.1f GB). New sidings `docker load` this — no pull.\n",
+			fmt.Printf("%s warmed: %s (%.1f GB). New sidings `docker load` this — no pull.\n",
 				tick(), tar, float64(fi.Size())/1e9)
 			return nil
 		},
@@ -102,7 +95,9 @@ func warmFromGuest(ctx context.Context, app state.App, src, tar string) error {
 		fmt.Printf("    %s\n", im)
 	}
 	saveArgs := append([]string{"exec", guest, "docker", "save"}, imgs...)
-	if err := proc.RunToFile(ctx, tar, "container", saveArgs...); err != nil {
+	if err := imagecache.Capture(tar, func(temp string) error {
+		return proc.RunToFile(ctx, temp, "container", saveArgs...)
+	}); err != nil {
 		return fmt.Errorf("docker save → %s: %w", tar, err)
 	}
 	fi, _ := os.Stat(tar)

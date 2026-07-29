@@ -75,6 +75,32 @@ func TestVerifyCommitNamesMissingRef(t *testing.T) {
 	}
 }
 
+func TestCloneVolumeSetReplacesWholeRoot(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "baseline")
+	destination := filepath.Join(root, "siding", "vol")
+	writeTestFile(t, filepath.Join(source, "db"), "value", "new db")
+	writeTestFile(t, filepath.Join(source, "cache"), "value", "new cache")
+	writeTestFile(t, filepath.Join(destination, "db"), "value", "old db")
+	writeTestFile(t, filepath.Join(destination, "cache"), "value", "old cache")
+
+	if err := CloneVolumeSet(context.Background(), source, destination, []string{"db", "cache"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct{ volume, want string }{{"db", "new db"}, {"cache", "new cache"}} {
+		got, err := os.ReadFile(filepath.Join(destination, test.volume, "value"))
+		if err != nil || string(got) != test.want {
+			t.Fatalf("%s = %q, %v; want %q", test.volume, got, err, test.want)
+		}
+	}
+}
+
+func TestCloneVolumeSetRejectsUnsafeNames(t *testing.T) {
+	if err := CloneVolumeSet(context.Background(), t.TempDir(), filepath.Join(t.TempDir(), "dest"), []string{"../db"}); err == nil {
+		t.Fatal("CloneVolumeSet() error = nil")
+	}
+}
+
 func newWorktreeTestRepo(t *testing.T) (repo, mainCommit, workspaceCommit string) {
 	t.Helper()
 	repo = filepath.Join(t.TempDir(), "repo")
@@ -104,6 +130,9 @@ func newWorktreeTestRepo(t *testing.T) (repo, mainCommit, workspaceCommit string
 
 func writeTestFile(t *testing.T, dir, name, contents string) {
 	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o644); err != nil {
 		t.Fatal(err)
 	}
