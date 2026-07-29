@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/gordonbeeming/shunt/internal/state"
 )
 
 func TestParseCleanupSelection(t *testing.T) {
@@ -137,6 +139,32 @@ func TestWorktreeHasChangesAllowsMissingWorktree(t *testing.T) {
 	}
 	if dirty {
 		t.Fatal("missing worktree reported as dirty")
+	}
+}
+
+func TestSidingBaseRejectsPathsOutsideConfigDir(t *testing.T) {
+	configDir := filepath.Join(t.TempDir(), "project")
+	tests := []struct {
+		name    string
+		siding  string
+		wantErr bool
+	}{
+		{name: "direct child", siding: "feature", wantErr: false},
+		{name: "config dir itself", siding: ".", wantErr: true},
+		{name: "parent", siding: "..", wantErr: true},
+		{name: "outside config dir", siding: filepath.Join("..", "other-project", "feature"), wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := sidingBase(state.App{ConfigDir: configDir}, test.siding)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("sidingBase(%q) error = %v, wantErr %v", test.siding, err, test.wantErr)
+			}
+			if !test.wantErr && got != filepath.Join(configDir, test.siding) {
+				t.Fatalf("sidingBase(%q) = %q, want %q", test.siding, got, filepath.Join(configDir, test.siding))
+			}
+		})
 	}
 }
 

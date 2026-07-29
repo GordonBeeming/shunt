@@ -161,3 +161,17 @@ func removeSiding(ctx context.Context, app *state.App, name string) error {
 	fmt.Printf("%s removed %q\n", tick(), name)
 	return nil
 }
+
+func sidingBase(app state.App, name string) (string, error) {
+	configDir := filepath.Clean(app.ConfigDir)
+	if !filepath.IsAbs(configDir) {
+		return "", fmt.Errorf("refusing to remove siding %q with unsafe config dir %q", name, app.ConfigDir)
+	}
+
+	base := filepath.Clean(filepath.Join(configDir, name))
+	rel, err := filepath.Rel(configDir, base)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("refusing to remove unsafe siding dir %q (config dir %q)", base, configDir)
+	}
+	return base, nil
+}
