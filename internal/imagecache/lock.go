@@ -19,40 +19,68 @@ type storeLock struct {
 }
 
 func acquireStoreLock(ctx context.Context, path string) (*storeLock, error) {
+	return acquireCacheFileLock(ctx, path+".lock", "image cache", unix.LOCK_EX)
+}
+
+func acquireCacheFileLock(ctx context.Context, lockPath, description string, mode int) (*storeLock, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create image cache parent: %w", err)
 	}
-	lockPath := path + ".lock"
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("open image cache lock: %w", err)
+		return nil, fmt.Errorf("open %s lock: %w", description, err)
 	}
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
-		return nil, fmt.Errorf("chmod image cache lock: %w", err)
+		return nil, fmt.Errorf("chmod %s lock: %w", description, err)
 	}
 
 	ticker := time.NewTicker(lockPollInterval)
 	defer ticker.Stop()
 	for {
-		err = unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		err = unix.Flock(int(file.Fd()), mode|unix.LOCK_NB)
 		if err == nil {
 			return &storeLock{file: file}, nil
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
 			_ = file.Close()
-			return nil, fmt.Errorf("lock image cache: %w", err)
+			return nil, fmt.Errorf("lock %s: %w", description, err)
 		}
 		select {
 		case <-ctx.Done():
 			_ = file.Close()
-			return nil, fmt.Errorf("wait for image cache lock: %w", ctx.Err())
+			return nil, fmt.Errorf("wait for %s lock: %w", description, ctx.Err())
 		case <-ticker.C:
 		}
 	}
+}
+
+// withCacheUpdateLock serializes cache producers without blocking readers of
+// the current immutable generation. A second cold-start waits here, then
+// snapshots and reuses the generation published by the first instead of
+// downloading/building the same sources and losing a publication race.
+func withCacheUpdateLock(ctx context.Context, path string, fn func() error) (retErr error) {
+	lock, err := acquireCacheFileLock(ctx, path+".update.lock", "image cache update", unix.LOCK_EX)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, lock.close()) }()
+	return fn()
+}
+
+// withCacheSweepLock coordinates publishers with GC. Publishers hold it
+// shared only around adoption/publication; collection holds it exclusively
+// while scanning and deleting immutable objects, leaving ordinary readers free.
+func withCacheSweepLock(ctx context.Context, path string, mode int, fn func() error) (retErr error) {
+	lock, err := acquireCacheFileLock(ctx, path+".sweep.lock", "image cache sweep", mode)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, lock.close()) }()
+	return fn()
 }
 
 func (lock *storeLock) close() error {
@@ -71,12 +99,7 @@ func withStoreLock(ctx context.Context, path string, initialize bool, fn func() 
 	if err := ensureStoreRoot(path, initialize); err != nil {
 		return err
 	}
-	if err := repairStorePermissions(path); err != nil {
-		return err
-	}
-	err = fn()
-	repairErr := repairStorePermissions(path)
-	return errors.Join(err, repairErr)
+	return fn()
 }
 
 func ensureStoreRoot(path string, initialize bool) error {
@@ -115,7 +138,10 @@ func ensureStoreRoot(path string, initialize bool) error {
 	return nil
 }
 
-func repairStorePermissions(root string) error {
+// RepairPermissions is an explicit recovery operation for stores created by
+// older builds or modified outside shunt. Ordinary cache operations set modes
+// as they create or touch objects and must not walk historical generations.
+func RepairPermissions(root string) error {
 	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr

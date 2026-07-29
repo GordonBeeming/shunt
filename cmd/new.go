@@ -2,11 +2,9 @@ package cmd
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/siding"
-	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 )
 
@@ -19,8 +17,8 @@ func newNewCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			name := args[0]
-			if name == state.HostTarget {
-				return fmt.Errorf("%q is reserved — it's the switch target for your local copy; pick another siding name", name)
+			if err := siding.ValidateName(name); err != nil {
+				return err
 			}
 			if from != "" && branch != "" {
 				return fmt.Errorf("--from and --branch are mutually exclusive: --from continues an existing branch, --branch forks a new siding branch off a start point")
@@ -36,12 +34,6 @@ func newNewCmd() *cobra.Command {
 				return err
 			}
 
-			// One-time per project: extract declared host data volumes to APFS
-			// baselines so Spin can cp -c an instant copy-on-write clone per siding.
-			if err := siding.EnsureVolumeBaselines(ctx, app); err != nil {
-				return err
-			}
-
 			if from != "" {
 				fmt.Printf("• creating worktree from existing branch %q + launching idle guest for %q…\n", from, name)
 			} else {
@@ -51,17 +43,14 @@ func newNewCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			sd.CreatedAt = time.Now().Format(time.RFC3339)
-			app.Sidings[name] = sd
-			if err := state.SaveApp(app); err != nil {
+			src, _, err := siding.Paths(app, name)
+			if err != nil {
 				return err
 			}
-
-			src, _ := siding.Paths(app, name)
-			fmt.Printf("%s siding %q ready — guest is up, Aspire is NOT started yet.\n", tick(), name)
+			fmt.Printf("%s siding %q ready — guest Docker is prepared; the application is not started.\n", tick(), name)
 			fmt.Printf("  edit code here:  %s\n", src)
 			fmt.Printf("  on branch:       %s\n", sd.Branch)
-			fmt.Printf("  run it:          "+bin()+" up %s   (builds + starts Aspire, then points the front door at it)\n", name)
+			fmt.Printf("  run it:          "+bin()+" up %s   (builds + starts the application; use switch to go live)\n", name)
 			return nil
 		},
 	}

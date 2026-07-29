@@ -230,7 +230,7 @@ func redact(err error) error {
 
 var (
 	urlUserInfo  = regexp.MustCompile(`(?i)(https?://)[^/@\s]+:[^/@\s]+@`)
-	jsonSecret   = regexp.MustCompile(`(?i)("(?:password|passwd|token|access_token|refresh_token|identitytoken|registrytoken|authorization|secret|auth)"\s*:\s*)"[^"]*"`)
-	namedSecret  = regexp.MustCompile(`(?i)\b(password|passwd|token|access_token|refresh_token|identitytoken|registrytoken|authorization|secret|auth)(\s*[=:]\s*)(?:bearer\s+|basic\s+)?[^\s,;&}]+`)
+	jsonSecret   = regexp.MustCompile(`(?i)("(?:password|passwd|token|access_token|refresh_token|identitytoken|registrytoken|client[_-]?secret|clientsecret|authorization|secret|auth)"\s*:\s*)"[^"]*"`)
+	namedSecret  = regexp.MustCompile(`(?i)\b(password|passwd|token|access_token|refresh_token|identitytoken|registrytoken|client[_-]?secret|clientsecret|authorization|secret|auth)(\s*[=:]\s*)(?:bearer\s+|basic\s+)?[^\s,;&}]+`)
 	bearerSecret = regexp.MustCompile(`(?i)\b(bearer|basic)\s+[a-z0-9._~+/=-]+`)
 )

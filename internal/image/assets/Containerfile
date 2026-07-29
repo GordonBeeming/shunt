@@ -4,7 +4,7 @@
 # `dcp` binary (aspire.hosting.orchestration.linux-arm64) that fails on musl with
 # "No such file or directory". The official .NET SDK image is Debian (glibc), so
 # we start there and add the Docker engine for Aspire's in-guest container deps.
-FROM golang:1.26.5-bookworm AS shunt-tools
+FROM golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS shunt-tools
 
 WORKDIR /src
 COPY docker-api-admission.mod ./go.mod
@@ -18,7 +18,7 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0
 # Docker engine (dockerd + CLI + containerd) via Docker's official install
 # script, plus iptables which dockerd needs for its bridge networking.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl iptables uidmap socat \
+ && apt-get install -y --no-install-recommends ca-certificates curl iptables uidmap socat util-linux \
  && curl -fsSL https://get.docker.com | sh \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*

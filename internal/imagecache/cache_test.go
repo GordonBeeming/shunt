@@ -1,7 +1,9 @@
 package imagecache
 
 import (
+	stdtar "archive/tar"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -67,7 +69,9 @@ func TestAssureUsesCurrentGenerationWithoutRegistryAndPlansChanges(t *testing.T)
 	if len(full.Images) != 1 || full.Images[0].Ref != one.Name() || full.Images[0].Path == "" {
 		t.Fatalf("full plan = %#v", full)
 	}
-	noOp, err := Plan(context.Background(), path, GuestState{Marker: full.Marker, ImageIDs: full.Marker.Images})
+	observed := "sha256:" + strings.Repeat("1", 64)
+	loadedMarker := GuestMarker{Generation: full.Generation, Images: map[string]string{one.Name(): observed}, Digests: full.Marker.Digests}
+	noOp, err := Plan(context.Background(), path, GuestState{Marker: loadedMarker, ImageIDs: map[string]string{one.Name(): observed}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,6 +171,8 @@ func TestChangedTagPublishesNewGenerationAndPlanLoadsOnlyChangedRef(t *testing.T
 	}
 	before, _ := Inspect(context.Background(), path)
 	marker := markerFor(before)
+	marker.Images[one.Name()] = "sha256:" + strings.Repeat("3", 64)
+	marker.Images[two.Name()] = "sha256:" + strings.Repeat("4", 64)
 	images[one.Name()] = updated
 
 	changes, err := Refresh(context.Background(), path, []string{one.Name(), two.Name()})
@@ -189,6 +195,118 @@ func TestChangedTagPublishesNewGenerationAndPlanLoadsOnlyChangedRef(t *testing.T
 	}
 }
 
+func TestCollectPreservesLeasedGenerationThenReclaimsIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	ref := mustRef(t, "example.test/gc:latest")
+	images := map[string]v1.Image{ref.Name(): mustImage(t, 75)}
+	installFetcher(t, images)
+	if _, err := Assure(context.Background(), path, []string{ref.Name()}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := Plan(context.Background(), path, GuestState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	images[ref.Name()] = mustImage(t, 76)
+	if _, err := Refresh(context.Background(), path, []string{ref.Name()}); err != nil {
+		t.Fatal(err)
+	}
+	images[ref.Name()] = mustImage(t, 77)
+	if _, err := Refresh(context.Background(), path, []string{ref.Name()}); err != nil {
+		t.Fatal(err)
+	}
+	images[ref.Name()] = mustImage(t, 78)
+	if _, err := Refresh(context.Background(), path, []string{ref.Name()}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Collect(context.Background(), path, GCOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(generationPath(path, first.Generation)); err != nil {
+		t.Fatalf("leased generation was removed: %v", err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	result, err = Collect(context.Background(), path, GCOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ReclaimedBytes == 0 && len(result.Removed) == 0 {
+		t.Fatal("collection did not reclaim stale cache content")
+	}
+	if _, err := os.Stat(generationPath(path, first.Generation)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("released stale generation still exists: %v", err)
+	}
+	leasePath, err := generationLeasePath(path, first.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(leasePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("released stale generation lease still exists: %v", err)
+	}
+}
+
+func TestCollectSweepDoesNotBlockCurrentGenerationReaders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	ref := mustRef(t, "example.test/nonblocking-gc:latest")
+	images := map[string]v1.Image{ref.Name(): mustImage(t, 100)}
+	installFetcher(t, images)
+	if _, err := Assure(context.Background(), path, []string{ref.Name()}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := Plan(context.Background(), path, GuestState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for seed := int64(101); seed <= 102; seed++ {
+		images[ref.Name()] = mustImage(t, seed)
+		if _, err := Refresh(context.Background(), path, []string{ref.Name()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	collectDone := make(chan error, 1)
+	var once atomic.Bool
+	go func() {
+		_, err := Collect(context.Background(), path, GCOptions{Progress: func(string) {
+			if once.CompareAndSwap(false, true) {
+				close(started)
+				<-release
+			}
+		}})
+		collectDone <- err
+	}()
+	<-started
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := Inspect(context.Background(), path)
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Inspect blocked behind the cache sweep")
+	}
+	close(release)
+	if err := <-collectDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPlanReloadsCurrentMarkerWhenGuestImageIdentityIsWrong(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "images")
 	ref := mustRef(t, "example.test/identity:latest")
@@ -200,7 +318,9 @@ func TestPlanReloadsCurrentMarkerWhenGuestImageIdentityIsWrong(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	observed := "sha256:" + strings.Repeat("2", 64)
 	marker := markerFor(manifest)
+	marker.Images[ref.Name()] = observed
 	wrong := mustImage(t, 71)
 	wrongID, err := wrong.ConfigName()
 	if err != nil {
@@ -219,8 +339,8 @@ func TestPlanReloadsCurrentMarkerWhenGuestImageIdentityIsWrong(t *testing.T) {
 	}
 
 	matching, err := Plan(context.Background(), path, GuestState{
-		Marker:   GuestMarker{},
-		ImageIDs: map[string]string{ref.Name(): manifest.Images[0].ConfigDigest},
+		Marker:   marker,
+		ImageIDs: map[string]string{ref.Name(): observed},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +377,11 @@ func TestLocalBuildAssureBuildsMissingAndUnusableButRefreshAlwaysBuilds(t *testi
 				return err
 			}
 			defer file.Close()
-			return archive.Write(ref, img, file)
+			stageRef, err := name.NewTag(args[len(args)-1])
+			if err != nil {
+				return err
+			}
+			return archive.Write(stageRef, img, file)
 		}
 		return nil
 	})
@@ -265,11 +389,11 @@ func TestLocalBuildAssureBuildsMissingAndUnusableButRefreshAlwaysBuilds(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(changes) != 1 || changes[0].Action != "added" || len(calls) != 2 {
+	if len(changes) != 1 || changes[0].Action != "added" || len(calls) != 3 {
 		t.Fatalf("first local assure calls=%#v changes=%#v", calls, changes)
 	}
-	wantBuild := []string{"build", "--platform", "linux/arm64", "--build-arg", "ALPHA=first", "--build-arg", "ZED=last", "-t", ref.Name(), "-f", dockerfile, contextDir}
-	if strings.Join(calls[0], "\x00") != strings.Join(wantBuild, "\x00") {
+	wantBuild := []string{"build", "--platform", "linux/arm64", "--build-arg", "ALPHA=first", "--build-arg", "ZED=last", "-t", calls[0][8], "-f", dockerfile, contextDir}
+	if !strings.Contains(calls[0][8], "shunt-stage/") || strings.Join(calls[0], "\x00") != strings.Join(wantBuild, "\x00") {
 		t.Fatalf("build args = %#v, want %#v", calls[0], wantBuild)
 	}
 	firstManifest, err := Inspect(context.Background(), path)
@@ -295,7 +419,7 @@ func TestLocalBuildAssureBuildsMissingAndUnusableButRefreshAlwaysBuilds(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changes[0].Action != "updated" || len(calls) != 2 {
+	if changes[0].Action != "updated" || len(calls) != 3 {
 		t.Fatalf("changed local declaration was reused: calls=%#v changes=%#v", calls, changes)
 	}
 	changedManifest, err := Inspect(context.Background(), path)
@@ -322,8 +446,23 @@ func TestLocalBuildAssureBuildsMissingAndUnusableButRefreshAlwaysBuilds(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changes[0].Action != "unchanged" || len(calls) != 2 {
-		t.Fatalf("unusable local assure did not rebuild: calls=%#v changes=%#v", calls, changes)
+	if changes[0].Action != "unchanged" || len(calls) != 0 {
+		t.Fatalf("assure unexpectedly rebuilt before the load boundary: calls=%#v changes=%#v", calls, changes)
+	}
+	plan, err := Plan(context.Background(), path, GuestState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	if len(plan.Images) != 1 {
+		t.Fatalf("planned images = %d, want 1", len(plan.Images))
+	}
+	actualChecksum, err := fileDigest(plan.Images[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actualChecksum == plan.Images[0].Checksum {
+		t.Fatal("corrupt export retained its planned checksum")
 	}
 
 	calls = nil
@@ -331,7 +470,7 @@ func TestLocalBuildAssureBuildsMissingAndUnusableButRefreshAlwaysBuilds(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changes[0].Action != "unchanged" || len(calls) != 2 {
+	if changes[0].Action != "unchanged" || len(calls) != 3 {
 		t.Fatalf("local refresh did not rebuild: calls=%#v changes=%#v", calls, changes)
 	}
 }
@@ -403,7 +542,11 @@ func TestSourceProvenanceCompatibilityMatrix(t *testing.T) {
 				return err
 			}
 			defer file.Close()
-			return archive.Write(ref, localImage, file)
+			stageRef, err := name.NewTag(args[len(args)-1])
+			if err != nil {
+				return err
+			}
+			return archive.Write(stageRef, localImage, file)
 		}
 		return nil
 	})
@@ -415,7 +558,7 @@ func TestSourceProvenanceCompatibilityMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if containerCalls.Load() != 2 || changes[0].Action != "updated" || manifest.Images[0].SourceKind != sourceLocal {
+	if containerCalls.Load() != 3 || changes[0].Action != "updated" || manifest.Images[0].SourceKind != sourceLocal {
 		t.Fatalf("registry to local calls=%d changes=%#v source=%q", containerCalls.Load(), changes, manifest.Images[0].SourceKind)
 	}
 
@@ -433,17 +576,61 @@ func TestSourceProvenanceCompatibilityMatrix(t *testing.T) {
 	}
 }
 
-func TestStoreVersionOneIsRejected(t *testing.T) {
+func TestOlderStoreVersionsAreRejected(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("version-%d", version), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "images")
+			if err := os.MkdirAll(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			legacy := fmt.Sprintf(`{"version":%d,"generation":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`, version)
+			if err := os.WriteFile(filepath.Join(path, "index.json"), []byte(legacy), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Inspect(context.Background(), path); err == nil || !strings.Contains(err.Error(), "unsupported image cache index") {
+				t.Fatalf("legacy store error = %v", err)
+			}
+		})
+	}
+}
+
+func TestStagedImageAdoptionHardLinksImmutableObjects(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "images")
-	if err := os.MkdirAll(path, 0o700); err != nil {
+	ref := mustRef(t, "example.test/hard-link:latest")
+	stage, err := stageImage(path, ref, fetchedImage{
+		image:    mustImage(t, 81),
+		platform: v1.Platform{OS: "linux", Architecture: runtime.GOARCH},
+	}, sourceRegistry, "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	legacy := `{"version":1,"generation":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
-	if err := os.WriteFile(filepath.Join(path, "index.json"), []byte(legacy), 0o600); err != nil {
+	stagedExport, err := cacheRelativePath(stage.root, stage.record.Export)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Inspect(context.Background(), path); err == nil || !strings.Contains(err.Error(), "unsupported image cache index") {
-		t.Fatalf("legacy store error = %v", err)
+	stagedInfo, err := os.Stat(stagedExport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := withStoreLock(context.Background(), path, true, func() error {
+		return adoptStagedImage(path, &stage)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	liveExport, err := cacheRelativePath(path, stage.record.Export)
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveInfo, err := os.Stat(liveExport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(stagedInfo, liveInfo) {
+		t.Fatal("adoption copied the immutable export instead of hard-linking it")
+	}
+	stage.close()
+	if _, err := os.Stat(liveExport); err != nil {
+		t.Fatalf("live export did not survive private-stage cleanup: %v", err)
 	}
 }
 
@@ -480,6 +667,131 @@ func TestCaptureImportsAtomicallyAndInvalidCapturePreservesGeneration(t *testing
 	}
 	if leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".shunt-images-capture-*.tar")); len(leftovers) != 0 {
 		t.Fatalf("capture temps remain: %v", leftovers)
+	}
+}
+
+func TestCaptureAutomaticallyCollectsSupersededGenerations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	ref := mustRef(t, "example.test/capture-gc:latest")
+	var first string
+	for seed := int64(93); seed <= 95; seed++ {
+		img := mustImage(t, seed)
+		if err := Capture(path, func(temp string) error {
+			file, err := os.OpenFile(temp, os.O_WRONLY|os.O_TRUNC, 0o600)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			return archive.Write(ref, img, file)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		manifest, err := Inspect(context.Background(), path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first == "" {
+			first = manifest.Generation
+		}
+	}
+	if _, err := os.Stat(generationPath(path, first)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("superseded captured generation still exists: %v", err)
+	}
+}
+
+func TestRefreshReturnsCommittedCleanupErrorWithPublishedChanges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	ref := mustRef(t, "example.test/committed-cleanup:latest")
+	images := map[string]v1.Image{ref.Name(): mustImage(t, 96)}
+	installFetcher(t, images)
+	if _, err := Assure(context.Background(), path, []string{ref.Name()}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	images[ref.Name()] = mustImage(t, 97)
+	ctx, cancel := context.WithCancel(context.Background())
+	changes, err := RefreshSourcesProgress(ctx, path, []string{ref.Name()}, nil, func(event ProgressEvent) {
+		if event.Step == "stored" {
+			cancel()
+		}
+	})
+	var cleanupErr *CommittedCleanupError
+	if !errors.As(err, &cleanupErr) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("RefreshSourcesProgress() error = %v", err)
+	}
+	if len(changes) != 1 || changes[0].Action != "updated" {
+		t.Fatalf("published changes = %#v", changes)
+	}
+	after, inspectErr := Inspect(context.Background(), path)
+	if inspectErr != nil {
+		t.Fatal(inspectErr)
+	}
+	if after.Generation == before.Generation {
+		t.Fatal("generation was not published before cleanup warning")
+	}
+}
+
+func TestCaptureRejectsHostileManifestReferenceWithoutReplacingGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	ref := mustRef(t, "example.test/capture:latest")
+	installFetcher(t, map[string]v1.Image{ref.Name(): mustImage(t, 80)})
+	if _, err := Assure(context.Background(), path, []string{ref.Name()}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = Capture(path, func(temp string) error {
+		file, err := os.OpenFile(temp, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		writer := stdtar.NewWriter(file)
+		defer writer.Close()
+		manifest, err := json.Marshal([]archive.Descriptor{{Config: "../host-file", RepoTags: []string{"example.test/hostile:latest"}, Layers: []string{"layer.tar"}}})
+		if err != nil {
+			return err
+		}
+		if err := writer.WriteHeader(&stdtar.Header{Name: "manifest.json", Mode: 0o600, Size: int64(len(manifest))}); err != nil {
+			return err
+		}
+		_, err = writer.Write(manifest)
+		return err
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsafe member reference") {
+		t.Fatalf("hostile capture error = %v", err)
+	}
+	after, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Generation != before.Generation {
+		t.Fatalf("hostile capture changed generation: %s -> %s", before.Generation, after.Generation)
+	}
+}
+
+func TestCaptureRejectsArchiveAboveConfiguredCacheLimit(t *testing.T) {
+	t.Setenv(cacheMaxBytesEnv, "1024")
+	path := filepath.Join(t.TempDir(), "images")
+	ref := mustRef(t, "example.test/oversized:latest")
+	err := Capture(path, func(temp string) error {
+		file, err := os.OpenFile(temp, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		return archive.Write(ref, mustImage(t, 98), file)
+	})
+	if err == nil || !strings.Contains(err.Error(), "above the 1024-byte cache limit") {
+		t.Fatalf("Capture() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(path, "index.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("oversized capture published cache state: %v", err)
 	}
 }
 
@@ -543,6 +855,46 @@ func TestStaleExternalCredentialHelpersDoNotAffectAnonymousPull(t *testing.T) {
 	got, err := pulled.Digest()
 	if err != nil || got != want {
 		t.Fatalf("anonymous pull digest=%s err=%v, want %s", got, err, want)
+	}
+}
+
+func TestRegistryFetchContextLivesThroughLazyMaterialization(t *testing.T) {
+	server := httptest.NewServer(registry.New())
+	defer server.Close()
+	registryRef, err := name.NewTag(strings.TrimPrefix(server.URL, "http://")+"/public/lazy:latest", name.Insecure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := mustImage(t, 12)
+	if err := remote.Write(registryRef, image, remote.WithTransport(http.DefaultTransport)); err != nil {
+		t.Fatal(err)
+	}
+
+	oldFetch := fetchImage
+	t.Cleanup(func() { fetchImage = oldFetch })
+	fetchImage = func(ctx context.Context, _ name.Reference) (fetchedImage, error) {
+		lazyImage, err := remote.Image(
+			registryRef,
+			remote.WithContext(ctx),
+			remote.WithTransport(http.DefaultTransport),
+		)
+		return fetchedImage{image: lazyImage, platform: v1.Platform{OS: "linux", Architecture: runtime.GOARCH}}, err
+	}
+
+	path := filepath.Join(t.TempDir(), "images")
+	changes, err := Assure(context.Background(), path, []string{"example.test/public/lazy:latest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || changes[0].Action != "added" {
+		t.Fatalf("Assure() changes = %#v", changes)
+	}
+	manifest, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Images) != 1 || manifest.Images[0].Digest == "" {
+		t.Fatalf("materialized manifest = %#v", manifest)
 	}
 }
 
@@ -653,7 +1005,7 @@ func TestAllowedRealmReceivesRestoredFormBody(t *testing.T) {
 	}
 }
 
-func TestPermissionRepair(t *testing.T) {
+func TestPermissionRepairIsExplicit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "images")
 	ref := mustRef(t, "example.test/one:latest")
 	installFetcher(t, map[string]v1.Image{ref.Name(): mustImage(t, 12)})
@@ -674,6 +1026,10 @@ func TestPermissionRepair(t *testing.T) {
 	if _, err := Inspect(context.Background(), path); err != nil {
 		t.Fatal(err)
 	}
+	assertMode(t, filepath.Join(path, "index.json"), 0o644)
+	if err := RepairPermissions(path); err != nil {
+		t.Fatal(err)
+	}
 	assertMode(t, path, 0o700)
 	assertMode(t, filepath.Join(path, "index.json"), 0o600)
 	assertMode(t, blob, 0o600)
@@ -692,6 +1048,207 @@ func TestRegistryWaitHonorsCancellation(t *testing.T) {
 	})
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > time.Second {
 		t.Fatalf("registry cancellation err=%v elapsed=%s", err, time.Since(started))
+	}
+}
+
+func TestRegistryAndLocalBuildStagingDoNotHoldPublicationLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	ref := mustRef(t, "example.test/staged-registry:latest")
+	img := mustImage(t, 79)
+	oldFetch := fetchImage
+	t.Cleanup(func() { fetchImage = oldFetch })
+	fetchImage = func(_ context.Context, _ name.Reference) (fetchedImage, error) {
+		assertPublicationLockAvailable(t, path)
+		return fetchedImage{image: img, platform: v1.Platform{OS: "linux", Architecture: runtime.GOARCH}}, nil
+	}
+	if _, err := Assure(context.Background(), path, []string{ref.Name()}); err != nil {
+		t.Fatal(err)
+	}
+
+	contextDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(contextDir, "Dockerfile"), []byte("FROM scratch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localRef := mustRef(t, "example.test/staged-local:latest")
+	installContainerRunner(t, func(_ context.Context, args ...string) error {
+		assertPublicationLockAvailable(t, path)
+		if len(args) > 1 && args[0] == "image" && args[1] == "save" {
+			output := argumentValue(t, args, "-o")
+			file, err := os.OpenFile(output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			stageRef, err := name.NewTag(args[len(args)-1])
+			if err != nil {
+				return err
+			}
+			return archive.Write(stageRef, img, file)
+		}
+		return nil
+	})
+	if _, err := AssureSources(context.Background(), path, nil, []LocalBuildSource{{Ref: localRef.Name(), ContextDir: contextDir}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLocalBuildFailureCleansCompletedRegistryStages(t *testing.T) {
+	parent := t.TempDir()
+	path := filepath.Join(parent, "images")
+	registryRef := mustRef(t, "example.test/staged-registry:latest")
+	localRef := mustRef(t, "example.test/staged-local:latest")
+	installFetcher(t, map[string]v1.Image{registryRef.Name(): mustImage(t, 91)})
+	contextDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(contextDir, "Dockerfile"), []byte("FROM scratch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	installContainerRunner(t, func(context.Context, ...string) error {
+		return errors.New("injected local build failure")
+	})
+
+	_, err := AssureSources(context.Background(), path, []string{registryRef.Name()}, []LocalBuildSource{{Ref: localRef.Name(), ContextDir: contextDir}})
+	if err == nil || !strings.Contains(err.Error(), "injected local build failure") {
+		t.Fatalf("AssureSources() error = %v", err)
+	}
+	assertNoImageObjectStages(t, parent)
+}
+
+func TestRegistryCancellationCleansCompletedStages(t *testing.T) {
+	parent := t.TempDir()
+	path := filepath.Join(parent, "images")
+	fast := mustRef(t, "example.test/fast:latest")
+	slow := mustRef(t, "example.test/slow:latest")
+	img := mustImage(t, 92)
+	oldFetch := fetchImage
+	t.Cleanup(func() { fetchImage = oldFetch })
+	fetchImage = func(ctx context.Context, ref name.Reference) (fetchedImage, error) {
+		if ref.Name() == slow.Name() {
+			<-ctx.Done()
+			return fetchedImage{}, ctx.Err()
+		}
+		return fetchedImage{image: img, platform: v1.Platform{OS: "linux", Architecture: runtime.GOARCH}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := Assure(ctx, path, []string{fast.Name(), slow.Name()})
+		done <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		matches, err := filepath.Glob(filepath.Join(parent, ".shunt-image-object-*"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("registry stage was not created")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Assure() error = %v", err)
+	}
+	assertNoImageObjectStages(t, parent)
+}
+
+func assertNoImageObjectStages(t *testing.T, parent string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(parent, ".shunt-image-object-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("leaked image stages: %v", matches)
+	}
+}
+
+func TestRefreshCompareAndSwapDoesNotOverwriteConcurrentGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	ref := mustRef(t, "example.test/concurrent-refresh:latest")
+	img := mustImage(t, 82)
+	installFetcher(t, map[string]v1.Image{ref.Name(): img})
+	if _, err := Assure(context.Background(), path, []string{ref.Name()}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldFetch := fetchImage
+	t.Cleanup(func() { fetchImage = oldFetch })
+	fetchImage = func(_ context.Context, _ name.Reference) (fetchedImage, error) {
+		if err := withStoreLock(context.Background(), path, false, func() error {
+			manifest, err := readCurrentUnlocked(path)
+			if err != nil {
+				return err
+			}
+			manifest.Images[0].Platform = "linux/concurrent"
+			return publishGeneration(path, manifest)
+		}); err != nil {
+			return fetchedImage{}, err
+		}
+		return fetchedImage{image: img, platform: v1.Platform{OS: "linux", Architecture: runtime.GOARCH}}, nil
+	}
+	if _, err := Refresh(context.Background(), path, []string{ref.Name()}); err == nil || !strings.Contains(err.Error(), "while images were staged") {
+		t.Fatalf("concurrent refresh error = %v", err)
+	}
+	manifest, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Images[0].Platform != "linux/concurrent" {
+		t.Fatalf("slow refresh overwrote concurrent generation: %#v", manifest.Images[0])
+	}
+}
+
+func TestConcurrentColdAssureStagesSourcesOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	ref := mustRef(t, "example.test/single-stage:latest")
+	img := mustImage(t, 99)
+	oldFetch := fetchImage
+	t.Cleanup(func() { fetchImage = oldFetch })
+	var fetches atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fetchImage = func(context.Context, name.Reference) (fetchedImage, error) {
+		if fetches.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return fetchedImage{image: img, platform: v1.Platform{OS: "linux", Architecture: runtime.GOARCH}}, nil
+	}
+	errorsByCall := make(chan error, 2)
+	go func() {
+		_, err := Assure(context.Background(), path, []string{ref.Name()})
+		errorsByCall <- err
+	}()
+	<-started
+	go func() {
+		_, err := Assure(context.Background(), path, []string{ref.Name()})
+		errorsByCall <- err
+	}()
+	close(release)
+	for range 2 {
+		if err := <-errorsByCall; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fetches.Load() != 1 {
+		t.Fatalf("registry fetches = %d, want 1", fetches.Load())
+	}
+}
+
+func assertPublicationLockAvailable(t *testing.T, path string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	lock, err := acquireStoreLock(ctx, path)
+	if err != nil {
+		t.Fatalf("staging ran while image-cache publication lock was held: %v", err)
+	}
+	if err := lock.close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -795,9 +1352,9 @@ func TestImagecacheSubprocessWriter(t *testing.T) {
 }
 
 func TestRedactDoesNotExposeCredentialValues(t *testing.T) {
-	err := redact(errors.New(`unauthorized password=hunter2 token:abc123 Authorization: Bearer ey.secret https://user:pass@example.test/v2 {"identitytoken":"identity-secret","auth":"dXNlcjpwYXNz"}`))
+	err := redact(errors.New(`unauthorized password=hunter2 token:abc123 Authorization: Bearer ey.secret client_secret=form-secret client-secret=dash-secret clientsecret=plain-secret https://user:pass@example.test/v2 {"identitytoken":"identity-secret","auth":"dXNlcjpwYXNz","client_secret":"json-secret"}`))
 	got := err.Error()
-	for _, secret := range []string{"hunter2", "abc123", "ey.secret", "pass@", "identity-secret", "dXNlcjpwYXNz"} {
+	for _, secret := range []string{"hunter2", "abc123", "ey.secret", "form-secret", "dash-secret", "plain-secret", "json-secret", "pass@", "identity-secret", "dXNlcjpwYXNz"} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("credential %q leaked: %s", secret, got)
 		}
@@ -818,6 +1375,40 @@ func TestValidateDetectsBlobCorruption(t *testing.T) {
 	}
 	if err := Validate(path); err == nil {
 		t.Fatal("corrupt blob validated")
+	}
+}
+
+func BenchmarkIndexDockerArchiveMultiImage(b *testing.B) {
+	parent := b.TempDir()
+	source := filepath.Join(parent, "multi-image.tar")
+	images := make(map[name.Tag]v1.Image, 8)
+	for index := 0; index < 8; index++ {
+		ref, err := name.NewTag(fmt.Sprintf("example.test/benchmark/image-%d:latest", index))
+		if err != nil {
+			b.Fatal(err)
+		}
+		img, err := random.Image(256*1024+int64(index), 3)
+		if err != nil {
+			b.Fatal(err)
+		}
+		images[ref] = img
+	}
+	if err := archive.MultiWriteToFile(source, images); err != nil {
+		b.Fatal(err)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(info.Size())
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		indexed, err := indexDockerArchive(context.Background(), filepath.Join(parent, "images"), source)
+		if err != nil {
+			b.Fatal(err)
+		}
+		indexed.cleanup()
 	}
 }
 

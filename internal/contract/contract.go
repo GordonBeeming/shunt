@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -32,9 +33,13 @@ type Contract struct {
 	FrontDoor []FrontDoorRoute  `json:"frontDoor"` // stable front-door routes
 	Env       map[string]string `json:"env"`       // extra guest env (Aspire parameters, secrets)
 	Mounts    []state.MountSpec `json:"mounts"`    // explicit extra host->guest mounts (e.g. user-secrets)
-	// Dependency container images the application brings up. shunt keeps an exact
-	// daemon-free archive and loads it into each guest. `shunt warm` refreshes it.
+	// Registry dependency-image tags incorporated into an immutable,
+	// content-addressed cache generation. Per-image Docker archives are derived
+	// exports loaded into each guest; `shunt warm` refreshes every tag.
 	PrebakeImages []string `json:"prebakeImages"`
+	// Local dependency images built on the host and stored in the same cache as
+	// registry images. Relative paths are resolved from the app repository.
+	PrebakeBuilds []state.PrebakeBuild `json:"prebakeBuilds"`
 	// Volumes lists the Docker named volumes shunt stores in host-backed siding
 	// directories. A new siding clones the current baseline, or starts empty when
 	// no baseline exists. Omit this list when the app has no persistent test data.
@@ -87,13 +92,23 @@ func Load(repoPath string) (Contract, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return Contract{}, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if err := c.validate(); err != nil {
+	if err := c.validate(repoPath); err != nil {
 		return Contract{}, fmt.Errorf("%s: %w", FileName, err)
 	}
 	return c, nil
 }
 
-func (c Contract) validate() error {
+var dockerVolumeNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
+
+// ValidateVolumeName matches the Docker engine's named-volume grammar.
+func ValidateVolumeName(volume string) error {
+	if !dockerVolumeNamePattern.MatchString(volume) {
+		return fmt.Errorf("volume name must match %s", dockerVolumeNamePattern.String())
+	}
+	return nil
+}
+
+func (c *Contract) validate(repoPath string) error {
 	seenImage := make(map[string]struct{}, len(c.PrebakeImages))
 	for i, ref := range c.PrebakeImages {
 		parsed, err := name.ParseReference(ref)
@@ -108,10 +123,60 @@ func (c Contract) validate() error {
 		}
 		seenImage[parsed.Name()] = struct{}{}
 	}
+	for i := range c.PrebakeBuilds {
+		build := &c.PrebakeBuilds[i]
+		parsed, err := name.ParseReference(build.Image)
+		if err != nil {
+			return fmt.Errorf("prebakeBuilds[%d].image %q: invalid image reference: %w", i, build.Image, err)
+		}
+		if _, ok := parsed.(name.Digest); ok {
+			return fmt.Errorf("prebakeBuilds[%d].image %q: output image must use a tag", i, build.Image)
+		}
+		if _, exists := seenImage[parsed.Name()]; exists {
+			return fmt.Errorf("duplicate prebake image output %q", build.Image)
+		}
+		seenImage[parsed.Name()] = struct{}{}
+		if build.Context == "" {
+			return fmt.Errorf("prebakeBuilds[%d].context is required", i)
+		}
+		if build.Dockerfile == "" {
+			return fmt.Errorf("prebakeBuilds[%d].dockerfile is required", i)
+		}
+		build.Context, err = resolveBuildPath(repoPath, build.Context)
+		if err != nil {
+			return fmt.Errorf("prebakeBuilds[%d].context: %w", i, err)
+		}
+		info, err := os.Stat(build.Context)
+		if err != nil {
+			return fmt.Errorf("prebakeBuilds[%d].context %q: %w", i, build.Context, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("prebakeBuilds[%d].context %q is not a directory", i, build.Context)
+		}
+		build.Dockerfile, err = resolveBuildPath(repoPath, build.Dockerfile)
+		if err != nil {
+			return fmt.Errorf("prebakeBuilds[%d].dockerfile: %w", i, err)
+		}
+		info, err = os.Stat(build.Dockerfile)
+		if err != nil {
+			return fmt.Errorf("prebakeBuilds[%d].dockerfile %q: %w", i, build.Dockerfile, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("prebakeBuilds[%d].dockerfile %q is not a regular file", i, build.Dockerfile)
+		}
+		for key, value := range build.BuildArgs {
+			if strings.TrimSpace(key) == "" || strings.ContainsAny(key, "=\x00\r\n") {
+				return fmt.Errorf("prebakeBuilds[%d].buildArgs contains invalid key %q", i, key)
+			}
+			if strings.ContainsRune(value, 0) {
+				return fmt.Errorf("prebakeBuilds[%d].buildArgs[%q] contains a NUL byte", i, key)
+			}
+		}
+	}
 	seenVolume := make(map[string]struct{}, len(c.Volumes))
 	for i, volume := range c.Volumes {
-		if volume == "" || volume == "." || volume == ".." || filepath.Base(volume) != volume || strings.ContainsAny(volume, `/\\`) {
-			return fmt.Errorf("dataVolumes[%d] %q: volume name must be a non-empty name, not a path", i, volume)
+		if err := ValidateVolumeName(volume); err != nil {
+			return fmt.Errorf("dataVolumes[%d] %q: %w", i, volume, err)
 		}
 		if _, exists := seenVolume[volume]; exists {
 			return fmt.Errorf("dataVolumes: duplicate volume name %q", volume)
@@ -154,4 +219,32 @@ func (c Contract) validate() error {
 		}
 	}
 	return nil
+}
+
+func resolveBuildPath(repoPath, configured string) (string, error) {
+	repoRoot, err := filepath.Abs(filepath.Clean(repoPath))
+	if err != nil {
+		return "", err
+	}
+	repoRoot, err = filepath.EvalSymlinks(repoRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve app repository: %w", err)
+	}
+	path := configured
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(repoRoot, path)
+	}
+	path, err = filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(repoRoot, path)
+	if err != nil || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path %q is outside app repository %q", configured, repoRoot)
+	}
+	return path, nil
 }

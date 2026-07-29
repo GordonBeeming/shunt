@@ -6,7 +6,10 @@ package proc
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -122,13 +125,24 @@ func RunPassthrough(ctx context.Context, name string, args ...string) error {
 // multi-GB images — where buffering into memory would be wrong. Stderr is
 // captured so a failure still produces a useful message.
 func RunToFile(ctx context.Context, outPath, name string, args ...string) error {
+	return RunToFileLimited(ctx, outPath, 0, name, args...)
+}
+
+// RunToFileLimited is RunToFile with a hard byte ceiling. A positive limit
+// stops a producer before untrusted output can grow the destination without
+// bound; zero retains RunToFile's unlimited behavior.
+func RunToFileLimited(ctx context.Context, outPath string, maxBytes int64, name string, args ...string) error {
 	f, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", outPath, err)
 	}
 	defer f.Close()
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Stdout = f
+	if maxBytes > 0 {
+		cmd.Stdout = &limitedWriter{writer: f, remaining: maxBytes}
+	} else {
+		cmd.Stdout = f
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -137,24 +151,56 @@ func RunToFile(ctx context.Context, outPath, name string, args ...string) error 
 	return nil
 }
 
+type limitedWriter struct {
+	writer    io.Writer
+	remaining int64
+}
+
+func (w *limitedWriter) Write(data []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, fmt.Errorf("output exceeds configured byte limit")
+	}
+	if int64(len(data)) > w.remaining {
+		allowed := int(w.remaining)
+		written, err := w.writer.Write(data[:allowed])
+		w.remaining -= int64(written)
+		if err != nil {
+			return written, err
+		}
+		return written, fmt.Errorf("output exceeds configured byte limit")
+	}
+	written, err := w.writer.Write(data)
+	w.remaining -= int64(written)
+	return written, err
+}
+
 // RunStdin runs name with args, feeding the file at stdinPath as stdin — for
 // streaming a large file into a command (e.g. `docker load` of a multi-GB tar)
 // without buffering it. Stderr is captured for a useful error.
 func RunStdin(ctx context.Context, stdinPath, name string, args ...string) error {
+	_, err := RunStdinDigest(ctx, stdinPath, name, args...)
+	return err
+}
+
+// RunStdinDigest streams a file into a command while computing its SHA-256.
+// It avoids a separate full-file verification pass before the command consumes
+// the bytes; callers compare the returned digest with their trusted metadata.
+func RunStdinDigest(ctx context.Context, stdinPath, name string, args ...string) (string, error) {
 	f, err := os.Open(stdinPath)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", stdinPath, err)
+		return "", fmt.Errorf("open %s: %w", stdinPath, err)
 	}
 	defer f.Close()
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Stdin = f
+	hash := sha256.New()
+	cmd.Stdin = io.TeeReader(f, hash)
 	cmd.Stdout = os.Stdout // surface progress (e.g. `docker load` "Loaded image:" lines)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("run %s: %w: %s", name, err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("run %s: %w: %s", name, err, strings.TrimSpace(stderr.String()))
 	}
-	return nil
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // Look reports whether an executable is on PATH.

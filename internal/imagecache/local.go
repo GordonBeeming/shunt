@@ -12,7 +12,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -138,7 +141,28 @@ var runContainer = func(ctx context.Context, args ...string) error {
 	return proc.RunPassthrough(ctx, "container", args...)
 }
 
-func buildAndStoreLocalImage(ctx context.Context, cachePath string, build localBuild) (ImageRecord, error) {
+var localStageSequence atomic.Uint64
+
+type stagedLocalImage struct {
+	build   localBuild
+	image   v1.Image
+	cleanup func()
+}
+
+func (stage stagedLocalImage) close() {
+	if stage.cleanup != nil {
+		stage.cleanup()
+	}
+}
+
+// stageLocalBuild runs the expensive host build and export before the cache
+// publication lock. The caller imports the resulting immutable image during
+// its short compare-and-swap section.
+func stageLocalBuild(ctx context.Context, cachePath string, build localBuild) (stagedLocalImage, error) {
+	stageRef, err := name.NewTag("shunt-stage/" + strings.TrimPrefix(build.fingerprint, "sha256:")[:16] + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatUint(localStageSequence.Add(1), 10) + ":cache")
+	if err != nil {
+		return stagedLocalImage{}, fmt.Errorf("create local stage tag: %w", err)
+	}
 	args := []string{"build", "--platform", build.source.Platform}
 	keys := make([]string, 0, len(build.source.BuildArgs))
 	for key := range build.source.BuildArgs {
@@ -146,48 +170,86 @@ func buildAndStoreLocalImage(ctx context.Context, cachePath string, build localB
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		if strings.TrimSpace(key) == "" || strings.ContainsAny(key, "=\x00") {
-			return ImageRecord{}, fmt.Errorf("invalid empty or delimited build argument name")
+		if strings.TrimSpace(key) == "" || strings.ContainsAny(key, "=\x00\r\n") {
+			return stagedLocalImage{}, fmt.Errorf("invalid empty or delimited build argument name")
+		}
+		if strings.ContainsRune(build.source.BuildArgs[key], 0) {
+			return stagedLocalImage{}, fmt.Errorf("build argument %q contains a NUL byte", key)
 		}
 		args = append(args, "--build-arg", key+"="+build.source.BuildArgs[key])
 	}
-	args = append(args, "-t", build.ref.Name(), "-f", build.source.Dockerfile, build.source.ContextDir)
+	args = append(args, "-t", stageRef.Name(), "-f", build.source.Dockerfile, build.source.ContextDir)
 	if err := runContainer(ctx, args...); err != nil {
-		return ImageRecord{}, fmt.Errorf("container build: %w", err)
+		return stagedLocalImage{}, fmt.Errorf("container build: %w", err)
 	}
+	stageRefOwned := true
+	defer func() {
+		if stageRefOwned {
+			deleteLocalStageRef(stageRef.Name())
+		}
+	}()
 
 	tmp, err := newCaptureTemp(cachePath)
 	if err != nil {
-		return ImageRecord{}, err
+		return stagedLocalImage{}, err
 	}
 	archivePath := tmp.Name()
+	archiveOwned := true
+	defer func() {
+		if archiveOwned {
+			_ = os.Remove(archivePath)
+		}
+	}()
 	if err := tmp.Close(); err != nil {
-		return ImageRecord{}, err
+		return stagedLocalImage{}, err
 	}
-	defer os.Remove(archivePath)
 	if err := os.Remove(archivePath); err != nil {
-		return ImageRecord{}, fmt.Errorf("prepare local image archive: %w", err)
+		return stagedLocalImage{}, fmt.Errorf("prepare local image archive: %w", err)
 	}
-	if err := runContainer(ctx, "image", "save", "--platform", build.source.Platform, "-o", archivePath, build.ref.Name()); err != nil {
-		return ImageRecord{}, fmt.Errorf("container image save: %w", err)
+	if err := runContainer(ctx, "image", "save", "--platform", build.source.Platform, "-o", archivePath, stageRef.Name()); err != nil {
+		return stagedLocalImage{}, fmt.Errorf("container image save: %w", err)
 	}
 	if err := os.Chmod(archivePath, 0o600); err != nil {
-		return ImageRecord{}, fmt.Errorf("chmod local image archive: %w", err)
+		return stagedLocalImage{}, fmt.Errorf("chmod local image archive: %w", err)
 	}
-	img, err := dockerarchive.ImageFromPath(archivePath, &build.ref)
+	img, err := dockerarchive.ImageFromPath(archivePath, &stageRef)
 	cleanupImage := func() {}
 	if err != nil {
-		img, cleanupImage, err = imageFromOCIArchive(archivePath, build.ref, build.platform)
+		img, cleanupImage, err = imageFromOCIArchive(archivePath, stageRef, build.platform)
 		if err != nil {
-			return ImageRecord{}, fmt.Errorf("read saved local image: %w", err)
+			return stagedLocalImage{}, fmt.Errorf("read saved local image: %w", err)
 		}
 	}
-	defer cleanupImage()
-	record, err := storeImage(cachePath, build.ref, fetchedImage{image: img, platform: build.platform}, sourceLocal, build.fingerprint)
+	stageRefOwned = false
+	archiveOwned = false
+	return stagedLocalImage{build: build, image: img, cleanup: func() {
+		cleanupImage()
+		_ = os.Remove(archivePath)
+		deleteLocalStageRef(stageRef.Name())
+	}}, nil
+}
+
+func deleteLocalStageRef(ref string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = runContainer(ctx, "image", "delete", ref)
+}
+
+func buildAndStoreLocalImage(ctx context.Context, cachePath string, build localBuild) (ImageRecord, error) {
+	buildStage, err := stageLocalBuild(ctx, cachePath, build)
+	if err != nil {
+		return ImageRecord{}, err
+	}
+	defer buildStage.close()
+	stage, err := stageImage(cachePath, build.ref, fetchedImage{image: buildStage.image, platform: build.platform}, sourceLocal, build.fingerprint)
 	if err != nil {
 		return ImageRecord{}, fmt.Errorf("import saved local image: %w", err)
 	}
-	return record, nil
+	defer stage.close()
+	if err := adoptStagedImage(cachePath, &stage); err != nil {
+		return ImageRecord{}, fmt.Errorf("adopt saved local image: %w", err)
+	}
+	return stage.record, nil
 }
 
 func imageFromOCIArchive(archivePath string, ref name.Tag, platform v1.Platform) (v1.Image, func(), error) {

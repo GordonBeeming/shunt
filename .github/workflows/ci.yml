@@ -7,6 +7,8 @@ on:
 jobs:
   unit:
     name: build + unit tests
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -18,8 +20,28 @@ jobs:
         run: go build ./...
       - name: vet
         run: go vet ./...
+      - name: vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck ./...
+          go build -modfile=internal/image/assets/docker-api-admission.mod -o "${RUNNER_TEMP}/shunt-docker-api-admission" internal/image/assets/docker-api-admission.go internal/image/assets/docker-build-admission.go
+          govulncheck -mode=binary "${RUNNER_TEMP}/shunt-docker-api-admission"
       - name: unit tests
         # Integration tests are behind the `integration` build tag (they need the
         # Apple container runtime), so the default test run is unit-only and works
         # on a stock GitHub-hosted runner.
         run: go test ./... -race -count=1
+
+  macos-fidelity:
+    name: macOS APFS clone fidelity
+    permissions:
+      contents: read
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: APFS clone, baseline, and cache tests
+        run: go test ./internal/fsclone ./internal/databaseline ./internal/imagecache -race -count=1

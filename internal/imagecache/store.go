@@ -19,10 +19,11 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/layout"
 	archive "github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/google/go-containerregistry/pkg/v1/types"
+	"golang.org/x/sys/unix"
 )
 
 const (
-	storeVersion       = 2
+	storeVersion       = 3
 	maxIndexBytes      = 1 << 20
 	maxGenerationBytes = 16 << 20
 	sourceRegistry     = "registry"
@@ -59,10 +60,14 @@ type BlobRecord struct {
 	Size   int64  `json:"size"`
 }
 
-// GuestMarker is safe to record in a guest after all planned exports load.
+// GuestMarker records the image identifiers Docker actually assigned after a
+// verified cache load. Docker's containerd image store may derive an identifier
+// that differs from the source config digest, so future plans compare the live
+// identifier with this observation and the per-ref digest with the host cache.
 type GuestMarker struct {
 	Generation string            `json:"generation"`
 	Images     map[string]string `json:"images"`
+	Digests    map[string]string `json:"digests"`
 }
 
 // GuestState combines the last marker with image identities observed from one
@@ -89,6 +94,18 @@ type LoadPlan struct {
 	Generation string
 	Images     []PlannedImage
 	Marker     GuestMarker
+	lease      *generationLease
+}
+
+// Release relinquishes the stable-generation lease acquired by Plan. It is
+// safe to call on test-created plans and more than once.
+func (plan *LoadPlan) Release() error {
+	if plan == nil || plan.lease == nil {
+		return nil
+	}
+	err := plan.lease.close()
+	plan.lease = nil
+	return err
 }
 
 type currentIndex struct {
@@ -107,9 +124,9 @@ func Inspect(ctx context.Context, path string) (Manifest, error) {
 	return manifest, err
 }
 
-// Plan compares the current generation to image IDs observed in the guest and
-// returns immutable Docker archives for missing or substituted refs. The
-// marker is advisory only: even a current marker cannot hide a wrong image ID.
+// Plan compares the current generation and the IDs observed after its last
+// verified load with the IDs currently in the guest. It returns immutable
+// Docker archives for missing, substituted, or generation-stale refs.
 func Plan(ctx context.Context, path string, guest GuestState) (LoadPlan, error) {
 	var plan LoadPlan
 	err := withStoreLock(ctx, path, false, func() error {
@@ -119,16 +136,20 @@ func Plan(ctx context.Context, path string, guest GuestState) (LoadPlan, error) 
 		}
 		plan.Generation = manifest.Generation
 		plan.Marker = markerFor(manifest)
+		lease, err := acquireGenerationLease(path, manifest.Generation, unix.LOCK_SH)
+		if err != nil {
+			return fmt.Errorf("lease image generation: %w", err)
+		}
+		plan.lease = lease
 		for _, image := range manifest.Images {
-			if normalizeImageID(guest.ImageIDs[image.Ref]) == image.ConfigDigest {
+			observed := normalizeImageID(guest.ImageIDs[image.Ref])
+			marked := normalizeImageID(guest.Marker.Images[image.Ref])
+			if guest.Marker.Digests[image.Ref] == image.Digest && observed != "" && observed == marked {
 				continue
 			}
 			exportPath, err := cacheRelativePath(path, image.Export)
 			if err != nil {
 				return err
-			}
-			if err := verifyFile(exportPath, image.ExportChecksum, -1); err != nil {
-				return fmt.Errorf("verify export for %s: %w", image.Ref, err)
 			}
 			plan.Images = append(plan.Images, PlannedImage{
 				Ref:      image.Ref,
@@ -142,6 +163,9 @@ func Plan(ctx context.Context, path string, guest GuestState) (LoadPlan, error) 
 		}
 		return nil
 	})
+	if err != nil {
+		_ = plan.Release()
+	}
 	return plan, err
 }
 
@@ -175,9 +199,13 @@ func OpenExport(ctx context.Context, path, ref, digest string) (*os.File, error)
 }
 
 func markerFor(manifest Manifest) GuestMarker {
-	marker := GuestMarker{Generation: manifest.Generation, Images: make(map[string]string, len(manifest.Images))}
+	marker := GuestMarker{
+		Generation: manifest.Generation,
+		Images:     make(map[string]string, len(manifest.Images)),
+		Digests:    make(map[string]string, len(manifest.Images)),
+	}
 	for _, image := range manifest.Images {
-		marker.Images[image.Ref] = image.ConfigDigest
+		marker.Digests[image.Ref] = image.Digest
 	}
 	return marker
 }
@@ -227,6 +255,17 @@ func publishGeneration(root string, manifest Manifest) error {
 	if err := writeOCIIndex(root, manifest.Images); err != nil {
 		return fmt.Errorf("write OCI index: %w", err)
 	}
+	if current, err := readCurrentUnlocked(root); err == nil && current.Generation != generation {
+		previous, err := json.MarshalIndent(currentIndex{Version: storeVersion, Generation: current.Generation}, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := writeFileAtomic(filepath.Join(root, "previous.json"), append(previous, '\n')); err != nil {
+			return fmt.Errorf("publish previous image generation: %w", err)
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	indexData, err := json.MarshalIndent(currentIndex{Version: storeVersion, Generation: generation}, "", "  ")
 	if err != nil {
 		return err
@@ -236,6 +275,21 @@ func publishGeneration(root string, manifest Manifest) error {
 		return fmt.Errorf("publish image generation: %w", err)
 	}
 	return nil
+}
+
+func readPreviousUnlocked(root string) (Manifest, error) {
+	data, err := readLimitedFile(filepath.Join(root, "previous.json"), maxIndexBytes)
+	if err != nil {
+		return Manifest{}, err
+	}
+	var index currentIndex
+	if err := decodeStrict(data, &index); err != nil {
+		return Manifest{}, fmt.Errorf("decode previous image cache index: %w", err)
+	}
+	if index.Version != storeVersion || !validDigest(index.Generation) {
+		return Manifest{}, fmt.Errorf("unsupported previous image cache index")
+	}
+	return readGenerationUnlocked(root, index.Generation)
 }
 
 func readCurrentUnlocked(root string) (Manifest, error) {
@@ -358,6 +412,142 @@ func storeImage(root string, ref name.Tag, fetched fetchedImage, sourceKind, sou
 	return record, nil
 }
 
+// stagedImageRecord is a complete private cache object tree. Expensive image
+// decoding, blob verification, and Docker-export generation happen here before
+// the live store lock is acquired. Publication only hard-links these immutable
+// objects into the live store and writes the small generation/index files.
+type stagedImageRecord struct {
+	root   string
+	record ImageRecord
+}
+
+func stageImage(cacheRoot string, ref name.Tag, fetched fetchedImage, sourceKind, sourceFingerprint string) (stagedImageRecord, error) {
+	if err := os.MkdirAll(filepath.Dir(cacheRoot), 0o700); err != nil {
+		return stagedImageRecord{}, err
+	}
+	root, err := os.MkdirTemp(filepath.Dir(cacheRoot), ".shunt-image-object-*")
+	if err != nil {
+		return stagedImageRecord{}, err
+	}
+	record, err := storeImage(root, ref, fetched, sourceKind, sourceFingerprint)
+	if err != nil {
+		_ = os.RemoveAll(root)
+		return stagedImageRecord{}, err
+	}
+	return stagedImageRecord{root: root, record: record}, nil
+}
+
+func (stage *stagedImageRecord) close() {
+	if stage == nil || stage.root == "" {
+		return
+	}
+	_ = os.RemoveAll(stage.root)
+	stage.root = ""
+}
+
+func adoptStagedImage(root string, stage *stagedImageRecord) error {
+	if stage == nil || stage.root == "" {
+		return fmt.Errorf("staged image is unavailable")
+	}
+	if err := ensureOCILayout(root); err != nil {
+		return err
+	}
+	for _, blob := range stage.record.Blobs {
+		source, err := blobPath(stage.root, blob.Digest)
+		if err != nil {
+			return err
+		}
+		destination, err := blobPath(root, blob.Digest)
+		if err != nil {
+			return err
+		}
+		if err := linkImmutableObject(source, destination, blob.Size); err != nil {
+			return fmt.Errorf("adopt image blob %s: %w", blob.Digest, err)
+		}
+	}
+	source, err := cacheRelativePath(stage.root, stage.record.Export)
+	if err != nil {
+		return err
+	}
+	destination, err := cacheRelativePath(root, stage.record.Export)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if existing, statErr := os.Lstat(destination); statErr == nil && (!existing.Mode().IsRegular() || existing.Size() != info.Size()) {
+		recovery, recoveryErr := recoveryExportPath(root, stage.record.Export)
+		if recoveryErr != nil {
+			return recoveryErr
+		}
+		stage.record.Export = recovery
+		destination, err = cacheRelativePath(root, recovery)
+		if err != nil {
+			return err
+		}
+	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	if err := linkImmutableObject(source, destination, info.Size()); err != nil {
+		return fmt.Errorf("adopt image export %s: %w", stage.record.Ref, err)
+	}
+	return nil
+}
+
+func recoveryExportPath(root, relative string) (string, error) {
+	destination, err := cacheRelativePath(root, relative)
+	if err != nil {
+		return "", err
+	}
+	file, err := os.CreateTemp(filepath.Dir(destination), strings.TrimSuffix(filepath.Base(destination), ".tar")+"-recovery-*.tar")
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
+	if err := errors.Join(file.Close(), os.Remove(path)); err != nil {
+		return "", err
+	}
+	recovery, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", err
+	}
+	if _, err := cacheRelativePath(root, recovery); err != nil {
+		return "", err
+	}
+	return recovery, nil
+}
+
+func linkImmutableObject(source, destination string, expectedSize int64) error {
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() != expectedSize {
+		return fmt.Errorf("staged object is not a regular %d-byte file", expectedSize)
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(filepath.Dir(destination), 0o700); err != nil {
+		return err
+	}
+	if err := os.Link(source, destination); err == nil {
+		return os.Chmod(destination, 0o600)
+	} else if !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("hard-link staged object: %w", err)
+	}
+	existing, err := os.Lstat(destination)
+	if err != nil {
+		return err
+	}
+	if !existing.Mode().IsRegular() || existing.Size() != expectedSize {
+		return fmt.Errorf("immutable destination already exists with unexpected type or size")
+	}
+	return os.Chmod(destination, 0o600)
+}
+
 func validSource(kind, fingerprint string) bool {
 	switch kind {
 	case sourceRegistry, sourceCapture:
@@ -384,7 +574,31 @@ func recordUsable(root string, record ImageRecord) error {
 	if !validDigest(record.ConfigDigest) {
 		return fmt.Errorf("image config identity is missing")
 	}
-	return verifyManifestFiles(root, Manifest{Images: []ImageRecord{record}})
+	exportPath, err := cacheRelativePath(root, record.Export)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(exportPath)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("image export is not a regular file")
+	}
+	for _, blob := range record.Blobs {
+		path, pathErr := blobPath(root, blob.Digest)
+		if pathErr != nil {
+			return pathErr
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return statErr
+		}
+		if !info.Mode().IsRegular() || info.Size() != blob.Size {
+			return fmt.Errorf("image blob %s is unavailable", blob.Digest)
+		}
+	}
+	return nil
 }
 
 func ensureOCILayout(root string) error {
@@ -434,24 +648,11 @@ func writeOCIIndex(root string, images []ImageRecord) error {
 
 func ensureExport(root string, ref name.Tag, img v1.Image, digest v1.Hash) (string, string, error) {
 	refHash := sha256.Sum256([]byte(ref.Name()))
-	relative := filepath.Join("exports", "sha256", digest.Hex, hex.EncodeToString(refHash[:])+".tar")
-	path := filepath.Join(root, relative)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	directory := filepath.Join(root, "exports", "sha256", digest.Hex)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return "", "", err
 	}
-	if _, err := os.Stat(path); err == nil {
-		if err := validateExport(path, ref, img); err == nil {
-			checksum, err := fileDigest(path)
-			return relative, checksum, err
-		}
-		if err := os.Remove(path); err != nil {
-			return "", "", err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", "", err
-	}
-
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".export-*.tar")
+	tmp, err := os.CreateTemp(directory, ".export-*.tar")
 	if err != nil {
 		return "", "", err
 	}
@@ -461,7 +662,8 @@ func ensureExport(root string, ref name.Tag, img v1.Image, digest v1.Hash) (stri
 		_ = tmp.Close()
 		return "", "", err
 	}
-	if err := archive.Write(ref, img, tmp); err != nil {
+	hash := sha256.New()
+	if err := archive.Write(ref, img, io.MultiWriter(tmp, hash)); err != nil {
 		_ = tmp.Close()
 		return "", "", err
 	}
@@ -472,11 +674,16 @@ func ensureExport(root string, ref name.Tag, img v1.Image, digest v1.Hash) (stri
 	if err := tmp.Close(); err != nil {
 		return "", "", err
 	}
-	if err := validateExport(tmpPath, ref, img); err != nil {
-		return "", "", err
-	}
-	checksum, err := fileDigest(tmpPath)
-	if err != nil {
+	checksum := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	relative := filepath.Join("exports", "sha256", digest.Hex,
+		hex.EncodeToString(refHash[:])+"-"+strings.TrimPrefix(checksum, "sha256:")+".tar")
+	path := filepath.Join(root, relative)
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() {
+			return "", "", fmt.Errorf("immutable image export is not a regular file")
+		}
+		return relative, checksum, os.Chmod(path, 0o600)
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", "", err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {

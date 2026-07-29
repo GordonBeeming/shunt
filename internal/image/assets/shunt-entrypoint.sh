@@ -20,6 +20,7 @@ admission_log=/var/log/shunt-docker-api-admission.log
 admission_socket=/var/run/docker.sock
 backend_dir=/run/shunt/dockerd
 backend_socket=$backend_dir/docker.sock
+dockerd_lock_file=/run/shunt/dockerd-offline.lock
 
 print_policy_env() {
     printf '%s\n' \
@@ -53,10 +54,10 @@ admission_pid() {
 }
 
 process_is_running() {
-    pid=$1
-    kill -0 "$pid" 2>/dev/null || return 1
-    if [ -r "/proc/$pid/stat" ]; then
-        process_stat=$(sed -n '1p' "/proc/$pid/stat")
+    process_pid=$1
+    kill -0 "$process_pid" 2>/dev/null || return 1
+    if [ -r "/proc/$process_pid/stat" ]; then
+        process_stat=$(sed -n '1p' "/proc/$process_pid/stat")
         case "$process_stat" in
             *') Z '*) return 1 ;;
         esac
@@ -65,8 +66,8 @@ process_is_running() {
 }
 
 daemon_has_offline_policy() {
-    pid=$1
-    environ=/proc/$pid/environ
+    daemon_pid=$1
+    environ=/proc/$daemon_pid/environ
     [ -r "$environ" ] || return 1
     env_lines=$(tr '\000' '\n' < "$environ")
     printf '%s\n' "$env_lines" | grep -Fqx "HTTP_PROXY=$offline_proxy" || return 1
@@ -76,13 +77,13 @@ daemon_has_offline_policy() {
 }
 
 write_ready_marker() {
-    pid=$1
+    marker_pid=$1
     mkdir -p "${offline_ready_marker%/*}"
     marker_tmp=$offline_ready_marker.tmp.$$
     umask 077
     {
         printf 'version=%s\n' "$offline_policy_version"
-        printf 'pid=%s\n' "$pid"
+        printf 'pid=%s\n' "$marker_pid"
         printf 'proxy=%s\n' "$offline_proxy"
         printf 'admission=%s\n' "$admission_socket"
         printf 'backend=%s\n' "$backend_socket"
@@ -92,14 +93,18 @@ write_ready_marker() {
 
 stop_admission() {
     if admission_process=$(admission_pid); then
-        kill "$admission_process" 2>/dev/null || true
+        if ! kill "$admission_process" 2>/dev/null; then
+            echo "shunt-dockerd-offline: failed to TERM admission PID $admission_process" >&2
+        fi
         i=0
         while process_is_running "$admission_process" && [ "$i" -lt 20 ]; do
             i=$((i + 1))
             sleep 1
         done
         if process_is_running "$admission_process"; then
-            kill -9 "$admission_process" 2>/dev/null || true
+            if ! kill -9 "$admission_process" 2>/dev/null; then
+                echo "shunt-dockerd-offline: failed to KILL admission PID $admission_process" >&2
+            fi
         fi
     fi
     rm -f "$admission_pid_file" "$admission_socket"
@@ -109,14 +114,18 @@ stop_dockerd() {
     rm -f "$offline_ready_marker"
     stop_admission
     if pid=$(dockerd_pid); then
-        kill "$pid" 2>/dev/null || true
+        if ! kill "$pid" 2>/dev/null; then
+            echo "shunt-dockerd-offline: failed to TERM dockerd PID $pid" >&2
+        fi
         i=0
         while process_is_running "$pid" && [ "$i" -lt 20 ]; do
             i=$((i + 1))
             sleep 1
         done
         if process_is_running "$pid"; then
-            kill -9 "$pid" 2>/dev/null || true
+            if ! kill -9 "$pid" 2>/dev/null; then
+                echo "shunt-dockerd-offline: failed to KILL dockerd PID $pid" >&2
+            fi
         fi
     fi
 
@@ -127,7 +136,9 @@ stop_dockerd() {
         containerd_pid=$(sed -n '1p' /var/run/docker/containerd/containerd.pid)
         case "$containerd_pid" in
             ''|*[!0-9]*) ;;
-            *) kill "$containerd_pid" 2>/dev/null || true ;;
+            *) if ! kill "$containerd_pid" 2>/dev/null; then
+                   echo "shunt-dockerd-offline: failed to TERM containerd PID $containerd_pid" >&2
+               fi ;;
         esac
     fi
     rm -f "$dockerd_pid_file" /var/run/docker/containerd/containerd.pid "$backend_socket"
@@ -151,13 +162,36 @@ start_admission() {
 }
 
 ensure_offline_dockerd() {
-    if pid=$(dockerd_pid) \
-        && admitted_docker_ready \
-        && daemon_has_offline_policy "$pid"; then
-        write_ready_marker "$pid"
-        return 0
+    repair_reason="missing dockerd PID"
+    prior_pid=""
+    if pid=$(dockerd_pid); then
+        prior_pid=$pid
+        if ! backend_docker_ready; then
+            repair_reason="backend Docker health check failed"
+        elif ! admitted_docker_ready; then
+            repair_reason="admission proxy health check failed"
+        elif ! daemon_has_offline_policy "$pid"; then
+            repair_reason="offline policy mismatch"
+        else
+            write_ready_marker "$pid"
+            return 0
+        fi
     fi
 
+    echo "shunt-dockerd-offline: repairing dockerd; reason=$repair_reason prior_pid=${prior_pid:-none}" >&2
+
+    # Preserve the log that explains why the previous daemon was rejected.
+    # A dedicated guest may repair itself, but losing the triggering evidence
+    # makes the next failure needlessly opaque.
+    if [ -s "$dockerd_log" ]; then
+        stamp=$(date -u +%Y%m%dT%H%M%SZ)
+        rotated="$dockerd_log.$stamp"
+        if mv "$dockerd_log" "$rotated"; then
+            echo "shunt-dockerd-offline: rotating prior dockerd log to $rotated" >&2
+        else
+            echo "shunt-dockerd-offline: failed to rotate prior dockerd log" >&2
+        fi
+    fi
     stop_dockerd
     mkdir -p "${dockerd_log%/*}" "$backend_dir"
     chmod 0700 "$backend_dir"
@@ -210,7 +244,15 @@ if [ "${1:-}" = "--print-policy-contract" ]; then
     exit 0
 fi
 
+mkdir -p "${dockerd_lock_file%/*}"
+exec 9>"$dockerd_lock_file"
+if ! flock -w 120 9; then
+    echo "shunt-dockerd-offline: timed out waiting for startup lock $dockerd_lock_file" >&2
+    exit 1
+fi
 ensure_offline_dockerd
+flock -u 9
+exec 9>&-
 
 # The same asset is installed under a second name so lifecycle recovery can
 # idempotently enforce the exact startup policy without running entrypoint work.

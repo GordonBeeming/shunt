@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
 
@@ -200,7 +201,7 @@ func TestSidingBaseRejectsPathsOutsideConfigDir(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := sidingBase(state.App{ConfigDir: configDir}, test.siding)
+			got, err := siding.SidingBase(state.App{ConfigDir: configDir}, test.siding)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("sidingBase(%q) error = %v, wantErr %v", test.siding, err, test.wantErr)
 			}

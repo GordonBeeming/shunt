@@ -4,15 +4,17 @@
 
 A siding's guest starts with an empty Docker store. A `0700` content-addressed cache directory keeps immutable image generations, with one Docker-load export per image. It is daemon-free: Apple `container` is the host runtime, and Docker runs inside each guest.
 
-List every dependency image tag in `prebakeImages`:
+`new` and guest recreation also assure Shunt's exact content-versioned base image locally before changing a siding. A stale `latest` tag is never accepted as a substitute, and a missing Shunt base tag is built from the binary's embedded assets instead of being pulled from a registry.
+
+List registry dependency tags in `prebakeImages`, and declare app-owned images in `prebakeBuilds`:
 
 ```bash
-# declare the dependency images once in .shunt.app.json (prebakeImages), then:
+# declare registry tags and local builds once in .shunt.app.json, then:
 shunt-dev warm                            # refresh every configured tag from its registry
 shunt-dev new exp1 && shunt-dev up exp1   # the guest docker-loads the cache → no rebuild, no pull
 ```
 
-`warm` resolves the latest digest for every configured tag and publishes the next immutable generation in `<repos>/.shunt-dev/<project>/cache/` with mode `0700`. Each configured image has its own Docker-load export. Lifecycle commands compare the selected generation with the guest marker, Docker-load only missing or changed refs, then update the marker. Before an application starts, shunt inspects every declared tag. A siding never pulls live: an undeclared image, unavailable export, failed load, or failed inspection stops there. Digest-pinned refs aren't accepted because Docker load cannot recreate a runnable `repo@digest` alias.
+`warm` resolves the latest digest for every configured registry tag, rebuilds every local declaration, and publishes immutable generations in `<repos>/.shunt-dev/<project>/base/images/` with mode `0700`. Each configured image has its own Docker-load export. Lifecycle commands assure the host generation, compare it with the guest marker, Docker-load only missing or changed refs, then update the marker. Before an application starts, shunt inspects every declared tag. A siding never pulls live: an undeclared image, unavailable export, failed load, or failed inspection stops there. Digest-pinned refs aren't accepted because Docker load cannot recreate a runnable `repo@digest` alias. Publication automatically collects unreachable cache content; a cleanup failure warns without undoing the committed generation. Use `shunt-dev warm gc --dry-run` to preview the same collector or `shunt-dev warm gc` to run it explicitly; current, previous, and leased generations stay protected. `warm --from` limits both guest output and archive expansion to `SHUNT_CACHE_MAX_BYTES` (100 GiB by default).
 
 ## Data baseline workflow
 
@@ -20,7 +22,7 @@ shunt-dev new exp1 && shunt-dev up exp1   # the guest docker-loads the cache →
 
 1. Create or use a siding, then prepare the data you want future sidings to start from.
 2. Run `shunt-dev data promote <siding>` to quiesce the app and its volume consumers, then atomically install that siding's complete volume set as the next canonical generation.
-3. Run `shunt-dev new <name>` for a new siding, or `shunt-dev reapply <siding> --fresh-data` to rebuild an existing siding from the promoted generation. Plain `reapply` keeps that siding's current data.
+3. Future `shunt-dev new <name>` calls use the promoted generation. Use `shunt-dev reapply <siding> --fresh-data` to rebuild an existing siding from it; already-created sidings remain unchanged, and plain `reapply` keeps that siding's current data.
 4. Run `shunt-dev data rollback` to swap back to the immediately previous generation.
 5. If a promotion proves bad, roll it back first, then rebuild affected sidings with `reapply --fresh-data`. A failed promotion leaves the current generation in place.
 

@@ -62,6 +62,30 @@ func TestAppleContainerGuestDockerAdmission(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 
+	// Kill the backend once, then race two repair commands. The guest-local
+	// lock must let exactly one invocation repair dockerd while the other waits
+	// and observes the repaired daemon as healthy.
+	repairRace := `set -eu
+backend_pid=$(cat /var/run/docker.pid)
+kill "$backend_pid"
+i=0
+while kill -0 "$backend_pid" 2>/dev/null && [ "$i" -lt 20 ]; do
+    i=$((i + 1))
+    sleep 1
+done
+rm -f /run/shunt/dockerd-offline.ready /tmp/shunt-repair-1.log /tmp/shunt-repair-2.log
+/usr/local/bin/shunt-dockerd-offline >/tmp/shunt-repair-1.log 2>&1 &
+repair_one=$!
+/usr/local/bin/shunt-dockerd-offline >/tmp/shunt-repair-2.log 2>&1 &
+repair_two=$!
+wait "$repair_one"
+wait "$repair_two"
+repair_count=$(grep -h -c 'repairing dockerd' /tmp/shunt-repair-1.log /tmp/shunt-repair-2.log | awk '{ total += $1 } END { print total + 0 }')
+test "$repair_count" = 1
+docker info >/dev/null
+`
+	runHost(t, ctx, "container", "exec", guest, "sh", "-c", repairRace)
+
 	script := `set -eux
 proof_tag=shunt-admission-proof:latest
 proof_container=shunt-admission-proof

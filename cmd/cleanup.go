@@ -110,7 +110,10 @@ func buildCleanupCandidates(ctx context.Context, app state.App, checkDirty bool)
 }
 
 func sidingWorktreeHasChanges(ctx context.Context, app state.App, name string, removing []string) (bool, error) {
-	src, _ := siding.Paths(app, name)
+	src, _, err := siding.Paths(app, name)
+	if err != nil {
+		return false, err
+	}
 	branches := make([]string, 0, len(removing))
 	for _, candidate := range removing {
 		if siding, ok := app.Sidings[candidate]; ok {

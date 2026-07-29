@@ -15,7 +15,7 @@ func newUpCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "up [name]",
 		Short: "Build + start the app in a siding's guest and bridge it (use `switch` to go live)",
-		Args: cobra.MaximumNArgs(1),
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			app, _, err := loadCurrentApp()
@@ -41,29 +41,32 @@ func newUpCmd() *cobra.Command {
 				return fmt.Errorf("%w — if it persists, recreate the guest with `%s reapply %q` then `%s up %q` (keeps your worktree, branch, and data); only if that still fails, `%s rm %q && %s new %q` (this destroys the worktree + data)",
 					err, b, name, b, name, b, name, b, name)
 			}
-			app.Sidings[name] = sd
-			if err := state.SaveApp(app); err != nil {
+			app, err = state.LoadApp(app.ConfigDir)
+			if err != nil {
 				return err
 			}
+			app.Sidings[name] = sd
 
 			if noBridge {
 				fmt.Printf("%s %q started in the guest — not bridged to the host (front door untouched)\n", tick(), name)
 				if u := siding.DashboardURL(app, sd); u != "" {
-					fmt.Printf("  check it on the guest's Aspire dashboard: %s\n", u)
+					fmt.Printf("  dashboard (guest): %s\n", u)
 				}
 				fmt.Printf("  when it looks good: `%s up %s` bridges it, then `%s switch %s` (or `%s up %s --switch`) goes live\n", bin(), name, bin(), name, bin(), name)
+				return nil
+			}
+			if name == app.LiveSiding {
+				fmt.Printf("%s %q is up and live\n", tick(), name)
+				printFrontDoor(app, sd)
+				if u := siding.DashboardURL(app, sd); u != "" {
+					fmt.Printf("  dashboard (guest): %s\n", u)
+				}
 				return nil
 			}
 			// By default `up` brings the siding online (bridged) but leaves the
 			// front door where it is, so it can't yank the shared ports away from
 			// whatever's currently live. Going live is a deliberate `switch`.
 			if !doSwitch {
-				// Re-upping the siding that's already live: its guest IP may have
-				// changed on restart, so refresh the front door (re-point Caddy at the
-				// current bridge). This isn't a user-visible switch — it's already live.
-				if name == app.LiveSiding {
-					return switchTo(ctx, &app, name)
-				}
 				fmt.Printf("%s %q is up and bridged — not live yet\n", tick(), name)
 				fmt.Printf("  run `%s switch %s` to point the front door at it (or `%s up %s --switch` to go live now)\n", bin(), name, bin(), name)
 				if u := siding.DashboardURL(app, sd); u != "" {
@@ -76,7 +79,9 @@ func newUpCmd() *cobra.Command {
 				return err
 			}
 			printFrontDoor(app, app.Sidings[name])
-			fmt.Printf("  dashboard (guest): %s\n", siding.DashboardURL(app, sd))
+			if dashboard := siding.DashboardURL(app, sd); dashboard != "" {
+				fmt.Printf("  dashboard (guest): %s\n", dashboard)
+			}
 			return nil
 		},
 	}

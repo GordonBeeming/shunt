@@ -61,6 +61,20 @@ func (e *CommittedCleanupError) Error() string {
 
 func (e *CommittedCleanupError) Unwrap() error { return e.Err }
 
+// CommittedDurabilityError means the new manifest is visible after rename,
+// but the filesystem refused the directory flush that establishes crash
+// durability. Retrying a non-idempotent promotion or rollback is unsafe.
+type CommittedDurabilityError struct {
+	Operation string
+	Err       error
+}
+
+func (e *CommittedDurabilityError) Error() string {
+	return fmt.Sprintf("%s is visible but durability is unconfirmed; do not retry: %v", e.Operation, e.Err)
+}
+
+func (e *CommittedDurabilityError) Unwrap() error { return e.Err }
+
 // CleanupError reports uncommitted leftovers from an interrupted or failed
 // operation. The canonical manifest is unchanged.
 type CleanupError struct {
@@ -143,6 +157,8 @@ type Manager struct {
 	rename         func(string, string) error
 	remove         func(string) error
 	write          func(string, Metadata) error
+	syncTree       func(string) error
+	syncDir        func(string) error
 	failpoint      func(string)
 }
 
@@ -167,6 +183,8 @@ func New(configDir string, volumes []string) (*Manager, error) {
 		rename:         os.Rename,
 		remove:         os.RemoveAll,
 		write:          writeMetadata,
+		syncTree:       syncTreeDurable,
+		syncDir:        syncDirectoryDurable,
 		failpoint:      func(string) {},
 	}, nil
 }
@@ -332,10 +350,10 @@ func (m *Manager) RollbackContext(ctx context.Context) (Result, error) {
 			return Result{}, errors.New("no previous data baseline generation is available")
 		}
 		next := stateManifest{Version: stateVersion, Current: state.Previous, Previous: state.Current}
-		leftovers, err := m.publishState(next)
+		leftovers, committed, err := m.publishState(next)
 		cleanup = append(cleanup, leftovers...)
 		if err != nil {
-			return Result{}, fmt.Errorf("publish rollback state: %w", err)
+			return Result{Committed: committed}, fmt.Errorf("publish rollback state: %w", err)
 		}
 		return Result{Committed: true}, nil
 	})
@@ -425,6 +443,9 @@ func (m *Manager) publishGeneration(ctx context.Context, state *stateManifest, s
 	if err := validateRoot(stage, m.Volumes); err != nil {
 		return Result{}, leftovers, fmt.Errorf("validate staged baseline generation: %w", err)
 	}
+	if err := m.syncTree(stage); err != nil {
+		return Result{}, leftovers, fmt.Errorf("durably sync staged baseline generation: %w", err)
+	}
 
 	generationID := m.newGenerationID(filepath.Base(stage))
 	generationPath := m.generationRoot(generationID)
@@ -432,16 +453,25 @@ func (m *Manager) publishGeneration(ctx context.Context, state *stateManifest, s
 		return Result{}, leftovers, fmt.Errorf("install immutable baseline generation: %w", err)
 	}
 	leftovers = []string{generationPath}
+	if err := m.syncDir(m.generationsRoot()); err != nil {
+		return Result{}, leftovers, fmt.Errorf("durably install baseline generation: %w", err)
+	}
 	m.failpoint("generation-installed")
 
 	next := stateManifest{Version: stateVersion, Current: generationID}
 	if state != nil {
 		next.Previous = state.Current
 	}
-	stateLeftovers, err := m.publishState(next)
+	stateLeftovers, committed, err := m.publishState(next)
 	leftovers = append(leftovers, stateLeftovers...)
 	if err != nil {
-		return Result{}, leftovers, fmt.Errorf("publish baseline state: %w", err)
+		if committed {
+			leftovers = stateLeftovers
+			if state != nil && state.Previous != "" {
+				leftovers = append(leftovers, m.generationRoot(state.Previous))
+			}
+		}
+		return Result{Committed: committed}, leftovers, fmt.Errorf("publish baseline state: %w", err)
 	}
 
 	// The generation is now referenced by the atomically published manifest.
@@ -452,42 +482,53 @@ func (m *Manager) publishGeneration(ctx context.Context, state *stateManifest, s
 	return Result{Committed: true}, leftovers, nil
 }
 
-func (m *Manager) publishState(state stateManifest) ([]string, error) {
+func (m *Manager) publishState(state stateManifest) ([]string, bool, error) {
 	contents, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		return nil, fmt.Errorf("marshal baseline state: %w", err)
+		return nil, false, fmt.Errorf("marshal baseline state: %w", err)
 	}
 	temp, err := os.CreateTemp(m.ConfigDir, stateTempPrefix)
 	if err != nil {
-		return nil, fmt.Errorf("create baseline state stage: %w", err)
+		return nil, false, fmt.Errorf("create baseline state stage: %w", err)
 	}
 	tempPath := temp.Name()
 	if err := temp.Chmod(0o600); err != nil {
 		_ = temp.Close()
-		return []string{tempPath}, fmt.Errorf("secure baseline state stage: %w", err)
+		return []string{tempPath}, false, fmt.Errorf("secure baseline state stage: %w", err)
 	}
 	if _, err := temp.Write(append(contents, '\n')); err != nil {
 		_ = temp.Close()
-		return []string{tempPath}, fmt.Errorf("write baseline state stage: %w", err)
+		return []string{tempPath}, false, fmt.Errorf("write baseline state stage: %w", err)
 	}
-	if err := temp.Sync(); err != nil {
+	if err := fullSyncFile(temp); err != nil {
 		_ = temp.Close()
-		return []string{tempPath}, fmt.Errorf("sync baseline state stage: %w", err)
+		return []string{tempPath}, false, fmt.Errorf("sync baseline state stage: %w", err)
 	}
 	if err := temp.Close(); err != nil {
-		return []string{tempPath}, fmt.Errorf("close baseline state stage: %w", err)
+		return []string{tempPath}, false, fmt.Errorf("close baseline state stage: %w", err)
 	}
 	m.failpoint("manifest-staged")
 	if err := m.rename(tempPath, m.statePath()); err != nil {
-		return []string{tempPath}, err
+		return []string{tempPath}, false, err
+	}
+	m.failpoint("manifest-renamed")
+	if err := m.syncDir(m.ConfigDir); err != nil {
+		return nil, true, &CommittedDurabilityError{Operation: "baseline manifest", Err: fmt.Errorf("durably publish baseline state: %w", err)}
 	}
 	m.failpoint("manifest-published")
-	return nil, nil
+	return nil, true, nil
 }
 
 func (m *Manager) finishOperation(operation string, result Result, operationErr error, cleanup []string) (Result, error) {
 	failedPaths, cleanupErr := m.cleanupPaths(cleanup)
 	result.RecoveryPaths = mergePaths(result.RecoveryPaths, failedPaths)
+	if result.Committed && operationErr != nil {
+		var durabilityErr *CommittedDurabilityError
+		if errors.As(operationErr, &durabilityErr) {
+			return result, &CommittedDurabilityError{Operation: durabilityErr.Operation, Err: errors.Join(durabilityErr.Err, cleanupErr)}
+		}
+		return result, &CommittedCleanupError{Operation: operation, RecoveryPaths: result.RecoveryPaths, Err: errors.Join(operationErr, cleanupErr)}
+	}
 	if cleanupErr == nil && len(result.RecoveryPaths) == 0 {
 		return result, operationErr
 	}

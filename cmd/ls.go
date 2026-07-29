@@ -100,7 +100,10 @@ func newLsCmd() *cobra.Command {
 					if err != nil {
 						guestState = "-"
 					}
-					src, _ := siding.Paths(app, sn)
+					src, _, err := siding.Paths(app, sn)
+					if err != nil {
+						return err
+					}
 					la.Sidings = append(la.Sidings, lsSiding{
 						Name:      sn,
 						Live:      app.LiveSiding == sn,

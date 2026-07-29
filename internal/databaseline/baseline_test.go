@@ -48,6 +48,38 @@ func TestPromotePublishesImmutableGenerationAndMetadata(t *testing.T) {
 	}
 }
 
+func TestPromoteDurabilityFailureBeforeInstallDoesNotCommit(t *testing.T) {
+	m, source := testManager(t, "db")
+	writeVolume(t, source, "db", "one")
+	m.syncTree = func(string) error { return errors.New("injected tree sync failure") }
+	result, err := m.Promote(context.Background(), "alpha", source)
+	if err == nil || result.Committed || !strings.Contains(err.Error(), "durably sync staged") {
+		t.Fatalf("Promote() = %#v, %v", result, err)
+	}
+	if _, err := os.Stat(m.statePath()); !os.IsNotExist(err) {
+		t.Fatalf("failed durability check published state: %v", err)
+	}
+}
+
+func TestPromoteStateDirectorySyncFailureReportsDurabilityUncertainty(t *testing.T) {
+	m, source := testManager(t, "db")
+	writeVolume(t, source, "db", "one")
+	originalSyncDir := m.syncDir
+	m.syncDir = func(path string) error {
+		if path == m.ConfigDir {
+			return errors.New("injected state directory sync failure")
+		}
+		return originalSyncDir(path)
+	}
+	result, err := m.Promote(context.Background(), "alpha", source)
+	var committed *CommittedDurabilityError
+	if !result.Committed || !errors.As(err, &committed) || !strings.Contains(err.Error(), "durably publish baseline state") {
+		t.Fatalf("Promote() = %#v, %v", result, err)
+	}
+	state := readState(t, m)
+	assertVolume(t, m.generationRoot(state.Current), "db", "one")
+}
+
 func TestPromoteKeepsOnlyCurrentAndPreviousGenerations(t *testing.T) {
 	m, source := testManager(t, "db")
 	for _, value := range []string{"one", "two", "three"} {
@@ -414,6 +446,29 @@ func TestLifecycleRestoreRunsOutsideMutationLock(t *testing.T) {
 	}
 }
 
+func TestPromoteWithLifecycleRestoresAfterSnapshotFailure(t *testing.T) {
+	m, _ := testManager(t, "db")
+	lifecycle := &recordingLifecycle{steps: []string{}, snapshotErr: errors.New("snapshot failed")}
+	result, err := m.PromoteWithLifecycle(context.Background(), "alpha", lifecycle)
+	if err == nil || result.Committed {
+		t.Fatalf("PromoteWithLifecycle() = %#v, %v", result, err)
+	}
+	want := []string{"quiesce", "stop", "sync", "snapshot:db", "restore"}
+	if !reflect.DeepEqual(lifecycle.steps, want) {
+		t.Fatalf("lifecycle order = %v, want %v", lifecycle.steps, want)
+	}
+}
+
+func TestPromoteWithLifecycleReportsCommittedRestoreFailure(t *testing.T) {
+	m, _ := testManager(t, "db")
+	lifecycle := &recordingLifecycle{steps: []string{}, restoreErr: errors.New("restart failed")}
+	result, err := m.PromoteWithLifecycle(context.Background(), "alpha", lifecycle)
+	var restore *RestoreError
+	if !result.Committed || !errors.As(err, &restore) || !reflect.DeepEqual(lifecycle.steps, []string{"quiesce", "stop", "sync", "snapshot:db", "restore"}) {
+		t.Fatalf("PromoteWithLifecycle() = %#v, %v, steps=%v", result, err, lifecycle.steps)
+	}
+}
+
 func TestRetiredGenerationCleanupRunsOutsideMutationLock(t *testing.T) {
 	m, source := testManager(t, "db")
 	for _, value := range []string{"one", "two"} {
@@ -524,7 +579,7 @@ func TestPromotionCrashRecoveryPreservesRollbackPredecessor(t *testing.T) {
 	if os.Getenv("SHUNT_BASELINE_CRASH_HELPER") != "" {
 		t.Skip("parent-only test")
 	}
-	for _, point := range []string{"generation-installed", "manifest-staged", "manifest-published"} {
+	for _, point := range []string{"generation-installed", "manifest-staged", "manifest-renamed", "manifest-published"} {
 		t.Run(point, func(t *testing.T) {
 			m, source := testManager(t, "db")
 			for _, value := range []string{"one", "two"} {
@@ -557,7 +612,7 @@ func TestPromotionCrashRecoveryPreservesRollbackPredecessor(t *testing.T) {
 			}
 			state := readState(t, reopened)
 			want := "one"
-			if point == "manifest-published" {
+			if point == "manifest-renamed" || point == "manifest-published" {
 				want = "two"
 			}
 			assertVolume(t, reopened.generationRoot(state.Current), "db", want)
@@ -827,6 +882,36 @@ func writeCapturedVolume(destination, value string) error {
 type blockingRestoreLifecycle struct {
 	restoreEntered chan struct{}
 	restoreRelease chan struct{}
+}
+
+type recordingLifecycle struct {
+	steps       []string
+	snapshotErr error
+	restoreErr  error
+}
+
+func (l *recordingLifecycle) Quiesce(context.Context) error {
+	l.steps = append(l.steps, "quiesce")
+	return nil
+}
+func (l *recordingLifecycle) StopVolumeConsumers(context.Context) error {
+	l.steps = append(l.steps, "stop")
+	return nil
+}
+func (l *recordingLifecycle) Sync(context.Context) error {
+	l.steps = append(l.steps, "sync")
+	return nil
+}
+func (l *recordingLifecycle) SnapshotHostVolume(_ context.Context, volume, destination string) error {
+	l.steps = append(l.steps, "snapshot:"+volume)
+	if l.snapshotErr != nil {
+		return l.snapshotErr
+	}
+	return os.MkdirAll(destination, 0o700)
+}
+func (l *recordingLifecycle) Restore(context.Context) (RestoreResult, error) {
+	l.steps = append(l.steps, "restore")
+	return RestoreResult{Restored: l.restoreErr == nil}, l.restoreErr
 }
 
 func (*blockingRestoreLifecycle) Quiesce(context.Context) error             { return nil }

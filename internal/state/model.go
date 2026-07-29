@@ -69,11 +69,14 @@ type App struct {
 	DataVolumes []DataVolume      `json:"dataVolumes"`
 	Env         map[string]string `json:"env"`    // extra guest env (Aspire parameters, secrets)
 	Mounts      []MountSpec       `json:"mounts"` // explicit extra host->guest mounts
-	// Dependency images kept in the host Docker cache and copied into sidings so
-	// guests never pull from the network (see `shunt warm`).
-	PrebakeImages []string          `json:"prebakeImages,omitempty"`
-	// Docker named volumes cloned from the host's Docker into each siding's guest
-	// Docker on `new`, so sidings start with the host's test data.
+	// Registry dependency images kept in shunt's daemon-free host cache and
+	// loaded into sidings so guests never pull from the network (see `shunt warm`).
+	PrebakeImages []string `json:"prebakeImages,omitempty"`
+	// Local dependency images built on the host before sidings start. Paths are
+	// absolute after the repository contract is loaded.
+	PrebakeBuilds []PrebakeBuild `json:"prebakeBuilds,omitempty"`
+	// Docker named volumes backed by per-siding host directories. New/fresh-data
+	// sidings clone the project's selected canonical baseline generation.
 	Volumes []string `json:"volumes,omitempty"`
 	// Per-guest resource caps (Apple `container`); empty uses shunt's defaults.
 	Memory string `json:"memory,omitempty"`
@@ -90,6 +93,16 @@ type App struct {
 	DisableCache bool              `json:"disableCache,omitempty"`
 	Sidings      map[string]Siding `json:"sidings"`
 	LiveSiding   string            `json:"liveSiding"` // "" = nothing live
+}
+
+// PrebakeBuild declares one local image build that feeds shunt's shared,
+// daemon-free host cache.
+type PrebakeBuild struct {
+	Image      string            `json:"image"`
+	Context    string            `json:"context"`
+	Dockerfile string            `json:"dockerfile"`
+	Platform   string            `json:"platform,omitempty"`
+	BuildArgs  map[string]string `json:"buildArgs,omitempty"`
 }
 
 // Route is a stable front-door entry. The upstream target is NOT stored — it's

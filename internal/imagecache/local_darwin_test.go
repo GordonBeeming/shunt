@@ -52,7 +52,7 @@ func TestAppleContainerLocalBuildBootstrap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(changes) != 1 || changes[0].Action != "added" || calls.Load() != 2 {
+	if len(changes) != 1 || changes[0].Action != "added" || calls.Load() != 3 {
 		t.Fatalf("bootstrap calls=%d changes=%#v", calls.Load(), changes)
 	}
 	if err := Validate(path); err != nil {

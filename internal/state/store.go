@@ -1,12 +1,14 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/gordonbeeming/shunt/internal/config"
 )
@@ -41,7 +43,7 @@ func SaveRegistry(reg Registry) error {
 		return err
 	}
 	reg.Version = RegistryVersion
-	return withLock(path, func() error { return writeJSON(path, reg) })
+	return withLock(context.Background(), path, func() error { return writeJSON(path, reg) })
 }
 
 // statePath is <configDir>/state.json.
@@ -71,7 +73,34 @@ func SaveApp(app App) error {
 		return fmt.Errorf("create config dir: %w", err)
 	}
 	path := statePath(app.ConfigDir)
-	return withLock(path, func() error { return writeJSON(path, app) })
+	return withLock(context.Background(), path, func() error { return writeJSON(path, app) })
+}
+
+// UpdateApp holds the state-file lock across reload, mutation, and publication.
+// The callback only changes in-memory state; guest and routing work stays outside
+// this short lock.
+func UpdateApp(ctx context.Context, configDir string, update func(*App) error) (App, error) {
+	if configDir == "" {
+		return App{}, errors.New("UpdateApp: configDir is empty")
+	}
+	if update == nil {
+		return App{}, errors.New("UpdateApp: update callback is required")
+	}
+	path := statePath(configDir)
+	var app App
+	err := withLock(ctx, path, func() error {
+		if err := readJSON(path, &app); err != nil {
+			return err
+		}
+		if app.Sidings == nil {
+			app.Sidings = map[string]Siding{}
+		}
+		if err := update(&app); err != nil {
+			return err
+		}
+		return writeJSON(path, app)
+	})
+	return app, err
 }
 
 // --- low-level helpers ---
@@ -121,7 +150,7 @@ func writeJSON(path string, v any) error {
 
 // withLock takes an exclusive flock on <path>.lock for the duration of fn, so
 // concurrent shunt invocations don't interleave reads/writes of shared state.
-func withLock(path string, fn func() error) error {
+func withLock(ctx context.Context, path string, fn func() error) error {
 	lockPath := path + ".lock"
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return fmt.Errorf("create dir for lock: %w", err)
@@ -131,8 +160,19 @@ func withLock(path string, fn func() error) error {
 		return fmt.Errorf("open lock %s: %w", lockPath, err)
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("lock %s: %w", lockPath, err)
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			return fmt.Errorf("lock %s: %w", lockPath, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	return fn()

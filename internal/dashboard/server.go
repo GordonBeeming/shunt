@@ -258,13 +258,8 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
 		msg := ""
-		if updated, err := siding.Up(ctx, app, sd, true, io.Discard); err != nil {
+		if _, err := siding.Up(ctx, app, sd, true, io.Discard); err != nil {
 			msg = "error: " + err.Error()
-		} else {
-			app.Sidings[sdName] = updated
-			if e := state.SaveApp(app); e != nil {
-				msg = "error: " + e.Error()
-			}
 		}
 		s.release(key, msg)
 	}()
@@ -296,14 +291,17 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
-			siding.HostStop(ctx, app)
-			s.release(key, "")
+			msg := ""
+			if err := siding.HostStop(ctx, app); err != nil {
+				msg = "error: " + err.Error()
+			}
+			s.release(key, msg)
 		}()
 		w.WriteHeader(http.StatusAccepted)
 		writeJSON(w, map[string]string{"ok": "stopping host"})
 		return
 	}
-	sd, ok := app.Sidings[sdName]
+	_, ok = app.Sidings[sdName]
 	if !ok {
 		s.release(key, "")
 		http.Error(w, "no siding "+sdName, http.StatusNotFound)
@@ -314,13 +312,11 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 		msg := ""
-		// StopOrForce gracefully stops; only the cgroup.kill wedge (errno 95) triggers the
-		// force-remove escape. A transient failure comes back as an error so the user can
-		// retry rather than lose the guest; `up` self-heals a force-removed guest.
-		if forced, err := container.StopOrForce(ctx, sd.Container); err != nil {
+		result, err := siding.Stop(ctx, app, sdName)
+		if err != nil {
 			msg = "error: " + err.Error()
-		} else {
-			msg = s.markStopped(project, sdName, forced) // forced: guest gone, bridges stale
+		} else if result.Forced {
+			msg = "stopped (forced)"
 		}
 		s.release(key, msg)
 	}()
@@ -442,34 +438,6 @@ func (s *Server) release(key, finalStatus string) {
 	defer s.mu.Unlock()
 	s.busy[key] = false
 	s.status[key] = finalStatus
-}
-
-// markStopped reloads the app fresh (so a concurrent action's state isn't clobbered
-// by a stale in-memory snapshot from the start of this long-running stop), marks the
-// siding stopped, and — when the guest was force-removed — clears its now-stale
-// bridges, then persists. Returns the final status message ("" on a clean stop,
-// "stopped (forced)" after a force-remove, or an "error: …" string).
-func (s *Server) markStopped(project, sdName string, forced bool) string {
-	app, err := loadApp(project)
-	if err != nil {
-		return "error: " + err.Error()
-	}
-	sd, ok := app.Sidings[sdName]
-	if !ok {
-		return ""
-	}
-	sd.Stopped = true
-	if forced {
-		sd.Bridges = nil
-	}
-	app.Sidings[sdName] = sd
-	if err := state.SaveApp(app); err != nil {
-		return "error: " + err.Error()
-	}
-	if forced {
-		return "stopped (forced)"
-	}
-	return ""
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

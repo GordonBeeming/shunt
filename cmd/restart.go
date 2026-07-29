@@ -2,9 +2,7 @@ package cmd
 
 import (
 	"fmt"
-	"time"
 
-	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
@@ -35,8 +33,7 @@ func newRestartCmd() *cobra.Command {
 			}
 			if name == state.HostTarget {
 				fmt.Println("• restarting your local app on the host…")
-				siding.HostStop(ctx, app)
-				if err := siding.HostStart(ctx, app); err != nil {
+				if err := siding.HostRestart(ctx, app); err != nil {
 					return err
 				}
 				fmt.Println(tick() + " host app restarted")
@@ -46,26 +43,15 @@ func newRestartCmd() *cobra.Command {
 			if !ok {
 				return fmt.Errorf("no siding %q — create it with `"+bin()+" new %s`", name, name)
 			}
-			st, _ := container.State(ctx, sd.Container)
-			if st != "running" {
-				return fmt.Errorf("the guest for %q isn't running (state=%s); start it with `"+bin()+" up %s`", name, st, name)
-			}
-
-			fmt.Printf("• stopping the AppHost in %q (keeping deps + data up)…\n", name)
-			if err := siding.StopApp(ctx, app, sd); err != nil {
-				return err
-			}
-			// Clear the old start marker so WaitStarted waits for the fresh run.
-			_, _ = container.Exec(ctx, sd.Container, "sh", "-c", "> /var/log/apphost.log")
-
+			fmt.Printf("• stopping the application process in %q (keeping deps + data up)…\n", name)
 			fmt.Println("• rebuilding + restarting…")
-			if err := siding.StartApp(ctx, app, sd); err != nil {
+			if err := siding.Restart(ctx, app, sd); err != nil {
 				return err
 			}
-			if err := siding.WaitReady(ctx, app, sd, 15*time.Minute); err != nil {
-				return err
+			fmt.Printf("%s %q restarted\n", tick(), name)
+			if dashboard := siding.DashboardURL(app, sd); dashboard != "" {
+				fmt.Printf("  dashboard (guest): %s\n", dashboard)
 			}
-			fmt.Printf("%s %q restarted — dashboard %s\n", tick(), name, siding.DashboardURL(app, sd))
 			return nil
 		},
 	}

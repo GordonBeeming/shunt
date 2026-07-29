@@ -81,9 +81,6 @@ func newAppSwitchCmd() *cobra.Command {
 				if err := switchTo(ctx, &app, app.LiveSiding); err != nil {
 					return err
 				}
-				if err := state.SaveApp(app); err != nil {
-					return err
-				}
 			} else {
 				fmt.Printf("  (no live siding yet — `%s up <siding>` in %s to bring it up)\n", bin(), target)
 			}

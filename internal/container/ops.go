@@ -147,11 +147,19 @@ func Exec(ctx context.Context, name string, args ...string) (string, error) {
 // stdinPath as its stdin (e.g. `docker load` of a warm-cache tar). Uses `exec -i`
 // so no bind mount is needed to get the tar into the guest.
 func ExecStdinFile(ctx context.Context, name, stdinPath string, args ...string) error {
+	_, err := ExecStdinFileDigest(ctx, name, stdinPath, args...)
+	return err
+}
+
+// ExecStdinFileDigest streams a host file into a guest command and returns the
+// digest of exactly the bytes consumed by the guest process.
+func ExecStdinFileDigest(ctx context.Context, name, stdinPath string, args ...string) (string, error) {
 	full := append([]string{"exec", "-i", name}, args...)
-	if err := proc.RunStdin(ctx, stdinPath, Bin, full...); err != nil {
-		return fmt.Errorf("container exec -i %s: %w", name, err)
+	digest, err := proc.RunStdinDigest(ctx, stdinPath, Bin, full...)
+	if err != nil {
+		return "", fmt.Errorf("container exec -i %s: %w", name, err)
 	}
-	return nil
+	return digest, nil
 }
 
 // ExecDetached runs a long-lived command in the guest in the background (e.g. a

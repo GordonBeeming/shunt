@@ -173,7 +173,10 @@ type syncOutcome struct {
 // Conflicts are reported, not auto-resolved, so the caller can hand off to
 // `shunt git` in the worktree.
 func syncSiding(ctx context.Context, app state.App, name, fromOverride string, rebase bool) syncOutcome {
-	src, _ := siding.Paths(app, name)
+	src, _, err := siding.Paths(app, name)
+	if err != nil {
+		return syncOutcome{name: name, kind: syncError, err: err}
+	}
 	base := defaultBranch(ctx, src, fromOverride)
 	target := "origin/" + base
 	out := syncOutcome{name: name, src: src, base: base}
@@ -236,10 +239,14 @@ func defaultBranch(ctx context.Context, src, override string) string {
 }
 
 // commitsAhead counts commits on HEAD not yet on target (local work).
-func commitsAhead(ctx context.Context, src, target string) int { return revListCount(ctx, src, target+"..HEAD") }
+func commitsAhead(ctx context.Context, src, target string) int {
+	return revListCount(ctx, src, target+"..HEAD")
+}
 
 // commitsBehind counts commits on target not yet on HEAD (what a sync pulls in).
-func commitsBehind(ctx context.Context, src, target string) int { return revListCount(ctx, src, "HEAD.."+target) }
+func commitsBehind(ctx context.Context, src, target string) int {
+	return revListCount(ctx, src, "HEAD.."+target)
+}
 
 func revListCount(ctx context.Context, src, rng string) int {
 	res, err := proc.RunInDir(ctx, src, "git", "rev-list", "--count", rng)
