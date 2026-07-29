@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/fsclone"
@@ -102,12 +104,12 @@ func newRmCmd() *cobra.Command {
 					return err
 				}
 				if dirty {
-					confirmed, err := confirmDirtyCleanup([]string{name}, os.Stdin, os.Stdout)
+					confirmed, err := confirmDirtyCleanup([]string{name}, bufio.NewReader(os.Stdin), os.Stdout)
 					if err != nil {
 						return err
 					}
 					if !confirmed {
-						fmt.Println("cleanup cancelled")
+						fmt.Println("removal cancelled")
 						return nil
 					}
 				}
@@ -126,12 +128,14 @@ func removeSiding(ctx context.Context, app *state.App, name string) error {
 	}
 
 	src, _ := siding.Paths(*app, name)
-	base := filepath.Dir(src) // <configDir>/<name>
+	base, err := sidingBase(*app, name)
+	if err != nil {
+		return err
+	}
 	// Validate every filesystem target before touching the guest or worktree, so
 	// a corrupt state file can't leave a partially removed siding.
-	if !filepath.IsAbs(base) || base == "/" || base == "." || filepath.Dir(base) == base {
-		return fmt.Errorf("refusing to remove unsafe siding dir %q (resolved from %q)", base, src)
-	}
+	// sidingBase proves that base is beneath this app's ConfigDir, rather than
+	// only relying on it being an absolute, deep-looking path.
 
 	fmt.Printf("• removing guest %q…\n", sd.Container)
 	if err := container.Remove(ctx, sd.Container); err != nil {

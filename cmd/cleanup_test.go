@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"os"
@@ -50,7 +51,7 @@ func TestPickCleanupByNumberShowsDirtyStateAndSelectsSeveral(t *testing.T) {
 		{Name: "gamma", Status: "up"},
 	}
 	var out bytes.Buffer
-	got, err := pickCleanupByNumber(candidates, strings.NewReader("1,3\n"), &out)
+	got, err := pickCleanupByNumber(candidates, bufio.NewReader(strings.NewReader("1,3\n")), &out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestPickCleanupByNumberShowsDirtyStateAndSelectsSeveral(t *testing.T) {
 
 func TestConfirmDirtyCleanupDefaultsToNo(t *testing.T) {
 	var out bytes.Buffer
-	confirmed, err := confirmDirtyCleanup([]string{"beta"}, strings.NewReader("\n"), &out)
+	confirmed, err := confirmDirtyCleanup([]string{"beta"}, bufio.NewReader(strings.NewReader("\n")), &out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,12 +79,33 @@ func TestConfirmDirtyCleanupDefaultsToNo(t *testing.T) {
 }
 
 func TestConfirmDirtyCleanupAcceptsYes(t *testing.T) {
-	confirmed, err := confirmDirtyCleanup([]string{"beta"}, strings.NewReader("yes\n"), &bytes.Buffer{})
+	confirmed, err := confirmDirtyCleanup([]string{"beta"}, bufio.NewReader(strings.NewReader("yes\n")), &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !confirmed {
 		t.Fatal("yes confirmation was rejected")
+	}
+}
+
+func TestNumberedCleanupPreservesPipedConfirmation(t *testing.T) {
+	candidates := []cleanupCandidate{{Name: "alpha"}}
+	in := bufio.NewReader(strings.NewReader("1\nyes\n"))
+
+	selected, err := pickCleanupByNumber(candidates, in, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(selected, []string{"alpha"}) {
+		t.Fatalf("pickCleanupByNumber() = %#v, want alpha", selected)
+	}
+
+	confirmed, err := confirmDirtyCleanup(selected, in, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !confirmed {
+		t.Fatal("piped confirmation was lost")
 	}
 }
 

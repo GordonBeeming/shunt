@@ -32,6 +32,7 @@ func newCleanupCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
+			in := bufio.NewReader(os.Stdin)
 			app, _, err := loadCurrentApp()
 			if err != nil {
 				return err
@@ -45,7 +46,7 @@ func newCleanupCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			selected, err := pickCleanupCandidates(candidates)
+			selected, err := pickCleanupCandidates(candidates, in)
 			if err != nil {
 				return err
 			}
@@ -63,7 +64,7 @@ func newCleanupCmd() *cobra.Command {
 					return err
 				}
 				if len(dirty) > 0 {
-					confirmed, err := confirmDirtyCleanup(dirty, os.Stdin, os.Stdout)
+					confirmed, err := confirmDirtyCleanup(dirty, in, os.Stdout)
 					if err != nil {
 						return err
 					}
@@ -131,18 +132,18 @@ func worktreeHasChanges(ctx context.Context, src string) (bool, error) {
 	return strings.TrimSpace(out.Stdout) != "", nil
 }
 
-func pickCleanupCandidates(candidates []cleanupCandidate) ([]string, error) {
+func pickCleanupCandidates(candidates []cleanupCandidate, in *bufio.Reader) ([]string, error) {
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
-		return pickCleanupByNumber(candidates, os.Stdin, os.Stdout)
+		return pickCleanupByNumber(candidates, in, os.Stdout)
 	}
-	return pickCleanupInteractive(candidates, fd)
+	return pickCleanupInteractive(candidates, fd, in)
 }
 
-func pickCleanupInteractive(candidates []cleanupCandidate, fd int) ([]string, error) {
+func pickCleanupInteractive(candidates []cleanupCandidate, fd int, in *bufio.Reader) ([]string, error) {
 	old, err := term.MakeRaw(fd)
 	if err != nil {
-		return pickCleanupByNumber(candidates, os.Stdin, os.Stdout)
+		return pickCleanupByNumber(candidates, in, os.Stdout)
 	}
 	defer term.Restore(fd, old)
 
@@ -167,7 +168,6 @@ func pickCleanupInteractive(candidates []cleanupCandidate, fd int) ([]string, er
 		}
 	}
 	draw(true)
-	in := bufio.NewReader(os.Stdin)
 	for {
 		b, err := in.ReadByte()
 		if err != nil {
@@ -208,13 +208,13 @@ func pickCleanupInteractive(candidates []cleanupCandidate, fd int) ([]string, er
 	}
 }
 
-func pickCleanupByNumber(candidates []cleanupCandidate, in io.Reader, out io.Writer) ([]string, error) {
+func pickCleanupByNumber(candidates []cleanupCandidate, in *bufio.Reader, out io.Writer) ([]string, error) {
 	fmt.Fprintln(out, "Select sidings to clean up (comma-separated numbers, 'all', or 'q'):")
 	for i, candidate := range candidates {
 		fmt.Fprintf(out, "  %d) %s  (%s)\n", i+1, candidate.Name, cleanupStatus(candidate))
 	}
 	fmt.Fprint(out, "> ")
-	line, err := bufio.NewReader(in).ReadString('\n')
+	line, err := in.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("read selection: %w", err)
 	}
@@ -292,13 +292,13 @@ func containsName(names []string, target string) bool {
 	return false
 }
 
-func confirmDirtyCleanup(names []string, in io.Reader, out io.Writer) (bool, error) {
+func confirmDirtyCleanup(names []string, in *bufio.Reader, out io.Writer) (bool, error) {
 	fmt.Fprintln(out, "The following sidings have uncommitted changes:")
 	for _, name := range names {
 		fmt.Fprintf(out, "  - %s\n", name)
 	}
 	fmt.Fprint(out, "Permanently remove them and discard those changes? [y/N] ")
-	line, err := bufio.NewReader(in).ReadString('\n')
+	line, err := in.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return false, fmt.Errorf("read confirmation: %w", err)
 	}
