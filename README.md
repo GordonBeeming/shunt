@@ -18,3 +18,5 @@
 ---
 
 Each experiment — a **siding** — runs in its own isolated Apple `container` guest, and a stable Caddy front door lets you switch which siding is live on fixed local ports without disturbing the others. See **[DESIGN.md](DESIGN.md)** for the full model.
+
+Apple `container` is the only host runtime shunt needs. Docker runs inside each guest. Declare dependency images as unique tags in `prebakeImages`, and persistent Docker volumes in `dataVolumes`. `warm` resolves the latest digest for every configured tag into an immutable generation in a `0700` content-addressed cache directory, with one Docker-load export per image. Lifecycle commands compare that generation with the guest marker, load only missing or changed refs, then update the marker. A siding never pulls live: an undeclared or unavailable image stops startup. Re-run `shunt app add` after changing the root `.shunt.app.json`.

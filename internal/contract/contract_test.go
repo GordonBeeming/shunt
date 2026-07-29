@@ -3,6 +3,7 @@ package contract
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -57,14 +58,60 @@ func TestNonAspireContractNeedsNoAppHost(t *testing.T) {
 	}
 }
 
+func TestDigestPinnedPrebakeImageRejected(t *testing.T) {
+	dir := writeContract(t, `{
+      "runner": "node", "start": "npm start",
+      "prebakeImages": ["postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      "frontDoor": [{"key":"web","kind":"http","listenPort":3000,"resource":"web","guestPort":3000}]
+    }`)
+	_, err := Load(dir)
+	if err == nil || !strings.Contains(err.Error(), "Docker save/load cannot recreate a runnable repo@digest alias") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestImageAndVolumeBoundaries(t *testing.T) {
+	valid := `{
+      "runner": "node", "start": "npm start",
+		"prebakeImages": ["postgres:16", "mcr.microsoft.com/azure-storage/azurite:3.35.0", "alpine"],
+      "dataVolumes": ["pg-data", "azurite_data.1"],
+      "frontDoor": [{"key":"web","kind":"http","listenPort":3000,"resource":"web","guestPort":3000}]
+    }`
+	if _, err := Load(writeContract(t, valid)); err != nil {
+		t.Fatalf("valid image and volume contract should load: %v", err)
+	}
+
+	cases := map[string]string{
+		"empty image":      `"prebakeImages":[""]`,
+		"invalid image":    `"prebakeImages":["not a valid image"]`,
+		"digest image":     `"prebakeImages":["postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]`,
+		"duplicate image":  `"prebakeImages":["postgres:16","docker.io/library/postgres:16"]`,
+		"empty volume":     `"dataVolumes":[""]`,
+		"dot volume":       `"dataVolumes":["."]`,
+		"dot-dot volume":   `"dataVolumes":[".."]`,
+		"nested volume":    `"dataVolumes":["data/postgres"]`,
+		"absolute volume":  `"dataVolumes":["/data/postgres"]`,
+		"windows path":     `"dataVolumes":["data\\postgres"]`,
+		"duplicate volume": `"dataVolumes":["pg-data","pg-data"]`,
+	}
+	for name, field := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := `{"runner":"node","start":"npm start",` + field + `,"frontDoor":[{"key":"web","kind":"http","listenPort":3000,"resource":"web","guestPort":3000}]}`
+			if _, err := Load(writeContract(t, body)); err == nil {
+				t.Fatalf("Load() accepted invalid %s contract", name)
+			}
+		})
+	}
+}
+
 func TestValidationErrors(t *testing.T) {
 	cases := map[string]string{
-		"no apphost":      `{"frontDoor":[{"key":"a","kind":"http","listenPort":1,"resource":"r"}]}`,
-		"no routes":       `{"apphost":"x"}`,
-		"bad kind":        `{"apphost":"x","frontDoor":[{"key":"a","kind":"udp","listenPort":1,"resource":"r"}]}`,
-		"dup key":         `{"apphost":"x","frontDoor":[{"key":"a","kind":"http","listenPort":1,"resource":"r"},{"key":"a","kind":"http","listenPort":2,"resource":"r"}]}`,
-		"dup port":        `{"apphost":"x","frontDoor":[{"key":"a","kind":"http","listenPort":1,"resource":"r"},{"key":"b","kind":"http","listenPort":1,"resource":"r"}]}`,
-		"missing resource": `{"apphost":"x","frontDoor":[{"key":"a","kind":"http","listenPort":1}]}`,
+		"no apphost":        `{"frontDoor":[{"key":"a","kind":"http","listenPort":1,"resource":"r"}]}`,
+		"no routes":         `{"apphost":"x"}`,
+		"bad kind":          `{"apphost":"x","frontDoor":[{"key":"a","kind":"udp","listenPort":1,"resource":"r"}]}`,
+		"dup key":           `{"apphost":"x","frontDoor":[{"key":"a","kind":"http","listenPort":1,"resource":"r"},{"key":"a","kind":"http","listenPort":2,"resource":"r"}]}`,
+		"dup port":          `{"apphost":"x","frontDoor":[{"key":"a","kind":"http","listenPort":1,"resource":"r"},{"key":"b","kind":"http","listenPort":1,"resource":"r"}]}`,
+		"missing resource":  `{"apphost":"x","frontDoor":[{"key":"a","kind":"http","listenPort":1}]}`,
 		"port out of range": `{"apphost":"x","frontDoor":[{"key":"a","kind":"http","listenPort":99999,"resource":"r"}]}`,
 	}
 	for name, body := range cases {

@@ -1,6 +1,6 @@
 // Package contract reads the committed in-repo .shunt.app.json — the developer's
-// declaration of an app's stable front-door ports and how they map onto the
-// app's Aspire resources. shunt derives its runtime state from this.
+// declaration of an app's stable front-door ports and runner settings. shunt
+// derives its runtime state from this.
 package contract
 
 import (
@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
 
@@ -26,18 +28,16 @@ type Contract struct {
 	Stop    string `json:"stop"`    // optional clean-stop command (e.g. `aspire stop`); shunt's force-kill is the fallback
 	Workdir string `json:"workdir"` // dir to run Start/Stop in, relative to the repo (default repo root)
 
-	AppHost     string             `json:"apphost"`   // aspire only: rel path to the AppHost project/csproj
-	FrontDoor   []FrontDoorRoute   `json:"frontDoor"` // stable front-door routes
-	Env         map[string]string  `json:"env"`    // extra guest env (Aspire parameters, secrets)
-	Mounts      []state.MountSpec  `json:"mounts"` // explicit extra host->guest mounts (e.g. user-secrets)
-	// Dependency container images Aspire brings up (SQL, Azurite, etc.). shunt
-	// keeps these in the host Docker cache and copies them into each siding, so
-	// siding guests never pull from the network. `shunt warm` uses this list.
+	AppHost   string            `json:"apphost"`   // aspire only: rel path to the AppHost project/csproj
+	FrontDoor []FrontDoorRoute  `json:"frontDoor"` // stable front-door routes
+	Env       map[string]string `json:"env"`       // extra guest env (Aspire parameters, secrets)
+	Mounts    []state.MountSpec `json:"mounts"`    // explicit extra host->guest mounts (e.g. user-secrets)
+	// Dependency container images the application brings up. shunt keeps an exact
+	// daemon-free archive and loads it into each guest. `shunt warm` refreshes it.
 	PrebakeImages []string `json:"prebakeImages"`
-	// Volumes lists Docker named volumes (as named in the AppHost's
-	// WithDataVolume) whose data shunt clones from the host's Docker into each
-	// siding's guest Docker on `new`, so sidings start with the host's test data
-	// instead of an empty DB. Omit for a clean per-siding database.
+	// Volumes lists the Docker named volumes shunt stores in host-backed siding
+	// directories. A new siding clones the current baseline, or starts empty when
+	// no baseline exists. Omit this list when the app has no persistent test data.
 	Volumes []string `json:"dataVolumes"`
 	// FixedPorts pins the front door to the exact listenPort values (no channel
 	// offset). Use when the app's config + Entra redirect URIs point at specific
@@ -94,6 +94,30 @@ func Load(repoPath string) (Contract, error) {
 }
 
 func (c Contract) validate() error {
+	seenImage := make(map[string]struct{}, len(c.PrebakeImages))
+	for i, ref := range c.PrebakeImages {
+		parsed, err := name.ParseReference(ref)
+		if err != nil {
+			return fmt.Errorf("prebakeImages[%d] %q: invalid image reference: %w", i, ref, err)
+		}
+		if _, ok := parsed.(name.Digest); ok {
+			return fmt.Errorf("prebakeImages[%d] %q: digest-pinned images are not supported because Docker save/load cannot recreate a runnable repo@digest alias; use a tag", i, ref)
+		}
+		if _, exists := seenImage[parsed.Name()]; exists {
+			return fmt.Errorf("prebakeImages: duplicate image reference %q", ref)
+		}
+		seenImage[parsed.Name()] = struct{}{}
+	}
+	seenVolume := make(map[string]struct{}, len(c.Volumes))
+	for i, volume := range c.Volumes {
+		if volume == "" || volume == "." || volume == ".." || filepath.Base(volume) != volume || strings.ContainsAny(volume, `/\\`) {
+			return fmt.Errorf("dataVolumes[%d] %q: volume name must be a non-empty name, not a path", i, volume)
+		}
+		if _, exists := seenVolume[volume]; exists {
+			return fmt.Errorf("dataVolumes: duplicate volume name %q", volume)
+		}
+		seenVolume[volume] = struct{}{}
+	}
 	// apphost is Aspire-only (StartApp reads it just for the aspire runner). A
 	// dotnet/node/custom app declares `runner` + `start` instead, so only require
 	// it for the aspire runner (empty runner defaults to aspire).

@@ -5,25 +5,37 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gordonbeeming/shunt/internal/fsclone"
 )
 
-func TestPromoteFirstInstallWritesMetadata(t *testing.T) {
+func TestPromotePublishesImmutableGenerationAndMetadata(t *testing.T) {
 	m, source := testManager(t, "db", "cache")
 	writeVolume(t, source, "db", "one")
 	writeVolume(t, source, "cache", "two")
-	m.clock = func() time.Time { return time.Date(2026, 7, 29, 1, 2, 3, 0, time.UTC) }
+	now := time.Date(2026, 7, 29, 1, 2, 3, 0, time.UTC)
+	m.clock = func() time.Time { return now }
 
 	result, err := m.Promote(context.Background(), "alpha", source)
 	if err != nil || !result.Committed {
 		t.Fatalf("Promote() = %#v, %v", result, err)
 	}
-	assertVolume(t, m.currentRoot(), "db", "one")
-	contents, err := os.ReadFile(filepath.Join(m.currentRoot(), metadataName))
+	state := readState(t, m)
+	if state.Version != stateVersion || state.Current == "" || state.Previous != "" {
+		t.Fatalf("state = %#v", state)
+	}
+	current := m.generationRoot(state.Current)
+	assertVolume(t, current, "db", "one")
+	contents, err := os.ReadFile(filepath.Join(current, metadataName))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,63 +43,30 @@ func TestPromoteFirstInstallWritesMetadata(t *testing.T) {
 	if err := json.Unmarshal(contents, &metadata); err != nil {
 		t.Fatal(err)
 	}
-	if metadata.SourceSiding != "alpha" || !metadata.Timestamp.Equal(m.clock()) || len(metadata.Volumes) != 2 {
+	if metadata.SourceSiding != "alpha" || !metadata.Timestamp.Equal(now) || !sameNames(metadata.Volumes, m.Volumes) {
 		t.Fatalf("metadata = %#v", metadata)
 	}
 }
 
-func TestPromoteReplacementKeepsOnlyCurrentAndPrevious(t *testing.T) {
+func TestPromoteKeepsOnlyCurrentAndPreviousGenerations(t *testing.T) {
 	m, source := testManager(t, "db")
-	writeVolume(t, source, "db", "one")
-	if _, err := m.Promote(context.Background(), "one", source); err != nil {
-		t.Fatal(err)
-	}
-	writeVolume(t, source, "db", "two")
-	if _, err := m.Promote(context.Background(), "two", source); err != nil {
-		t.Fatal(err)
-	}
-	writeVolume(t, source, "db", "three")
-	if _, err := m.Promote(context.Background(), "three", source); err != nil {
-		t.Fatal(err)
-	}
-	assertVolume(t, m.currentRoot(), "db", "three")
-	assertVolume(t, m.previousRoot(), "db", "two")
-}
-
-func TestPromoteRotationFailureKeepsRecoveryPaths(t *testing.T) {
-	m, source := testManager(t, "db")
-	writeVolume(t, source, "db", "old")
-	if _, err := m.Promote(context.Background(), "old", source); err != nil {
-		t.Fatal(err)
-	}
-	writeVolume(t, source, "db", "new")
-	originalRename := m.rename
-	m.rename = func(from, to string) error {
-		if to == m.previousRoot() {
-			return errors.New("rename previous failed")
+	for _, value := range []string{"one", "two", "three"} {
+		writeVolume(t, source, "db", value)
+		if _, err := m.Promote(context.Background(), value, source); err != nil {
+			t.Fatal(err)
 		}
-		return originalRename(from, to)
 	}
-	result, err := m.Promote(context.Background(), "new", source)
-	if !result.Committed {
-		t.Fatalf("result = %#v, want committed", result)
-	}
-	var cleanup *CommittedCleanupError
-	if !errors.As(err, &cleanup) {
-		t.Fatalf("Promote() error = %v, want CommittedCleanupError", err)
-	}
-	assertVolume(t, m.currentRoot(), "db", "new")
-	if len(cleanup.RecoveryPaths) == 0 {
-		t.Fatal("cleanup error has no recovery path")
-	}
-	for _, path := range cleanup.RecoveryPaths {
-		if _, statErr := os.Stat(path); statErr != nil {
-			t.Fatalf("recovery path %q missing: %v", path, statErr)
-		}
+	state := readState(t, m)
+	assertVolume(t, m.generationRoot(state.Current), "db", "three")
+	assertVolume(t, m.generationRoot(state.Previous), "db", "two")
+	want := []string{state.Current, state.Previous}
+	sort.Strings(want)
+	if got := generationEntries(t, m); !reflect.DeepEqual(got, want) {
+		t.Fatalf("generations = %v, want current and previous", got)
 	}
 }
 
-func TestRollbackSwapsCurrentAndPrevious(t *testing.T) {
+func TestRollbackPublishesPreviousAsCurrent(t *testing.T) {
 	m, source := testManager(t, "db")
 	writeVolume(t, source, "db", "old")
 	if _, err := m.Promote(context.Background(), "old", source); err != nil {
@@ -97,37 +76,117 @@ func TestRollbackSwapsCurrentAndPrevious(t *testing.T) {
 	if _, err := m.Promote(context.Background(), "new", source); err != nil {
 		t.Fatal(err)
 	}
+
 	result, err := m.Rollback()
 	if err != nil || !result.Committed {
 		t.Fatalf("Rollback() = %#v, %v", result, err)
 	}
-	assertVolume(t, m.currentRoot(), "db", "old")
-	assertVolume(t, m.previousRoot(), "db", "new")
+	state := readState(t, m)
+	assertVolume(t, m.generationRoot(state.Current), "db", "old")
+	assertVolume(t, m.generationRoot(state.Previous), "db", "new")
 }
 
-func TestPromoteSecondCopyFailurePreservesCurrent(t *testing.T) {
-	m, source := testManager(t, "db", "cache")
-	writeVolume(t, source, "db", "stable")
-	writeVolume(t, source, "cache", "stable")
-	if _, err := m.Promote(context.Background(), "stable", source); err != nil {
+func TestSeedInstallsOnlyWhenCanonicalStateIsAbsent(t *testing.T) {
+	m, _ := testManager(t, "db", "cache")
+	result, err := m.Seed(context.Background(), "explicit-seed", testCapture(map[string]string{"db": "one", "cache": "two"}))
+	if err != nil || !result.Committed {
+		t.Fatalf("Seed() = %#v, %v", result, err)
+	}
+	state := readState(t, m)
+	assertVolume(t, m.generationRoot(state.Current), "db", "one")
+
+	called := false
+	result, err = m.Seed(context.Background(), "explicit-seed", func(context.Context, string, string) error {
+		called = true
+		return nil
+	})
+	if err != nil || result.Committed || called {
+		t.Fatalf("second Seed() = %#v, %v; capture called=%t", result, err, called)
+	}
+}
+
+func TestSeedRejectsInvalidExistingStateWithoutMutation(t *testing.T) {
+	m, _ := testManager(t, "db")
+	if err := os.WriteFile(m.statePath(), []byte("{not-json\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeVolume(t, source, "db", "candidate")
-	m.clone = func(_ context.Context, src, dest string) error {
-		if filepath.Base(src) == "cache" {
-			return errors.New("copy failed")
-		}
-		return copyVolume(src, dest)
+	before := snapshotBytes(t, m.ConfigDir)
+	called := false
+	result, err := m.Seed(context.Background(), "seed", func(context.Context, string, string) error {
+		called = true
+		return nil
+	})
+	if err == nil || result.Committed || called {
+		t.Fatalf("Seed() = %#v, %v; capture called=%t", result, err, called)
 	}
-	if _, err := m.Promote(context.Background(), "candidate", source); err == nil {
-		t.Fatal("Promote() error = nil")
+	after := snapshotBytes(t, m.ConfigDir)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("invalid state mutated:\nbefore=%v\nafter=%v", before, after)
 	}
-	assertVolume(t, m.currentRoot(), "db", "stable")
-	assertVolume(t, m.currentRoot(), "cache", "stable")
 }
 
-func TestResetVolumeRootCreatesAtomicEmptySetWithoutBaseline(t *testing.T) {
+func TestSeedRejectsIncompleteExistingStateWithoutMutation(t *testing.T) {
+	m, _ := testManager(t, "db")
+	orphan := filepath.Join(m.generationsRoot(), generationPrefix+"orphan")
+	writeVolume(t, orphan, "db", "do-not-touch")
+	before := snapshotBytes(t, m.ConfigDir)
+
+	result, err := m.InitializeEmpty(context.Background())
+	if err == nil || result.Committed {
+		t.Fatalf("InitializeEmpty() = %#v, %v", result, err)
+	}
+	if after := snapshotBytes(t, m.ConfigDir); !reflect.DeepEqual(after, before) {
+		t.Fatalf("incomplete state mutated:\nbefore=%v\nafter=%v", before, after)
+	}
+}
+
+func TestRejectsUnsupportedLegacyLayoutWithoutMutation(t *testing.T) {
+	m, _ := testManager(t, "db")
+	writeVolume(t, filepath.Join(m.ConfigDir, "baseline"), "db", "legacy")
+	before := snapshotBytes(t, m.ConfigDir)
+
+	result, err := m.InitializeEmpty(context.Background())
+	if err == nil || result.Committed || !strings.Contains(err.Error(), "unsupported pre-generation baseline layout") {
+		t.Fatalf("InitializeEmpty() = %#v, %v", result, err)
+	}
+	if after := snapshotBytes(t, m.ConfigDir); !reflect.DeepEqual(after, before) {
+		t.Fatalf("legacy layout mutated:\nbefore=%v\nafter=%v", before, after)
+	}
+}
+
+func TestInitializeEmptyCreatesEveryDeclaredVolume(t *testing.T) {
 	m, _ := testManager(t, "db", "cache")
+	result, err := m.InitializeEmpty(context.Background())
+	if err != nil || !result.Committed {
+		t.Fatalf("InitializeEmpty() = %#v, %v", result, err)
+	}
+	state := readState(t, m)
+	for _, volume := range m.Volumes {
+		entries, err := os.ReadDir(filepath.Join(m.generationRoot(state.Current), volume))
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("empty generation volume %q = %v, %v", volume, entries, err)
+		}
+	}
+}
+
+func TestResetRequiresExplicitInitialization(t *testing.T) {
+	m, _ := testManager(t, "db")
+	destination := filepath.Join(m.ConfigDir, "alpha", "vol")
+	result, err := m.ResetVolumeRoot(context.Background(), destination)
+	if err == nil || result.Committed {
+		t.Fatalf("ResetVolumeRoot() = %#v, %v", result, err)
+	}
+	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+		t.Fatalf("destination exists after rejected reset: %v", err)
+	}
+}
+
+func TestResetClonesInitializedEmptyGeneration(t *testing.T) {
+	m, _ := testManager(t, "db", "cache")
+	m.cloneVolumeSet = cloneVolumeSetForTest
+	if _, err := m.InitializeEmpty(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	destination := filepath.Join(m.ConfigDir, "alpha", "vol")
 	writeVolume(t, destination, "db", "old")
 	result, err := m.ResetVolumeRoot(context.Background(), destination)
@@ -140,6 +199,394 @@ func TestResetVolumeRootCreatesAtomicEmptySetWithoutBaseline(t *testing.T) {
 			t.Fatalf("empty reset %q = %v, %v", volume, entries, err)
 		}
 	}
+}
+
+func TestPromoteCaptureFailurePreservesCurrent(t *testing.T) {
+	m, source := testManager(t, "db", "cache")
+	writeVolume(t, source, "db", "stable")
+	writeVolume(t, source, "cache", "stable")
+	if _, err := m.Promote(context.Background(), "stable", source); err != nil {
+		t.Fatal(err)
+	}
+	stable := readState(t, m)
+	writeVolume(t, source, "db", "candidate")
+	m.clone = func(_ context.Context, src, dest string) error {
+		if filepath.Base(src) == "cache" {
+			return errors.New("copy failed")
+		}
+		return copyVolume(src, dest)
+	}
+
+	result, err := m.Promote(context.Background(), "candidate", source)
+	if err == nil || result.Committed {
+		t.Fatalf("Promote() = %#v, %v", result, err)
+	}
+	if got := readState(t, m); got != stable {
+		t.Fatalf("state changed = %#v, want %#v", got, stable)
+	}
+	assertVolume(t, m.generationRoot(stable.Current), "db", "stable")
+}
+
+func TestPromotionCleanupFailureReportsCommittedRecoveryPath(t *testing.T) {
+	m, source := testManager(t, "db")
+	for _, value := range []string{"one", "two"} {
+		writeVolume(t, source, "db", value)
+		if _, err := m.Promote(context.Background(), value, source); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldPrevious := m.generationRoot(readState(t, m).Previous)
+	originalRemove := m.remove
+	m.remove = func(path string) error {
+		if path == oldPrevious {
+			return errors.New("cleanup denied")
+		}
+		return originalRemove(path)
+	}
+	writeVolume(t, source, "db", "three")
+
+	result, err := m.Promote(context.Background(), "three", source)
+	if !result.Committed {
+		t.Fatalf("result = %#v, want committed", result)
+	}
+	var cleanup *CommittedCleanupError
+	if !errors.As(err, &cleanup) || !reflect.DeepEqual(cleanup.RecoveryPaths, []string{oldPrevious}) {
+		t.Fatalf("Promote() error = %v, want recovery path %s", err, oldPrevious)
+	}
+	state := readState(t, m)
+	assertVolume(t, m.generationRoot(state.Current), "db", "three")
+	assertVolume(t, m.generationRoot(state.Previous), "db", "two")
+	if _, statErr := os.Stat(oldPrevious); statErr != nil {
+		t.Fatalf("recovery generation missing: %v", statErr)
+	}
+}
+
+func TestResetCleanupFailureReportsCommittedDestination(t *testing.T) {
+	m, _ := testManager(t, "db")
+	if _, err := m.InitializeEmpty(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	recovery := filepath.Join(m.ConfigDir, "alpha", ".volumes-stage-recovery")
+	if err := os.MkdirAll(recovery, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m.cloneVolumeSet = func(context.Context, string, string, []string) (fsclone.VolumeSetResult, error) {
+		result := fsclone.VolumeSetResult{Committed: true, RecoveryPaths: []string{recovery}}
+		return result, &fsclone.VolumeSetCleanupError{Committed: true, RecoveryPaths: result.RecoveryPaths, Err: errors.New("cleanup denied")}
+	}
+	result, err := m.ResetVolumeRoot(context.Background(), filepath.Join(m.ConfigDir, "alpha", "vol"))
+	var cleanup *CommittedCleanupError
+	if !result.Committed || !errors.As(err, &cleanup) || !reflect.DeepEqual(result.RecoveryPaths, []string{recovery}) {
+		t.Fatalf("ResetVolumeRoot() = %#v, %v", result, err)
+	}
+}
+
+func TestCleanupReportsDeterministicRecoveryPaths(t *testing.T) {
+	m, _ := testManager(t, "db")
+	if _, err := m.InitializeEmpty(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	orphan := m.generationRoot(generationPrefix + "retired")
+	writeVolume(t, orphan, "db", "retired")
+	originalRemove := m.remove
+	m.remove = func(path string) error {
+		if path == orphan {
+			return errors.New("cleanup denied")
+		}
+		return originalRemove(path)
+	}
+
+	result, err := m.Cleanup(context.Background())
+	var cleanup *CommittedCleanupError
+	if !result.Committed || !errors.As(err, &cleanup) {
+		t.Fatalf("Cleanup() = %#v, %v", result, err)
+	}
+	if !reflect.DeepEqual(result.RecoveryPaths, []string{orphan}) {
+		t.Fatalf("recovery paths = %v, want %s", result.RecoveryPaths, orphan)
+	}
+}
+
+func TestLockSerializesPromotions(t *testing.T) {
+	m, source := testManager(t, "db")
+	writeVolume(t, source, "db", "one")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	m.clone = func(_ context.Context, src, dest string) error {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return copyVolume(src, dest)
+	}
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	go func() { _, err := m.Promote(context.Background(), "one", source); first <- err }()
+	<-entered
+	go func() { _, err := m.Promote(context.Background(), "two", source); second <- err }()
+	select {
+	case err := <-second:
+		t.Fatalf("second promotion escaped lock early: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLockWaitRespectsCancellation(t *testing.T) {
+	m, source := testManager(t, "db")
+	writeVolume(t, source, "db", "one")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	m.clone = func(_ context.Context, src, dest string) error {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+		return copyVolume(src, dest)
+	}
+	first := make(chan error, 1)
+	go func() { _, err := m.Promote(context.Background(), "one", source); first <- err }()
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	result, err := m.Promote(ctx, "two", source)
+	if !errors.Is(err, context.DeadlineExceeded) || result.Committed {
+		t.Fatalf("canceled Promote() = %#v, %v", result, err)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancellationAtCommitStillReportsCommitted(t *testing.T) {
+	m, source := testManager(t, "db")
+	writeVolume(t, source, "db", "one")
+	ctx, cancel := context.WithCancel(context.Background())
+	m.failpoint = func(point string) {
+		if point == "manifest-published" {
+			cancel()
+		}
+	}
+	result, err := m.Promote(ctx, "one", source)
+	if err != nil || !result.Committed {
+		t.Fatalf("Promote() = %#v, %v", result, err)
+	}
+}
+
+func TestLifecycleRestoreRunsOutsideMutationLock(t *testing.T) {
+	m, source := testManager(t, "db")
+	writeVolume(t, source, "db", "second")
+	restoreEntered := make(chan struct{})
+	restoreRelease := make(chan struct{})
+	lifecycle := &blockingRestoreLifecycle{restoreEntered: restoreEntered, restoreRelease: restoreRelease}
+	first := make(chan error, 1)
+	go func() {
+		_, err := m.PromoteWithLifecycle(context.Background(), "first", lifecycle)
+		first <- err
+	}()
+	<-restoreEntered
+
+	second := make(chan error, 1)
+	go func() {
+		_, err := m.Promote(context.Background(), "second", source)
+		second <- err
+	}()
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("promotion blocked behind lifecycle restore")
+	}
+	close(restoreRelease)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetiredGenerationCleanupRunsOutsideMutationLock(t *testing.T) {
+	m, source := testManager(t, "db")
+	for _, value := range []string{"one", "two"} {
+		writeVolume(t, source, "db", value)
+		if _, err := m.Promote(context.Background(), value, source); err != nil {
+			t.Fatal(err)
+		}
+	}
+	retired := m.generationRoot(readState(t, m).Previous)
+	cleanupEntered := make(chan struct{})
+	cleanupRelease := make(chan struct{})
+	originalRemove := m.remove
+	var once sync.Once
+	m.remove = func(path string) error {
+		if path == retired {
+			once.Do(func() {
+				close(cleanupEntered)
+				<-cleanupRelease
+			})
+		}
+		return originalRemove(path)
+	}
+	writeVolume(t, source, "db", "three")
+	promotion := make(chan error, 1)
+	go func() {
+		_, err := m.Promote(context.Background(), "three", source)
+		promotion <- err
+	}()
+	<-cleanupEntered
+
+	rollback := make(chan Result, 1)
+	rollbackErr := make(chan error, 1)
+	go func() {
+		result, err := m.RollbackContext(context.Background())
+		rollback <- result
+		rollbackErr <- err
+	}()
+	select {
+	case result := <-rollback:
+		if !result.Committed {
+			t.Fatalf("RollbackContext() result = %#v", result)
+		}
+		// The still-running cleanup may be reported as recoverable, but it must
+		// not keep rollback from reaching its manifest commit.
+		<-rollbackErr
+	case <-time.After(time.Second):
+		t.Fatal("rollback blocked behind retired-generation cleanup")
+	}
+	close(cleanupRelease)
+	if err := <-promotion; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResetLeasePreservesGenerationAcrossConcurrentPromotions(t *testing.T) {
+	m, source := testManager(t, "db")
+	writeVolume(t, source, "db", "one")
+	if _, err := m.Promote(context.Background(), "one", source); err != nil {
+		t.Fatal(err)
+	}
+	leasedGeneration := m.generationRoot(readState(t, m).Current)
+	cloneEntered := make(chan struct{})
+	cloneRelease := make(chan struct{})
+	m.cloneVolumeSet = func(ctx context.Context, sourceRoot, destinationRoot string, volumes []string) (fsclone.VolumeSetResult, error) {
+		close(cloneEntered)
+		<-cloneRelease
+		return cloneVolumeSetForTest(ctx, sourceRoot, destinationRoot, volumes)
+	}
+	reset := make(chan error, 1)
+	go func() {
+		_, err := m.ResetVolumeRoot(context.Background(), filepath.Join(m.ConfigDir, "beta", "vol"))
+		reset <- err
+	}()
+	<-cloneEntered
+
+	for _, value := range []string{"two", "three"} {
+		writeVolume(t, source, "db", value)
+		result, err := m.Promote(context.Background(), value, source)
+		if value == "two" && err != nil {
+			t.Fatal(err)
+		}
+		if value == "three" {
+			var cleanup *CommittedCleanupError
+			if !result.Committed || !errors.As(err, &cleanup) {
+				t.Fatalf("third Promote() = %#v, %v", result, err)
+			}
+			if !reflect.DeepEqual(result.RecoveryPaths, []string{leasedGeneration}) {
+				t.Fatalf("recovery paths = %v, want leased generation", result.RecoveryPaths)
+			}
+		}
+	}
+	if _, err := os.Stat(leasedGeneration); err != nil {
+		t.Fatalf("leased generation was removed: %v", err)
+	}
+	close(cloneRelease)
+	if err := <-reset; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Cleanup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(leasedGeneration); !os.IsNotExist(err) {
+		t.Fatalf("retired generation remains after lease release: %v", err)
+	}
+}
+
+func TestPromotionCrashRecoveryPreservesRollbackPredecessor(t *testing.T) {
+	if os.Getenv("SHUNT_BASELINE_CRASH_HELPER") != "" {
+		t.Skip("parent-only test")
+	}
+	for _, point := range []string{"generation-installed", "manifest-staged", "manifest-published"} {
+		t.Run(point, func(t *testing.T) {
+			m, source := testManager(t, "db")
+			for _, value := range []string{"one", "two"} {
+				writeVolume(t, source, "db", value)
+				if _, err := m.Promote(context.Background(), value, source); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeVolume(t, source, "db", "three")
+			command := exec.Command(os.Args[0], "-test.run=^TestBaselineCrashHelper$")
+			command.Env = append(os.Environ(),
+				"SHUNT_BASELINE_CRASH_HELPER=1",
+				"SHUNT_BASELINE_CONFIG="+m.ConfigDir,
+				"SHUNT_BASELINE_SOURCE="+source,
+				"SHUNT_BASELINE_FAILPOINT="+point,
+			)
+			err := command.Run()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 73 {
+				t.Fatalf("crash helper = %v, want exit 73", err)
+			}
+
+			reopened, err := New(m.ConfigDir, []string{"db"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := reopened.Rollback()
+			if err != nil || !result.Committed {
+				t.Fatalf("Rollback() after %s = %#v, %v", point, result, err)
+			}
+			state := readState(t, reopened)
+			want := "one"
+			if point == "manifest-published" {
+				want = "two"
+			}
+			assertVolume(t, reopened.generationRoot(state.Current), "db", want)
+			if got := generationEntries(t, reopened); len(got) != 2 {
+				t.Fatalf("recovered generations after %s = %v", point, got)
+			}
+		})
+	}
+}
+
+func TestBaselineCrashHelper(t *testing.T) {
+	if os.Getenv("SHUNT_BASELINE_CRASH_HELPER") == "" {
+		return
+	}
+	m, err := New(os.Getenv("SHUNT_BASELINE_CONFIG"), []string{"db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.clone = func(_ context.Context, src, dest string) error { return copyVolume(src, dest) }
+	point := os.Getenv("SHUNT_BASELINE_FAILPOINT")
+	m.failpoint = func(current string) {
+		if current == point {
+			os.Exit(73)
+		}
+	}
+	if _, err := m.Promote(context.Background(), "crash-candidate", os.Getenv("SHUNT_BASELINE_SOURCE")); err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("failpoint %q did not terminate process", point)
 }
 
 func TestNewRejectsUnsafeNames(t *testing.T) {
@@ -171,18 +618,16 @@ func TestPromoteRejectsSymlinkEscapingConfig(t *testing.T) {
 
 func TestRollbackRejectsMetadataWithDifferentVolumeSet(t *testing.T) {
 	m, source := testManager(t, "db", "cache")
-	writeVolume(t, source, "db", "old")
-	writeVolume(t, source, "cache", "old")
-	if _, err := m.Promote(context.Background(), "old", source); err != nil {
-		t.Fatal(err)
+	for _, value := range []string{"old", "new"} {
+		writeVolume(t, source, "db", value)
+		writeVolume(t, source, "cache", value)
+		if _, err := m.Promote(context.Background(), value, source); err != nil {
+			t.Fatal(err)
+		}
 	}
-	writeVolume(t, source, "db", "new")
-	writeVolume(t, source, "cache", "new")
-	if _, err := m.Promote(context.Background(), "new", source); err != nil {
-		t.Fatal(err)
-	}
+	state := readState(t, m)
 	badMetadata := Metadata{SourceSiding: "bad", Timestamp: time.Now(), Volumes: []string{"db"}}
-	if err := writeMetadata(m.previousRoot(), badMetadata); err != nil {
+	if err := writeMetadata(m.generationRoot(state.Previous), badMetadata); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Rollback(); err == nil {
@@ -203,61 +648,6 @@ func TestPromoteAndRollbackRejectZeroVolumes(t *testing.T) {
 	}
 }
 
-func TestPromoteWithLifecycleOrdersCallsAndRestores(t *testing.T) {
-	m, _ := testManager(t, "db", "cache")
-	lifecycle := &recordingLifecycle{}
-	result, err := m.PromoteWithLifecycle(context.Background(), "alpha", lifecycle)
-	if err != nil || !result.Committed || !result.Restore.Restored {
-		t.Fatalf("PromoteWithLifecycle() = %#v, %v", result, err)
-	}
-	want := []string{"quiesce", "stop", "sync", "export:db", "snapshot:db", "export:cache", "snapshot:cache", "restore"}
-	if got := strings.Join(lifecycle.calls, ","); got != strings.Join(want, ",") {
-		t.Fatalf("lifecycle calls = %s, want %s", got, strings.Join(want, ","))
-	}
-}
-
-func TestPromoteWithLifecycleReportsCommittedRestoreFailure(t *testing.T) {
-	m, _ := testManager(t, "db")
-	lifecycle := &recordingLifecycle{restoreErr: errors.New("restart failed")}
-	result, err := m.PromoteWithLifecycle(context.Background(), "alpha", lifecycle)
-	if !result.Committed {
-		t.Fatalf("result = %#v, want committed", result)
-	}
-	var restore *RestoreError
-	if !errors.As(err, &restore) || !restore.Committed {
-		t.Fatalf("error = %v, want committed RestoreError", err)
-	}
-}
-
-func TestLockSerializesPromotions(t *testing.T) {
-	m, source := testManager(t, "db")
-	writeVolume(t, source, "db", "one")
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	m.clone = func(srcCtx context.Context, src, dest string) error {
-		once.Do(func() { close(entered); <-release })
-		return copyVolume(src, dest)
-	}
-	first := make(chan error, 1)
-	second := make(chan error, 1)
-	go func() { _, err := m.Promote(context.Background(), "one", source); first <- err }()
-	<-entered
-	go func() { _, err := m.Promote(context.Background(), "two", source); second <- err }()
-	select {
-	case err := <-second:
-		t.Fatalf("second promotion escaped lock early: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	close(release)
-	if err := <-first; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-second; err != nil {
-		t.Fatal(err)
-	}
-}
-
 func testManager(t *testing.T, volumes ...string) (*Manager, string) {
 	t.Helper()
 	config := t.TempDir()
@@ -266,8 +656,129 @@ func testManager(t *testing.T, volumes ...string) (*Manager, string) {
 		t.Fatal(err)
 	}
 	m.clone = func(_ context.Context, src, dest string) error { return copyVolume(src, dest) }
+	m.cloneVolumeSet = cloneVolumeSetForTest
 	source := filepath.Join(config, "alpha", "vol")
 	return m, source
+}
+
+func cloneVolumeSetForTest(_ context.Context, sourceRoot, destinationRoot string, volumes []string) (fsclone.VolumeSetResult, error) {
+	stage, err := os.MkdirTemp(filepath.Dir(destinationRoot), ".test-volume-stage-")
+	if err != nil {
+		if os.IsNotExist(err) {
+			if mkdirErr := os.MkdirAll(filepath.Dir(destinationRoot), 0o755); mkdirErr != nil {
+				return fsclone.VolumeSetResult{}, mkdirErr
+			}
+			stage, err = os.MkdirTemp(filepath.Dir(destinationRoot), ".test-volume-stage-")
+		}
+		if err != nil {
+			return fsclone.VolumeSetResult{}, err
+		}
+	}
+	defer os.RemoveAll(stage)
+	for _, volume := range volumes {
+		source := filepath.Join(sourceRoot, volume)
+		destination := filepath.Join(stage, volume)
+		if err := copyDirectoryForTest(source, destination); err != nil {
+			return fsclone.VolumeSetResult{}, err
+		}
+	}
+	if err := os.RemoveAll(destinationRoot); err != nil {
+		return fsclone.VolumeSetResult{}, err
+	}
+	if err := os.Rename(stage, destinationRoot); err != nil {
+		return fsclone.VolumeSetResult{}, err
+	}
+	return fsclone.VolumeSetResult{Committed: true}, nil
+}
+
+func copyDirectoryForTest(source, destination string) error {
+	if err := os.MkdirAll(destination, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			if err := copyDirectoryForTest(filepath.Join(source, entry.Name()), filepath.Join(destination, entry.Name())); err != nil {
+				return err
+			}
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(source, entry.Name()))
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(destination, entry.Name()), contents, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readState(t *testing.T, m *Manager) stateManifest {
+	t.Helper()
+	contents, err := os.ReadFile(m.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state stateManifest
+	if err := json.Unmarshal(contents, &state); err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
+func generationEntries(t *testing.T, m *Manager) []string {
+	t.Helper()
+	entries, err := os.ReadDir(m.generationsRoot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), generationPrefix) {
+			result = append(result, entry.Name())
+		}
+	}
+	return result
+}
+
+func snapshotBytes(t *testing.T, root string) map[string]string {
+	t.Helper()
+	result := make(map[string]string)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			result[rel] = "<dir>"
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			result[rel] = "<symlink>" + target
+			return nil
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		result[rel] = string(contents)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 
 func writeVolume(t *testing.T, root, volume, value string) {
@@ -300,40 +811,32 @@ func copyVolume(src, dest string) error {
 	return os.WriteFile(filepath.Join(dest, "value"), contents, 0o644)
 }
 
-type recordingLifecycle struct {
-	calls      []string
-	restoreErr error
+func testCapture(values map[string]string) VolumeCapture {
+	return func(_ context.Context, volume, destination string) error {
+		return writeCapturedVolume(destination, values[volume])
+	}
 }
 
-func (l *recordingLifecycle) Quiesce(context.Context) error {
-	l.calls = append(l.calls, "quiesce")
-	return nil
-}
-
-func (l *recordingLifecycle) StopVolumeConsumers(context.Context) error {
-	l.calls = append(l.calls, "stop")
-	return nil
-}
-
-func (l *recordingLifecycle) Sync(context.Context) error {
-	l.calls = append(l.calls, "sync")
-	return nil
-}
-
-func (l *recordingLifecycle) ExportLegacyGuestVolume(_ context.Context, volume, _ string) error {
-	l.calls = append(l.calls, "export:"+volume)
-	return nil
-}
-
-func (l *recordingLifecycle) SnapshotHostVolume(_ context.Context, volume, destination string) error {
-	l.calls = append(l.calls, "snapshot:"+volume)
+func writeCapturedVolume(destination, value string) error {
 	if err := os.MkdirAll(destination, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(destination, "value"), []byte(volume), 0o644)
+	return os.WriteFile(filepath.Join(destination, "value"), []byte(value), 0o644)
 }
 
-func (l *recordingLifecycle) Restore(context.Context) (RestoreResult, error) {
-	l.calls = append(l.calls, "restore")
-	return RestoreResult{Restored: l.restoreErr == nil}, l.restoreErr
+type blockingRestoreLifecycle struct {
+	restoreEntered chan struct{}
+	restoreRelease chan struct{}
+}
+
+func (*blockingRestoreLifecycle) Quiesce(context.Context) error             { return nil }
+func (*blockingRestoreLifecycle) StopVolumeConsumers(context.Context) error { return nil }
+func (*blockingRestoreLifecycle) Sync(context.Context) error                { return nil }
+func (*blockingRestoreLifecycle) SnapshotHostVolume(_ context.Context, volume, destination string) error {
+	return writeCapturedVolume(destination, volume)
+}
+func (l *blockingRestoreLifecycle) Restore(context.Context) (RestoreResult, error) {
+	close(l.restoreEntered)
+	<-l.restoreRelease
+	return RestoreResult{Restored: true}, nil
 }

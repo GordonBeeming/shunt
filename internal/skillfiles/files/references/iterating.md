@@ -2,17 +2,27 @@
 
 ## Why the first run is slow (and how to fix it)
 
-A siding's guest starts with an empty Docker store. So the first `up` rebuilds any custom dependency images (a SQL+FTS image can be ~6 GB) and re-pulls everything from scratch — that's the ~20–30 min. A native run only feels fast because the host's Docker already has those images cached from an earlier run; a genuinely clean native run is just as slow.
+A siding's guest starts with an empty Docker store. A `0700` content-addressed cache directory keeps immutable image generations, with one Docker-load export per image. It is daemon-free: Apple `container` is the host runtime, and Docker runs inside each guest.
 
-The fix is `shunt warm` — it treats the **host** Docker daemon as the canonical cache:
+List every dependency image tag in `prebakeImages`:
 
 ```bash
 # declare the dependency images once in .shunt.app.json (prebakeImages), then:
-shunt-dev warm                            # ensure they're on the host (pull only what's missing), save to the project cache
+shunt-dev warm                            # refresh every configured tag from its registry
 shunt-dev new exp1 && shunt-dev up exp1   # the guest docker-loads the cache → no rebuild, no pull
 ```
 
-`warm` writes `<repos>/.shunt-dev/<project>/base/images.tar`; every `up` `docker load`s it instead of rebuilding/pulling. When the host already has the images (e.g. you've run the app natively), `warm` touches the network zero times — so a cold siding works even offline. Re-run `warm` when the app's dependencies change. (`--from <siding>` captures from a running guest instead, useful before `prebakeImages` are declared.)
+`warm` resolves the latest digest for every configured tag and publishes the next immutable generation in `<repos>/.shunt-dev/<project>/cache/` with mode `0700`. Each configured image has its own Docker-load export. Lifecycle commands compare the selected generation with the guest marker, Docker-load only missing or changed refs, then update the marker. Before an application starts, shunt inspects every declared tag. A siding never pulls live: an undeclared image, unavailable export, failed load, or failed inspection stops there. Digest-pinned refs aren't accepted because Docker load cannot recreate a runnable `repo@digest` alias.
+
+## Data baseline workflow
+
+`dataVolumes` declares the Docker named volumes that matter to the app. The initial source is empty, so sidings created before any promotion start with empty volume directories.
+
+1. Create or use a siding, then prepare the data you want future sidings to start from.
+2. Run `shunt-dev data promote <siding>` to quiesce the app and its volume consumers, then atomically install that siding's complete volume set as the next canonical generation.
+3. Run `shunt-dev new <name>` for a new siding, or `shunt-dev reapply <siding> --fresh-data` to rebuild an existing siding from the promoted generation. Plain `reapply` keeps that siding's current data.
+4. Run `shunt-dev data rollback` to swap back to the immediately previous generation.
+5. If a promotion proves bad, roll it back first, then rebuild affected sidings with `reapply --fresh-data`. A failed promotion leaves the current generation in place.
 
 ## Going live — build + test on the host first, then bridge deliberately
 
@@ -20,7 +30,7 @@ A siding's `src` is an ordinary checkout on the host, so build it and run the te
 
 Once it builds and the tests pass, bring it online without stealing the front door, then go live deliberately:
 
-1. **Ask the user first, then `shunt up <name> --no-bridge`** — starts the app in the guest but leaves the host alone: no socat bridges and no Caddy, so nothing is taken from whatever's currently live. The command prints the guest's own Aspire dashboard URL; open it to confirm the app actually comes up ("would it work").
+1. **Ask the user first, then `shunt up <name> --no-bridge`** — starts the app in the guest but leaves the host alone: no socat bridges and no Caddy, so nothing is taken from whatever's currently live. Check the runner's guest output (the Aspire dashboard for an Aspire app) to confirm the app actually comes up ("would it work").
 2. **`shunt up <name>`** — bridges the host ports but leaves the stable front door where it is, so it does **not** interrupt whatever's currently live. Safe to run once step 1 looks healthy; the siding now shows as `up` in `ls`.
 3. **Confirm with the user, then `shunt switch <name>`** — *this* repoints the front door at the siding, so it's the step that can interrupt another session/agent using those ports. Going live is only ever an explicit `switch`. (`up <name> --switch` folds steps 2–3 into one when you already want it live.)
 
@@ -47,10 +57,10 @@ For an AI coding client, that confirmation belongs to the user. Stop and name th
 Editing the **root repo's** `.shunt.app.json` or running `shunt config` does **not** reach a siding that already exists — guest settings are baked in when the guest is created, and the app-level front door is derived at `app add` time. (One exception: a siding's *own* worktree `.shunt.app.json` front door — `up`/`switch` on that siding read it live; see the front-door bullet below.) After any config change, re-apply it before expecting the siding to behave differently:
 
 - **Guest settings** — `memory`, `cpus`, `mounts`, `env`: `shunt-dev reapply [siding]` recreates just the container from the app's **saved** settings, keeping the worktree, branch, and data clones; then `shunt-dev up [siding]`. If you changed these in `.shunt.app.json` (rather than via `shunt config`), run `shunt-dev app add` first so the saved settings pick up the edit — `reapply` reads saved state, only `app add` re-reads the contract. If you skip `app add`, `reapply` does not error; it silently recreates the guest with the previously saved memory, CPU, mount, and environment values.
-- If the first `up` after `reapply` fails because the AppHost cannot bind its dashboard port, retry `up` once before digging deeper.
+- If the first `up` after `reapply` fails because the app cannot bind a port, retry `up` once before digging deeper.
 - **Front-door ports/routes** — the contract's `frontDoor` (adding, removing, or renaming a route): **which `.shunt.app.json` you edited matters.** A change in a **siding's** worktree copy (`<repos>/.shunt[-ch]/<project>/<siding>/src/.shunt.app.json`) is that siding's own front door — the guest runs the siding's code, so `up`/`switch` on that siding read it and bridge the new route with **no `app add`** needed. A change in the **root repo's** `.shunt.app.json` is the app-level default (shared by sidings that don't override a route) and needs `shunt-dev app add` to re-derive. Do **not** run `app add` from inside a siding — it repoints the app's `RepoPath` to the worktree and breaks `new`. A route with a declared `guestPort` bridges eagerly (host==guest, no discovery), so even a late `WaitFor`-gated resource gets bridged; if a front-door port isn't coming online, first check it's actually in the siding's contract (`grep <port> <siding-src>/.shunt.app.json`) — not only the root repo's — before chasing discovery/timing.
 
-This is a common miss: a siding built before the edit keeps running the **old** config, so the app misbehaves or dies right after start — e.g. `up`/`aspire start` launches and the AppHost then exits with no error because a mount or env var it needs isn't there. If a siding goes wrong right after a config edit, `reapply` + `up` before you deep-dive the app itself.
+This is a common miss: a siding built before the edit keeps running the **old** config, so the app misbehaves or dies right after start because a mount or environment value it needs isn't there. If a siding goes wrong right after a config edit, run `app add`, then `reapply` + `up` before you deep-dive the app itself.
 
 ## Reading `active --json` to decide the next move
 
