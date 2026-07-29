@@ -1,10 +1,13 @@
 package imagecache
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,6 +23,8 @@ import (
 )
 
 const registryOperationTimeout = 2 * time.Minute
+
+const maxCredentialFormBytes = 1 << 20
 
 func pullImage(ctx context.Context, ref name.Reference, platform v1.Platform) (v1.Image, error) {
 	keychain, err := inlineKeychainFromEnv()
@@ -105,7 +110,11 @@ func (transport *domainBoundTransport) RoundTrip(request *http.Request) (*http.R
 		base = http.DefaultTransport
 	}
 	requestHost := normalizeAuthority(request.URL.Host, request.URL.Scheme)
-	if credentialBearing(request) && !transport.allowedCredentialHost(requestHost) {
+	credentialed, err := credentialBearing(request)
+	if err != nil {
+		return nil, fmt.Errorf("inspect registry request credentials: %w", redact(err))
+	}
+	if credentialed && !transport.allowedCredentialHost(requestHost) {
 		return nil, fmt.Errorf("refusing to send registry credentials to host %q for registry %q", requestHost, normalizeAuthority(transport.registryHost, "https"))
 	}
 	return base.RoundTrip(request)
@@ -131,22 +140,59 @@ var builtInRegistryAuthHosts = map[string][]string{
 	"registry-1.docker.io": {"docker.io", "index.docker.io", "auth.docker.io"},
 }
 
-func credentialBearing(request *http.Request) bool {
+func credentialBearing(request *http.Request) (bool, error) {
 	if request.Header.Get("Authorization") != "" || request.Header.Get("Proxy-Authorization") != "" || request.Header.Get("Cookie") != "" {
-		return true
+		return true, nil
 	}
 	if request.URL.User != nil {
 		if _, set := request.URL.User.Password(); set || request.URL.User.Username() != "" {
-			return true
+			return true, nil
 		}
 	}
 	for key := range request.URL.Query() {
-		switch strings.ToLower(key) {
-		case "password", "passwd", "token", "access_token", "refresh_token", "identitytoken", "registrytoken", "secret", "authorization", "auth":
-			return true
+		if credentialParameter(key) {
+			return true, nil
 		}
 	}
-	return false
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil && request.Header.Get("Content-Type") != "" {
+		return false, fmt.Errorf("parse Content-Type: %w", err)
+	}
+	if mediaType != "application/x-www-form-urlencoded" || request.Body == nil {
+		return false, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(request.Body, maxCredentialFormBytes+1))
+	if err != nil {
+		return false, fmt.Errorf("read form body: %w", err)
+	}
+	if closeErr := request.Body.Close(); closeErr != nil {
+		return false, fmt.Errorf("close form body: %w", closeErr)
+	}
+	request.Body = io.NopCloser(bytes.NewReader(body))
+	request.ContentLength = int64(len(body))
+	if len(body) > maxCredentialFormBytes {
+		return false, fmt.Errorf("form body exceeds %d bytes", maxCredentialFormBytes)
+	}
+	values, err := url.ParseQuery(string(body))
+	if err != nil {
+		return false, fmt.Errorf("parse form body: %w", err)
+	}
+	for key := range values {
+		if credentialParameter(key) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func credentialParameter(key string) bool {
+	key = strings.NewReplacer("_", "", "-", "", ".", "").Replace(strings.ToLower(strings.TrimSpace(key)))
+	switch key {
+	case "password", "passwd", "token", "accesstoken", "refreshtoken", "identitytoken", "registrytoken", "secret", "clientsecret", "authorization", "auth", "code":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeAuthority(host, scheme string) string {

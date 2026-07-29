@@ -22,9 +22,12 @@ import (
 )
 
 const (
-	storeVersion       = 1
+	storeVersion       = 2
 	maxIndexBytes      = 1 << 20
 	maxGenerationBytes = 16 << 20
+	sourceRegistry     = "registry"
+	sourceLocal        = "local"
+	sourceCapture      = "capture"
 )
 
 // Manifest is an immutable description of one cache generation.
@@ -36,15 +39,18 @@ type Manifest struct {
 
 // ImageRecord describes one configured reference and its immutable export.
 type ImageRecord struct {
-	Ref            string       `json:"ref"`
-	Digest         string       `json:"digest"`
-	MediaType      string       `json:"mediaType"`
-	ManifestSize   int64        `json:"manifestSize"`
-	Platform       string       `json:"platform"`
-	Fallback       bool         `json:"fallback,omitempty"`
-	Export         string       `json:"export"`
-	ExportChecksum string       `json:"exportChecksum"`
-	Blobs          []BlobRecord `json:"blobs"`
+	Ref               string       `json:"ref"`
+	Digest            string       `json:"digest"`
+	ConfigDigest      string       `json:"configDigest"`
+	MediaType         string       `json:"mediaType"`
+	ManifestSize      int64        `json:"manifestSize"`
+	Platform          string       `json:"platform"`
+	Fallback          bool         `json:"fallback,omitempty"`
+	SourceKind        string       `json:"sourceKind"`
+	SourceFingerprint string       `json:"sourceFingerprint,omitempty"`
+	Export            string       `json:"export"`
+	ExportChecksum    string       `json:"exportChecksum"`
+	Blobs             []BlobRecord `json:"blobs"`
 }
 
 // BlobRecord identifies one compressed OCI blob reused by cached images.
@@ -59,10 +65,18 @@ type GuestMarker struct {
 	Images     map[string]string `json:"images"`
 }
 
+// GuestState combines the last marker with image identities observed from one
+// batch Docker inspect. Marker data alone is never trusted to skip a load.
+type GuestState struct {
+	Marker   GuestMarker
+	ImageIDs map[string]string
+}
+
 // PlannedImage is a Docker-load-compatible export needed by a guest.
 type PlannedImage struct {
 	Ref      string
 	Digest   string
+	ImageID  string
 	Checksum string
 	Path     string
 	Platform string
@@ -93,9 +107,10 @@ func Inspect(ctx context.Context, path string) (Manifest, error) {
 	return manifest, err
 }
 
-// Plan compares the current generation to a guest marker and returns immutable
-// per-image Docker archives for only the missing or changed refs.
-func Plan(ctx context.Context, path string, guest GuestMarker) (LoadPlan, error) {
+// Plan compares the current generation to image IDs observed in the guest and
+// returns immutable Docker archives for missing or substituted refs. The
+// marker is advisory only: even a current marker cannot hide a wrong image ID.
+func Plan(ctx context.Context, path string, guest GuestState) (LoadPlan, error) {
 	var plan LoadPlan
 	err := withStoreLock(ctx, path, false, func() error {
 		manifest, err := readCurrentUnlocked(path)
@@ -104,11 +119,8 @@ func Plan(ctx context.Context, path string, guest GuestMarker) (LoadPlan, error)
 		}
 		plan.Generation = manifest.Generation
 		plan.Marker = markerFor(manifest)
-		if guest.Generation == manifest.Generation {
-			return nil
-		}
 		for _, image := range manifest.Images {
-			if guest.Images != nil && guest.Images[image.Ref] == image.Digest {
+			if normalizeImageID(guest.ImageIDs[image.Ref]) == image.ConfigDigest {
 				continue
 			}
 			exportPath, err := cacheRelativePath(path, image.Export)
@@ -121,6 +133,7 @@ func Plan(ctx context.Context, path string, guest GuestMarker) (LoadPlan, error)
 			plan.Images = append(plan.Images, PlannedImage{
 				Ref:      image.Ref,
 				Digest:   image.Digest,
+				ImageID:  image.ConfigDigest,
 				Checksum: image.ExportChecksum,
 				Path:     exportPath,
 				Platform: image.Platform,
@@ -164,7 +177,7 @@ func OpenExport(ctx context.Context, path, ref, digest string) (*os.File, error)
 func markerFor(manifest Manifest) GuestMarker {
 	marker := GuestMarker{Generation: manifest.Generation, Images: make(map[string]string, len(manifest.Images))}
 	for _, image := range manifest.Images {
-		marker.Images[image.Ref] = image.Digest
+		marker.Images[image.Ref] = image.ConfigDigest
 	}
 	return marker
 }
@@ -255,7 +268,7 @@ func readCurrentUnlocked(root string) (Manifest, error) {
 	seenRefs := make(map[string]bool, len(manifest.Images))
 	for _, image := range manifest.Images {
 		ref, refErr := name.NewTag(image.Ref)
-		if refErr != nil || ref.Name() != image.Ref || seenRefs[image.Ref] || !validDigest(image.Digest) || !validDigest(image.ExportChecksum) || image.MediaType == "" || image.ManifestSize <= 0 || image.Platform == "" {
+		if refErr != nil || ref.Name() != image.Ref || seenRefs[image.Ref] || !validDigest(image.Digest) || !validDigest(image.ConfigDigest) || !validDigest(image.ExportChecksum) || image.MediaType == "" || image.ManifestSize <= 0 || image.Platform == "" || !validSource(image.SourceKind, image.SourceFingerprint) {
 			return Manifest{}, fmt.Errorf("invalid image record for %q", image.Ref)
 		}
 		seenRefs[image.Ref] = true
@@ -275,7 +288,10 @@ func generationPath(root, generation string) string {
 	return filepath.Join(root, "generations", "sha256", strings.TrimPrefix(generation, "sha256:")+".json")
 }
 
-func storeImage(root string, ref name.Tag, fetched fetchedImage) (ImageRecord, error) {
+func storeImage(root string, ref name.Tag, fetched fetchedImage, sourceKind, sourceFingerprint string) (ImageRecord, error) {
+	if !validSource(sourceKind, sourceFingerprint) {
+		return ImageRecord{}, fmt.Errorf("invalid image source provenance")
+	}
 	img := fetched.image
 	digest, err := img.Digest()
 	if err != nil {
@@ -297,6 +313,10 @@ func storeImage(root string, ref name.Tag, fetched fetchedImage) (ImageRecord, e
 	if err != nil {
 		return ImageRecord{}, err
 	}
+	configDigest, err := img.ConfigName()
+	if err != nil {
+		return ImageRecord{}, err
+	}
 
 	blobs := make([]BlobRecord, 0, len(manifest.Layers)+2)
 	blobs = append(blobs, BlobRecord{Digest: digest.String(), Size: int64(len(rawManifest))})
@@ -313,13 +333,16 @@ func storeImage(root string, ref name.Tag, fetched fetchedImage) (ImageRecord, e
 	}
 
 	record := ImageRecord{
-		Ref:          ref.Name(),
-		Digest:       digest.String(),
-		MediaType:    string(mediaType),
-		ManifestSize: int64(len(rawManifest)),
-		Platform:     platformString(fetched.platform),
-		Fallback:     fetched.fallback,
-		Blobs:        blobs,
+		Ref:               ref.Name(),
+		Digest:            digest.String(),
+		ConfigDigest:      configDigest.String(),
+		MediaType:         string(mediaType),
+		ManifestSize:      int64(len(rawManifest)),
+		Platform:          platformString(fetched.platform),
+		Fallback:          fetched.fallback,
+		SourceKind:        sourceKind,
+		SourceFingerprint: sourceFingerprint,
+		Blobs:             blobs,
 	}
 	if err := writeOCIIndex(root, []ImageRecord{record}); err != nil {
 		return ImageRecord{}, err
@@ -333,6 +356,35 @@ func storeImage(root string, ref name.Tag, fetched fetchedImage) (ImageRecord, e
 		return ImageRecord{}, err
 	}
 	return record, nil
+}
+
+func validSource(kind, fingerprint string) bool {
+	switch kind {
+	case sourceRegistry, sourceCapture:
+		return fingerprint == ""
+	case sourceLocal:
+		return validDigest(fingerprint)
+	default:
+		return false
+	}
+}
+
+func normalizeImageID(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if len(value) == sha256.Size*2 {
+		value = "sha256:" + value
+	}
+	if !validDigest(value) {
+		return ""
+	}
+	return value
+}
+
+func recordUsable(root string, record ImageRecord) error {
+	if !validDigest(record.ConfigDigest) {
+		return fmt.Errorf("image config identity is missing")
+	}
+	return verifyManifestFiles(root, Manifest{Images: []ImageRecord{record}})
 }
 
 func ensureOCILayout(root string) error {
@@ -441,7 +493,7 @@ func validateExport(path string, ref name.Tag, expected v1.Image) error {
 	found := false
 	for _, entry := range manifest {
 		for _, rawTag := range entry.RepoTags {
-			if rawTag == ref.Name() {
+			if sameTagName(rawTag, ref.Name()) {
 				found = true
 			}
 		}
@@ -454,6 +506,11 @@ func validateExport(path string, ref name.Tag, expected v1.Image) error {
 		return err
 	}
 	return compareImageContent(expected, actual)
+}
+
+func sameTagName(raw, canonical string) bool {
+	ref, err := name.NewTag(raw)
+	return err == nil && ref.Name() == canonical
 }
 
 func compareImageContent(expected, actual v1.Image) error {
@@ -816,7 +873,7 @@ func verifyManifestFiles(root string, manifest Manifest) error {
 		foundTag := false
 		for _, entry := range exportManifest {
 			for _, tag := range entry.RepoTags {
-				foundTag = foundTag || tag == record.Ref
+				foundTag = foundTag || sameTagName(tag, record.Ref)
 			}
 		}
 		if !foundTag {

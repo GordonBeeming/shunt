@@ -114,7 +114,7 @@ func importArchive(ctx context.Context, root, archivePath string) error {
 				}
 				platform.Variant = config.Variant
 			}
-			record, err := storeImage(root, tag, fetchedImage{image: img, platform: platform})
+			record, err := storeImage(root, tag, fetchedImage{image: img, platform: platform}, sourceCapture, "")
 			if err != nil {
 				return fmt.Errorf("import captured image %s: %w", tag.Name(), redact(err))
 			}

@@ -60,14 +60,14 @@ func TestAssureUsesCurrentGenerationWithoutRegistryAndPlansChanges(t *testing.T)
 		t.Fatalf("changes = %#v", changes)
 	}
 
-	full, err := Plan(context.Background(), path, GuestMarker{})
+	full, err := Plan(context.Background(), path, GuestState{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(full.Images) != 1 || full.Images[0].Ref != one.Name() || full.Images[0].Path == "" {
 		t.Fatalf("full plan = %#v", full)
 	}
-	noOp, err := Plan(context.Background(), path, full.Marker)
+	noOp, err := Plan(context.Background(), path, GuestState{Marker: full.Marker, ImageIDs: full.Marker.Images})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,12 +180,270 @@ func TestChangedTagPublishesNewGenerationAndPlanLoadsOnlyChangedRef(t *testing.T
 	if after.Generation == before.Generation {
 		t.Fatal("changed tag did not publish a generation")
 	}
-	plan, err := Plan(context.Background(), path, marker)
+	plan, err := Plan(context.Background(), path, GuestState{Marker: marker, ImageIDs: marker.Images})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(plan.Images) != 1 || plan.Images[0].Ref != one.Name() {
 		t.Fatalf("incremental plan = %#v", plan)
+	}
+}
+
+func TestPlanReloadsCurrentMarkerWhenGuestImageIdentityIsWrong(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	ref := mustRef(t, "example.test/identity:latest")
+	installFetcher(t, map[string]v1.Image{ref.Name(): mustImage(t, 70)})
+	if _, err := Assure(context.Background(), path, []string{ref.Name()}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := markerFor(manifest)
+	wrong := mustImage(t, 71)
+	wrongID, err := wrong.ConfigName()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err := Plan(context.Background(), path, GuestState{
+		Marker:   marker,
+		ImageIDs: map[string]string{ref.Name(): wrongID.String()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Images) != 1 || plan.Images[0].Ref != ref.Name() || plan.Images[0].ImageID != manifest.Images[0].ConfigDigest {
+		t.Fatalf("wrong identity plan = %#v", plan)
+	}
+
+	matching, err := Plan(context.Background(), path, GuestState{
+		Marker:   GuestMarker{},
+		ImageIDs: map[string]string{ref.Name(): manifest.Images[0].ConfigDigest},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matching.Images) != 0 {
+		t.Fatalf("matching identity unnecessarily loaded: %#v", matching.Images)
+	}
+}
+
+func TestLocalBuildAssureBuildsMissingAndUnusableButRefreshAlwaysBuilds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	contextDir := t.TempDir()
+	dockerfile := filepath.Join(contextDir, "Containerfile")
+	if err := os.WriteFile(dockerfile, []byte("FROM scratch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ref := mustRef(t, "example.test/local:latest")
+	img := mustImage(t, 72)
+	source := LocalBuildSource{
+		Ref:        ref.Name(),
+		ContextDir: contextDir,
+		Dockerfile: "Containerfile",
+		Platform:   "linux/arm64",
+		BuildArgs:  map[string]string{"ZED": "last", "ALPHA": "first"},
+	}
+
+	var calls [][]string
+	installContainerRunner(t, func(_ context.Context, args ...string) error {
+		calls = append(calls, append([]string(nil), args...))
+		if len(args) >= 3 && args[0] == "image" && args[1] == "save" {
+			output := argumentValue(t, args, "-o")
+			file, err := os.OpenFile(output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			return archive.Write(ref, img, file)
+		}
+		return nil
+	})
+	changes, err := AssureSources(context.Background(), path, nil, []LocalBuildSource{source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || changes[0].Action != "added" || len(calls) != 2 {
+		t.Fatalf("first local assure calls=%#v changes=%#v", calls, changes)
+	}
+	wantBuild := []string{"build", "--platform", "linux/arm64", "--build-arg", "ALPHA=first", "--build-arg", "ZED=last", "-t", ref.Name(), "-f", dockerfile, contextDir}
+	if strings.Join(calls[0], "\x00") != strings.Join(wantBuild, "\x00") {
+		t.Fatalf("build args = %#v, want %#v", calls[0], wantBuild)
+	}
+	firstManifest, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstManifest.Images[0].SourceKind != sourceLocal || !validDigest(firstManifest.Images[0].SourceFingerprint) {
+		t.Fatalf("local source provenance = %#v", firstManifest.Images[0])
+	}
+
+	calls = nil
+	changes, err = AssureSources(context.Background(), path, nil, []LocalBuildSource{source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes[0].Action != "unchanged" || len(calls) != 0 {
+		t.Fatalf("usable local assure rebuilt: calls=%#v changes=%#v", calls, changes)
+	}
+
+	source.BuildArgs["ALPHA"] = "changed"
+	calls = nil
+	changes, err = AssureSources(context.Background(), path, nil, []LocalBuildSource{source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes[0].Action != "updated" || len(calls) != 2 {
+		t.Fatalf("changed local declaration was reused: calls=%#v changes=%#v", calls, changes)
+	}
+	changedManifest, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedManifest.Images[0].SourceFingerprint == firstManifest.Images[0].SourceFingerprint {
+		t.Fatal("changed local declaration retained its source fingerprint")
+	}
+
+	manifest, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exportPath, err := cacheRelativePath(path, manifest.Images[0].Export)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exportPath, []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls = nil
+	changes, err = AssureSources(context.Background(), path, nil, []LocalBuildSource{source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes[0].Action != "unchanged" || len(calls) != 2 {
+		t.Fatalf("unusable local assure did not rebuild: calls=%#v changes=%#v", calls, changes)
+	}
+
+	calls = nil
+	changes, err = RefreshSources(context.Background(), path, nil, []LocalBuildSource{source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes[0].Action != "unchanged" || len(calls) != 2 {
+		t.Fatalf("local refresh did not rebuild: calls=%#v changes=%#v", calls, changes)
+	}
+}
+
+func TestSourceProvenanceCompatibilityMatrix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	ref := mustRef(t, "example.test/provenance:latest")
+	capturedImage := mustImage(t, 73)
+	if err := Capture(path, func(temp string) error {
+		file, err := os.OpenFile(temp, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		return archive.Write(ref, capturedImage, file)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Images[0].SourceKind != sourceCapture {
+		t.Fatalf("captured source kind = %q", manifest.Images[0].SourceKind)
+	}
+
+	oldFetch := fetchImage
+	t.Cleanup(func() { fetchImage = oldFetch })
+	fetchImage = func(context.Context, name.Reference) (fetchedImage, error) {
+		t.Fatal("registry Assure fetched a compatible captured image")
+		return fetchedImage{}, nil
+	}
+	changes, err := Assure(context.Background(), path, []string{ref.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes[0].Action != "unchanged" {
+		t.Fatalf("captured registry Assure changes = %#v", changes)
+	}
+
+	var fetchCalls atomic.Int32
+	fetchImage = func(_ context.Context, _ name.Reference) (fetchedImage, error) {
+		fetchCalls.Add(1)
+		return fetchedImage{image: capturedImage, platform: v1.Platform{OS: "linux", Architecture: runtime.GOARCH}}, nil
+	}
+	changes, err = Refresh(context.Background(), path, []string{ref.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err = Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetchCalls.Load() != 1 || changes[0].Action != "updated" || manifest.Images[0].SourceKind != sourceRegistry {
+		t.Fatalf("captured registry Refresh calls=%d changes=%#v source=%q", fetchCalls.Load(), changes, manifest.Images[0].SourceKind)
+	}
+
+	contextDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(contextDir, "Dockerfile"), []byte("FROM scratch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localImage := mustImage(t, 74)
+	var containerCalls atomic.Int32
+	installContainerRunner(t, func(_ context.Context, args ...string) error {
+		containerCalls.Add(1)
+		if len(args) >= 2 && args[0] == "image" && args[1] == "save" {
+			file, err := os.OpenFile(argumentValue(t, args, "-o"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			return archive.Write(ref, localImage, file)
+		}
+		return nil
+	})
+	changes, err = AssureSources(context.Background(), path, nil, []LocalBuildSource{{Ref: ref.Name(), ContextDir: contextDir}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err = Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containerCalls.Load() != 2 || changes[0].Action != "updated" || manifest.Images[0].SourceKind != sourceLocal {
+		t.Fatalf("registry to local calls=%d changes=%#v source=%q", containerCalls.Load(), changes, manifest.Images[0].SourceKind)
+	}
+
+	fetchCalls.Store(0)
+	changes, err = Assure(context.Background(), path, []string{ref.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err = Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetchCalls.Load() != 1 || changes[0].Action != "updated" || manifest.Images[0].SourceKind != sourceRegistry {
+		t.Fatalf("local to registry calls=%d changes=%#v source=%q", fetchCalls.Load(), changes, manifest.Images[0].SourceKind)
+	}
+}
+
+func TestStoreVersionOneIsRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"version":1,"generation":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	if err := os.WriteFile(filepath.Join(path, "index.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Inspect(context.Background(), path); err == nil || !strings.Contains(err.Error(), "unsupported image cache index") {
+		t.Fatalf("legacy store error = %v", err)
 	}
 }
 
@@ -332,6 +590,66 @@ func TestCrossDomainRealmCannotReceiveCredentials(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("allowed auth host calls = %d", calls.Load())
+	}
+}
+
+func TestCrossDomainRealmCannotReceiveFormCredentials(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "identity token", body: "grant_type=refresh_token&identity_token=identity-secret"},
+		{name: "refresh token", body: "grant_type=refresh_token&refresh_token=refresh-secret"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			base := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				calls.Add(1)
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+			})
+			transport := &domainBoundTransport{base: base, registryHost: "registry.example"}
+			request, err := http.NewRequest(http.MethodPost, "https://auth.attacker.example/token", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			_, err = transport.RoundTrip(request)
+			if err == nil {
+				t.Fatal("cross-domain form credential request succeeded")
+			}
+			if calls.Load() != 0 {
+				t.Fatal("cross-domain realm received a credential form")
+			}
+			for _, secret := range []string{"identity-secret", "refresh-secret"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("credential leaked in error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestAllowedRealmReceivesRestoredFormBody(t *testing.T) {
+	want := "grant_type=refresh_token&refresh_token=refresh-secret"
+	base := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != want {
+			t.Fatalf("body = %q, want %q", body, want)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+	})
+	transport := &domainBoundTransport{base: base, registryHost: "registry.example"}
+	request, err := http.NewRequest(http.MethodPost, "https://registry.example/token", strings.NewReader(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+	if _, err := transport.RoundTrip(request); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -519,6 +837,24 @@ func installFetcher(t *testing.T, images map[string]v1.Image) *fetchCount {
 		return fetchedImage{image: img, platform: v1.Platform{OS: "linux", Architecture: runtime.GOARCH}}, nil
 	}
 	return calls
+}
+
+func installContainerRunner(t *testing.T, runner func(context.Context, ...string) error) {
+	t.Helper()
+	old := runContainer
+	t.Cleanup(func() { runContainer = old })
+	runContainer = runner
+}
+
+func argumentValue(t *testing.T, args []string, name string) string {
+	t.Helper()
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == name {
+			return args[i+1]
+		}
+	}
+	t.Fatalf("argument %q missing from %#v", name, args)
+	return ""
 }
 
 type fileSnapshot struct {

@@ -39,19 +39,46 @@ type cachedImage struct {
 // references are reused without registry traffic; only missing refs are
 // fetched.
 func Assure(ctx context.Context, path string, refs []string) ([]Change, error) {
-	return syncCache(ctx, path, refs, false)
+	return AssureSources(ctx, path, refs, nil)
 }
 
 // Refresh resolves every configured tag, downloads only changed images, and
 // publishes a new generation only when the selected content changed.
 func Refresh(ctx context.Context, path string, refs []string) ([]Change, error) {
-	return syncCache(ctx, path, refs, true)
+	return RefreshSources(ctx, path, refs, nil)
 }
 
-func syncCache(ctx context.Context, path string, refs []string, refresh bool) ([]Change, error) {
+// AssureSources makes the current generation contain precisely registryRefs
+// and local. Existing usable local images are reused; missing or corrupt local
+// images are built with Apple container without relying on a siding or a
+// Docker-compatible host daemon.
+func AssureSources(ctx context.Context, path string, registryRefs []string, local []LocalBuildSource) ([]Change, error) {
+	return syncCache(ctx, path, registryRefs, local, false)
+}
+
+// RefreshSources resolves every registry tag and rebuilds every local source.
+func RefreshSources(ctx context.Context, path string, registryRefs []string, local []LocalBuildSource) ([]Change, error) {
+	return syncCache(ctx, path, registryRefs, local, true)
+}
+
+func syncCache(ctx context.Context, path string, refs []string, local []LocalBuildSource, refresh bool) ([]Change, error) {
 	wanted, err := parseRefs(refs)
 	if err != nil {
 		return nil, err
+	}
+	builds, err := parseLocalBuilds(local)
+	if err != nil {
+		return nil, err
+	}
+	if len(wanted) == 0 && len(builds) == 0 {
+		return nil, fmt.Errorf("no images configured")
+	}
+	for _, build := range builds {
+		for _, want := range wanted {
+			if build.ref.Name() == want.ref.Name() {
+				return nil, fmt.Errorf("image reference %q is configured as both registry and local", build.source.Ref)
+			}
+		}
 	}
 
 	var changes []Change
@@ -69,11 +96,13 @@ func syncCache(ctx context.Context, path string, refs []string, refresh bool) ([
 			existing[image.Ref] = image
 		}
 
-		changes = make([]Change, 0, len(wanted))
-		next := make([]ImageRecord, 0, len(wanted))
+		changes = make([]Change, 0, len(wanted)+len(builds))
+		next := make([]ImageRecord, 0, len(wanted)+len(builds))
 		for _, want := range wanted {
 			old, found := existing[want.ref.Name()]
-			if found && !refresh {
+			compatible := found && registrySourceCompatible(old)
+			usable := compatible && recordUsable(path, old) == nil
+			if usable && !refresh {
 				next = append(next, old)
 				changes = append(changes, changeFromRecord(want.text, old, "unchanged", ""))
 				continue
@@ -87,13 +116,13 @@ func syncCache(ctx context.Context, path string, refs []string, refresh bool) ([
 			if err != nil {
 				return fmt.Errorf("digest %s: %w", want.text, redact(err))
 			}
-			if found && old.Digest == digest.String() {
+			if usable && old.SourceKind == sourceRegistry && old.Digest == digest.String() {
 				next = append(next, old)
 				changes = append(changes, changeFromRecord(want.text, old, "unchanged", old.Digest))
 				continue
 			}
 
-			record, err := storeImage(path, want.ref, fetched)
+			record, err := storeImage(path, want.ref, fetched, sourceRegistry, "")
 			if err != nil {
 				return fmt.Errorf("cache %s: %w", want.text, redact(err))
 			}
@@ -101,13 +130,44 @@ func syncCache(ctx context.Context, path string, refs []string, refresh bool) ([
 			action := "added"
 			previous := ""
 			if found {
-				action = "updated"
 				previous = old.Digest
+				if sameImageSource(old, record) && old.Digest == record.Digest && old.ConfigDigest == record.ConfigDigest {
+					action = "unchanged"
+				} else {
+					action = "updated"
+				}
 			}
 			changes = append(changes, changeFromRecord(want.text, record, action, previous))
 		}
 
+		for _, build := range builds {
+			old, found := existing[build.ref.Name()]
+			if found && localSourceCompatible(old, build.fingerprint) && !refresh && recordUsable(path, old) == nil {
+				next = append(next, old)
+				changes = append(changes, changeFromRecord(build.source.Ref, old, "unchanged", ""))
+				continue
+			}
+
+			record, err := buildAndStoreLocalImage(ctx, path, build)
+			if err != nil {
+				return fmt.Errorf("build and cache local image %s: %w", build.source.Ref, redact(err))
+			}
+			next = append(next, record)
+			action := "added"
+			previous := ""
+			if found {
+				previous = old.Digest
+				if sameImageSource(old, record) && old.Digest == record.Digest && old.ConfigDigest == record.ConfigDigest {
+					action = "unchanged"
+				} else {
+					action = "updated"
+				}
+			}
+			changes = append(changes, changeFromRecord(build.source.Ref, record, action, previous))
+		}
+
 		sortImageRecords(next)
+		sort.Slice(changes, func(i, j int) bool { return changes[i].Ref < changes[j].Ref })
 		candidate := Manifest{Version: storeVersion, Images: next}
 		if sameGenerationContent(current, candidate) {
 			return nil
@@ -118,6 +178,18 @@ func syncCache(ctx context.Context, path string, refs []string, refresh bool) ([
 		return nil, err
 	}
 	return changes, nil
+}
+
+func registrySourceCompatible(record ImageRecord) bool {
+	return (record.SourceKind == sourceRegistry || record.SourceKind == sourceCapture) && record.SourceFingerprint == ""
+}
+
+func localSourceCompatible(record ImageRecord, fingerprint string) bool {
+	return record.SourceKind == sourceLocal && record.SourceFingerprint == fingerprint
+}
+
+func sameImageSource(left, right ImageRecord) bool {
+	return left.SourceKind == right.SourceKind && left.SourceFingerprint == right.SourceFingerprint
 }
 
 func changeFromRecord(ref string, record ImageRecord, action, previous string) Change {
@@ -137,9 +209,6 @@ type wantedRef struct {
 }
 
 func parseRefs(refs []string) ([]wantedRef, error) {
-	if len(refs) == 0 {
-		return nil, fmt.Errorf("no images configured")
-	}
 	seen := map[string]bool{}
 	wanted := make([]wantedRef, 0, len(refs))
 	for _, text := range refs {
