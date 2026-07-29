@@ -70,6 +70,10 @@ func switchTo(ctx context.Context, app *state.App, target string) error {
 // pickSiding lets the user choose a siding — arrow-key navigation on a TTY,
 // numbered prompt otherwise. Each entry shows its live/up/idle/stopped status.
 func pickSiding(ctx context.Context, app state.App, includeHost bool) (string, error) {
+	return pickSidingWithReader(ctx, app, includeHost, bufio.NewReader(os.Stdin))
+}
+
+func pickSidingWithReader(ctx context.Context, app state.App, includeHost bool, in *bufio.Reader) (string, error) {
 	names := make([]string, 0, len(app.Sidings)+1)
 	for n := range app.Sidings {
 		names = append(names, n)
@@ -88,7 +92,7 @@ func pickSiding(ctx context.Context, app state.App, includeHost bool) (string, e
 	statuses := sidingStatuses(ctx, app, names)
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
-		return pickSidingByNumber(app, names, statuses)
+		return pickSidingByNumber(app, names, statuses, in)
 	}
 	return pickSidingInteractive(app, names, statuses, fd)
 }
@@ -136,7 +140,7 @@ func sidingStatuses(ctx context.Context, app state.App, names []string) map[stri
 func pickSidingInteractive(app state.App, names []string, statuses map[string]string, fd int) (string, error) {
 	old, err := term.MakeRaw(fd)
 	if err != nil {
-		return pickSidingByNumber(app, names, statuses)
+		return pickSidingByNumber(app, names, statuses, bufio.NewReader(os.Stdin))
 	}
 	defer term.Restore(fd, old)
 
@@ -214,7 +218,7 @@ func liveMarker(m string) string {
 }
 
 // pickSidingByNumber is the non-TTY fallback: print the list, read a number.
-func pickSidingByNumber(app state.App, names []string, statuses map[string]string) (string, error) {
+func pickSidingByNumber(app state.App, names []string, statuses map[string]string, in *bufio.Reader) (string, error) {
 	fmt.Println("Select a siding:")
 	for i, n := range names {
 		marker := " "
@@ -224,7 +228,7 @@ func pickSidingByNumber(app state.App, names []string, statuses map[string]strin
 		fmt.Printf("  %d) %s %s  (%s)\n", i+1, liveMarker(marker), n, paintStatus(statuses[n]))
 	}
 	fmt.Print("> ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, err := in.ReadString('\n')
 	if err != nil {
 		return "", fmt.Errorf("read selection: %w", err)
 	}
