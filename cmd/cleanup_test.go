@@ -120,7 +120,7 @@ func TestWorktreeHasChanges(t *testing.T) {
 	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "initial")
 	runGit(t, repo, "checkout", "-b", "siding")
 
-	dirty, err := worktreeHasChanges(context.Background(), repo, nil)
+	dirty, err := worktreeHasChanges(context.Background(), repo, "siding", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestWorktreeHasChanges(t *testing.T) {
 	if err := os.WriteFile(tracked, []byte("changed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	dirty, err = worktreeHasChanges(context.Background(), repo, nil)
+	dirty, err = worktreeHasChanges(context.Background(), repo, "siding", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestWorktreeHasChangesDetectsOnlyReachableFromSidingBranch(t *testing.T) {
 	runGit(t, repo, "checkout", "-b", "siding")
 	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unpushed")
 
-	dirty, err := worktreeHasChanges(context.Background(), repo, nil)
+	dirty, err := worktreeHasChanges(context.Background(), repo, "siding", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestWorktreeHasChangesDetectsUntrackedFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, "untracked.txt"), []byte("new\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	dirty, err := worktreeHasChanges(context.Background(), repo, nil)
+	dirty, err := worktreeHasChanges(context.Background(), repo, "main", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestWorktreeHasChangesDetectsUntrackedFile(t *testing.T) {
 }
 
 func TestWorktreeHasChangesAllowsMissingWorktree(t *testing.T) {
-	dirty, err := worktreeHasChanges(context.Background(), filepath.Join(t.TempDir(), "missing"), nil)
+	dirty, err := worktreeHasChanges(context.Background(), filepath.Join(t.TempDir(), "missing"), "siding", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

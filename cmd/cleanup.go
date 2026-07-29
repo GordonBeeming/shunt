@@ -117,10 +117,10 @@ func sidingWorktreeHasChanges(ctx context.Context, app state.App, name string, r
 			branches = append(branches, siding.Branch)
 		}
 	}
-	return worktreeHasChanges(ctx, src, branches)
+	return worktreeHasChanges(ctx, src, app.Sidings[name].Branch, branches)
 }
 
-func worktreeHasChanges(ctx context.Context, src string, removing []string) (bool, error) {
+func worktreeHasChanges(ctx context.Context, src, branch string, removing []string) (bool, error) {
 	info, err := os.Stat(src)
 	if errors.Is(err, os.ErrNotExist) {
 		return true, nil // fail closed: removing the branch may still lose committed work
@@ -139,15 +139,15 @@ func worktreeHasChanges(ctx context.Context, src string, removing []string) (boo
 		return true, nil
 	}
 
-	branch, err := proc.Run(ctx, "git", "-C", src, "symbolic-ref", "--quiet", "HEAD")
-	if err != nil {
-		return false, fmt.Errorf("identify siding branch %s: %w", src, err)
+	checkedOut, err := proc.Run(ctx, "git", "-C", src, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil || strings.TrimSpace(checkedOut.Stdout) != "refs/heads/"+branch {
+		return true, nil
 	}
-	refs, err := proc.Run(ctx, "git", "-C", src, "for-each-ref", "--format=%(refname)", "--contains=HEAD", "refs/heads", "refs/remotes")
+	refs, err := proc.Run(ctx, "git", "-C", src, "for-each-ref", "--format=%(refname)", "--contains=refs/heads/"+branch, "refs/heads", "refs/remotes")
 	if err != nil {
 		return false, fmt.Errorf("check whether siding commits are reachable: %w", err)
 	}
-	removed := map[string]bool{strings.TrimSpace(branch.Stdout): true}
+	removed := map[string]bool{"refs/heads/" + branch: true}
 	for _, branch := range removing {
 		removed["refs/heads/"+branch] = true
 	}
