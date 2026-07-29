@@ -100,7 +100,7 @@ func newRmCmd() *cobra.Command {
 				return fmt.Errorf("siding %q is live — switch away first, or pass --force", name)
 			}
 			if !force {
-				dirty, err := sidingWorktreeHasChanges(ctx, app, name)
+				dirty, err := sidingWorktreeHasChanges(ctx, app, name, []string{name})
 				if err != nil {
 					return err
 				}

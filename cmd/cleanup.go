@@ -98,7 +98,7 @@ func buildCleanupCandidates(ctx context.Context, app state.App, checkDirty bool)
 	for _, name := range names {
 		candidate := cleanupCandidate{Name: name, Status: statuses[name]}
 		if checkDirty {
-			dirty, err := sidingWorktreeHasChanges(ctx, app, name)
+			dirty, err := sidingWorktreeHasChanges(ctx, app, name, []string{name})
 			if err != nil {
 				return nil, err
 			}
@@ -109,15 +109,21 @@ func buildCleanupCandidates(ctx context.Context, app state.App, checkDirty bool)
 	return candidates, nil
 }
 
-func sidingWorktreeHasChanges(ctx context.Context, app state.App, name string) (bool, error) {
+func sidingWorktreeHasChanges(ctx context.Context, app state.App, name string, removing []string) (bool, error) {
 	src, _ := siding.Paths(app, name)
-	return worktreeHasChanges(ctx, src)
+	branches := make([]string, 0, len(removing))
+	for _, candidate := range removing {
+		if siding, ok := app.Sidings[candidate]; ok {
+			branches = append(branches, siding.Branch)
+		}
+	}
+	return worktreeHasChanges(ctx, src, branches)
 }
 
-func worktreeHasChanges(ctx context.Context, src string) (bool, error) {
+func worktreeHasChanges(ctx context.Context, src string, removing []string) (bool, error) {
 	info, err := os.Stat(src)
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		return true, nil // fail closed: removing the branch may still lose committed work
 	}
 	if err != nil {
 		return false, fmt.Errorf("inspect siding worktree %s: %w", src, err)
@@ -141,8 +147,12 @@ func worktreeHasChanges(ctx context.Context, src string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("check whether siding commits are reachable: %w", err)
 	}
+	removed := map[string]bool{strings.TrimSpace(branch.Stdout): true}
+	for _, branch := range removing {
+		removed["refs/heads/"+branch] = true
+	}
 	for _, ref := range strings.Fields(refs.Stdout) {
-		if ref != strings.TrimSpace(branch.Stdout) {
+		if !removed[ref] {
 			return false, nil
 		}
 	}
@@ -291,7 +301,7 @@ func selectedCleanupNames(candidates []cleanupCandidate, selected []bool) []stri
 func dirtySelectedSidings(ctx context.Context, app state.App, selected []string) ([]string, error) {
 	var dirty []string
 	for _, name := range selected {
-		hasChanges, err := sidingWorktreeHasChanges(ctx, app, name)
+		hasChanges, err := sidingWorktreeHasChanges(ctx, app, name, selected)
 		if err != nil {
 			return nil, err
 		}
