@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -88,44 +89,75 @@ func newRmCmd() *cobra.Command {
 			if name == state.HostTarget {
 				return fmt.Errorf("%q is your local copy, not a siding — nothing for shunt to tear down", name)
 			}
-			sd, ok := app.Sidings[name]
+			_, ok := app.Sidings[name]
 			if !ok {
 				return fmt.Errorf("no siding %q", name)
 			}
 			if app.LiveSiding == name && !force {
 				return fmt.Errorf("siding %q is live — switch away first, or pass --force", name)
 			}
-			fmt.Printf("• removing guest %q…\n", sd.Container)
-			_ = container.Remove(ctx, sd.Container)
-
-			src, _ := siding.Paths(app, name)
-			// Tear down the git worktree + its branch from the main repo first,
-			// so removing the dir doesn't leave a dangling worktree registration.
-			fmt.Println("• removing the worktree…")
-			_ = fsclone.RemoveWorktree(ctx, app.RepoPath, src, sd.Branch)
-			base := filepath.Dir(src) // <configDir>/<name>
-			// Guard against nuking an unintended path if ConfigDir/src was empty or
-			// unresolved: only ever remove a deep, absolute, siding-shaped dir.
-			if !filepath.IsAbs(base) || base == "/" || base == "." || filepath.Dir(base) == base {
-				return fmt.Errorf("refusing to remove unsafe siding dir %q (resolved from %q)", base, src)
+			if !force {
+				dirty, err := sidingWorktreeHasChanges(ctx, app, name)
+				if err != nil {
+					return err
+				}
+				if dirty {
+					confirmed, err := confirmDirtyCleanup([]string{name}, os.Stdin, os.Stdout)
+					if err != nil {
+						return err
+					}
+					if !confirmed {
+						fmt.Println("cleanup cancelled")
+						return nil
+					}
+				}
 			}
-			// Deleting the copy-on-write data clones is the slow part (a large SQL
-			// volume can take a while), so say so instead of hanging silently.
-			fmt.Println("• deleting siding data (a large data volume can take a while)…")
-			if err := os.RemoveAll(base); err != nil {
-				return fmt.Errorf("remove siding dir %s: %w", base, err)
-			}
-			delete(app.Sidings, name)
-			if app.LiveSiding == name {
-				app.LiveSiding = ""
-			}
-			if err := state.SaveApp(app); err != nil {
-				return err
-			}
-			fmt.Printf("%s removed %q\n", tick(), name)
-			return nil
+			return removeSiding(ctx, &app, name)
 		},
 	}
-	c.Flags().BoolVar(&force, "force", false, "remove even if the siding is live")
+	c.Flags().BoolVarP(&force, "force", "f", false, "remove even if the siding is live or its worktree has uncommitted changes")
 	return c
+}
+
+func removeSiding(ctx context.Context, app *state.App, name string) error {
+	sd, ok := app.Sidings[name]
+	if !ok {
+		return fmt.Errorf("no siding %q", name)
+	}
+
+	src, _ := siding.Paths(*app, name)
+	base := filepath.Dir(src) // <configDir>/<name>
+	// Validate every filesystem target before touching the guest or worktree, so
+	// a corrupt state file can't leave a partially removed siding.
+	if !filepath.IsAbs(base) || base == "/" || base == "." || filepath.Dir(base) == base {
+		return fmt.Errorf("refusing to remove unsafe siding dir %q (resolved from %q)", base, src)
+	}
+
+	fmt.Printf("• removing guest %q…\n", sd.Container)
+	if err := container.Remove(ctx, sd.Container); err != nil {
+		return err
+	}
+
+	// Tear down the git worktree + its branch from the main repo first, so
+	// removing the dir doesn't leave a dangling worktree registration.
+	fmt.Println("• removing the worktree…")
+	if err := fsclone.RemoveWorktree(ctx, app.RepoPath, src, sd.Branch); err != nil {
+		return err
+	}
+
+	// Deleting the copy-on-write data clones is the slow part (a large SQL
+	// volume can take a while), so say so instead of hanging silently.
+	fmt.Println("• deleting siding data (a large data volume can take a while)…")
+	if err := os.RemoveAll(base); err != nil {
+		return fmt.Errorf("remove siding dir %s: %w", base, err)
+	}
+	delete(app.Sidings, name)
+	if app.LiveSiding == name {
+		app.LiveSiding = ""
+	}
+	if err := state.SaveApp(*app); err != nil {
+		return err
+	}
+	fmt.Printf("%s removed %q\n", tick(), name)
+	return nil
 }

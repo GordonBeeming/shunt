@@ -36,6 +36,12 @@ The guest, its Docker daemon, and the dependency containers (SQL etc.) are separ
 
 So the loop is: `up` once, then edit-and-hot-reload, and reach for `restart` when watch falls short. You should rarely pay the cold start again on a warmed project.
 
+## Cleaning up sidings without losing work
+
+Run `shunt-dev cleanup` from the registered repo when several sidings are finished. It lists every siding for that project, lets you select more than one, and marks worktrees that contain uncommitted or untracked files. After the selection, a dirty siding gets a second confirmation before Shunt removes its guest, worktree, branch, and data.
+
+For an AI coding client, that confirmation belongs to the user. Stop and name the dirty sidings, then ask whether those changes should be discarded. Only answer yes or rerun with `shunt-dev cleanup --force` after the user explicitly approves it. Force also permits cleanup of the live siding; without force, switch away first. `shunt-dev rm <name>` uses the same checks when only one siding needs removal.
+
 ## Changed config? Re-apply it — a running siding won't pick it up on its own
 
 Editing the **root repo's** `.shunt.app.json` or running `shunt config` does **not** reach a siding that already exists — guest settings are baked in when the guest is created, and the app-level front door is derived at `app add` time. (One exception: a siding's *own* worktree `.shunt.app.json` front door — `up`/`switch` on that siding read it live; see the front-door bullet below.) After any config change, re-apply it before expecting the siding to behave differently:
