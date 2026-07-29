@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/config"
@@ -111,8 +113,12 @@ func paintStatus(status string) string {
 // with the interactive picker when none is given (like `switch`). Lets commands
 // that act on a siding be run bare and pick from the list.
 func sidingArg(ctx context.Context, app state.App, args []string) (string, error) {
+	return sidingArgWithReader(ctx, app, args, bufio.NewReader(os.Stdin))
+}
+
+func sidingArgWithReader(ctx context.Context, app state.App, args []string, in *bufio.Reader) (string, error) {
 	if len(args) > 0 {
 		return args[0], nil
 	}
-	return pickSiding(ctx, app, false) // guest ops (up/restart/kill/logs) — host isn't a target
+	return pickSidingWithReader(ctx, app, false, in) // guest ops (up/restart/kill/logs) — host isn't a target
 }

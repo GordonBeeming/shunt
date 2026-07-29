@@ -59,7 +59,7 @@ func TestPickCleanupByNumberShowsDirtyStateAndSelectsSeveral(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("pickCleanupByNumber() = %#v, want %#v", got, want)
 	}
-	if !strings.Contains(out.String(), "beta  (stopped, uncommitted changes)") {
+	if !strings.Contains(out.String(), "beta  (stopped, work not safely saved)") {
 		t.Fatalf("picker output did not mark dirty siding:\n%s", out.String())
 	}
 }
@@ -118,6 +118,7 @@ func TestWorktreeHasChanges(t *testing.T) {
 	}
 	runGit(t, repo, "add", "tracked.txt")
 	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "initial")
+	runGit(t, repo, "checkout", "-b", "siding")
 
 	dirty, err := worktreeHasChanges(context.Background(), repo)
 	if err != nil {
@@ -136,6 +137,26 @@ func TestWorktreeHasChanges(t *testing.T) {
 	}
 	if !dirty {
 		t.Fatal("tracked change was not detected")
+	}
+}
+
+func TestWorktreeHasChangesDetectsOnlyReachableFromSidingBranch(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "tracked.txt")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "initial")
+	runGit(t, repo, "checkout", "-b", "siding")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unpushed")
+
+	dirty, err := worktreeHasChanges(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dirty {
+		t.Fatal("commits reachable only from the siding branch must be protected")
 	}
 }
 

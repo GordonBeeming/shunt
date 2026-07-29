@@ -38,7 +38,7 @@ So the loop is: `up` once, then edit-and-hot-reload, and reach for `restart` whe
 
 ## Cleaning up sidings without losing work
 
-Run `shunt-dev cleanup` from the registered repo when several sidings are finished. It lists every siding for that project, lets you select more than one, and marks worktrees that contain uncommitted or untracked files. After the selection, a dirty siding gets a second confirmation before Shunt removes its guest, worktree, branch, and data.
+Run `shunt-dev cleanup` from the registered repo when several sidings are finished. It lists every siding for that project, lets you select more than one, and marks worktrees with uncommitted or untracked files, or commits reachable only from that siding branch. After the selection, a protected siding gets a second confirmation before Shunt removes its guest, worktree, branch, and data.
 
 For an AI coding client, that confirmation belongs to the user. Stop and name the dirty sidings, then ask whether those changes should be discarded. Only answer yes or rerun with `shunt-dev cleanup --force` after the user explicitly approves it. Force also permits cleanup of the live siding; without force, switch away first. `shunt-dev rm <name>` uses the same checks when only one siding needs removal.
 

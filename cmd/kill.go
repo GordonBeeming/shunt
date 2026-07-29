@@ -80,11 +80,12 @@ func newRmCmd() *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
+			in := bufio.NewReader(os.Stdin)
 			app, _, err := loadCurrentApp()
 			if err != nil {
 				return err
 			}
-			name, err := sidingArg(ctx, app, args)
+			name, err := sidingArgWithReader(ctx, app, args, in)
 			if err != nil {
 				return err
 			}
@@ -104,7 +105,7 @@ func newRmCmd() *cobra.Command {
 					return err
 				}
 				if dirty {
-					confirmed, err := confirmDirtyCleanup([]string{name}, bufio.NewReader(os.Stdin), os.Stdout)
+					confirmed, err := confirmDirtyCleanup([]string{name}, in, os.Stdout)
 					if err != nil {
 						return err
 					}

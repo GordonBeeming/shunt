@@ -129,7 +129,26 @@ func worktreeHasChanges(ctx context.Context, src string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("check siding worktree %s for uncommitted changes: %w", src, err)
 	}
-	return strings.TrimSpace(out.Stdout) != "", nil
+	if strings.TrimSpace(out.Stdout) != "" {
+		return true, nil
+	}
+
+	branch, err := proc.Run(ctx, "git", "-C", src, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		return false, fmt.Errorf("identify siding branch %s: %w", src, err)
+	}
+	refs, err := proc.Run(ctx, "git", "-C", src, "for-each-ref", "--format=%(refname)", "--contains=HEAD", "refs/heads", "refs/remotes")
+	if err != nil {
+		return false, fmt.Errorf("check whether siding commits are reachable: %w", err)
+	}
+	for _, ref := range strings.Fields(refs.Stdout) {
+		if ref != strings.TrimSpace(branch.Stdout) {
+			return false, nil
+		}
+	}
+	// A clean worktree is still unsafe to remove when its checked-out branch is
+	// the only ref that reaches HEAD: deleting it would lose committed work.
+	return true, nil
 }
 
 func pickCleanupCandidates(candidates []cleanupCandidate, in *bufio.Reader) ([]string, error) {
@@ -254,7 +273,7 @@ func parseCleanupSelection(line string, candidates []cleanupCandidate) ([]string
 
 func cleanupStatus(candidate cleanupCandidate) string {
 	if candidate.Dirty {
-		return candidate.Status + ", uncommitted changes"
+		return candidate.Status + ", work not safely saved"
 	}
 	return candidate.Status
 }
@@ -293,7 +312,7 @@ func containsName(names []string, target string) bool {
 }
 
 func confirmDirtyCleanup(names []string, in *bufio.Reader, out io.Writer) (bool, error) {
-	fmt.Fprintln(out, "The following sidings have uncommitted changes:")
+	fmt.Fprintln(out, "The following sidings have work that is not safely saved:")
 	for _, name := range names {
 		fmt.Fprintf(out, "  - %s\n", name)
 	}
