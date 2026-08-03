@@ -15,6 +15,19 @@ import (
 	"github.com/gordonbeeming/shunt/internal/state"
 )
 
+func TestStopAppDoesNotUseFullCommandLineProcessKills(t *testing.T) {
+	for _, unsafe := range []string{"pkill -9 -f dotnet", "pkill -9 -f aspire"} {
+		if strings.Contains(aspireProcessKillScript, unsafe) {
+			t.Fatalf("StopApp contains self-matching process kill %q", unsafe)
+		}
+	}
+	for _, safe := range []string{"pkill -9 -x dotnet", "pkill -9 -x aspire"} {
+		if !strings.Contains(aspireProcessKillScript, safe) {
+			t.Fatalf("StopApp is missing executable-name process kill %q", safe)
+		}
+	}
+}
+
 func TestRecreateAssuresCacheBeforeRemovingGuest(t *testing.T) {
 	originalAssure, originalRemove := assureImageSources, removeGuest
 	defer func() {

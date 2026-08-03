@@ -520,6 +520,9 @@ func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 // service 18890, MCP 18891) as the hex used in /proc/net/tcp local addresses.
 const aspirePortHex = "49C8 49C9 49CA 49CB"
 
+const aspireProcessKillScript = `pkill -9 -x dotnet 2>/dev/null
+pkill -9 -x aspire 2>/dev/null`
+
 // StopApp stops the app inside the guest WITHOUT touching the guest, dockerd, or
 // the dependency containers (which run under dockerd on other ports), so a
 // rebuild keeps SQL etc. + their data up.
@@ -571,8 +574,9 @@ func StopApp(ctx context.Context, app state.App, sd state.Siding) error {
 # to pile up across re-ups (26 deep once), thrashing the guest until nothing could
 # finish. In a shunt guest every dotnet/aspire process is the app, so a broad kill is
 # safe and actually reaps the tree.
-pkill -9 -f dotnet 2>/dev/null
-pkill -9 -f aspire 2>/dev/null
+# Match executable names instead of full command lines. The script itself is
+# passed inline to sh -c, so pkill -f also matches and SIGKILLs this shell.
+` + aspireProcessKillScript + `
 for hex in ` + aspirePortHex + `; do
   for f in /proc/net/tcp /proc/net/tcp6; do
     ino=$(awk -v h=":$hex" '$2 ~ h"$" {print $10; exit}' "$f" 2>/dev/null)
@@ -1163,6 +1167,14 @@ func DashboardURL(app state.App, sd state.Siding) string {
 	if sd.LastIP == "" {
 		return ""
 	}
+	port := dashboardGuestPort(app, sd)
+	if port == 0 {
+		return ""
+	}
+	return fmt.Sprintf("http://%s:%d", sd.LastIP, port)
+}
+
+func dashboardGuestPort(app state.App, sd state.Siding) int {
 	port := 0
 	if app.Runner == "" || app.Runner == runner.Aspire {
 		port = guestDashboardPort
@@ -1174,10 +1186,7 @@ func DashboardURL(app state.App, sd state.Siding) string {
 			break
 		}
 	}
-	if port == 0 {
-		return ""
-	}
-	return fmt.Sprintf("http://%s:%d", sd.LastIP, port)
+	return port
 }
 
 // expandHome replaces a leading ~ with the user's home dir.
@@ -1359,10 +1368,12 @@ func AppRunning(ctx context.Context, app state.App, sd state.Siding) bool {
 // a stopped application.
 func ProbeAppRunning(ctx context.Context, app state.App, sd state.Siding) (bool, error) {
 	if app.Runner == "" || app.Runner == runner.Aspire {
-		// The resource-service port (18890 = hex 49CA) being bound means the
-		// AppHost is running.
+		// Probe the dashboard route the AppHost actually exposes. Newer Aspire CLI
+		// versions no longer leave the old resource-service port (18890) listening,
+		// which made a live AppHost look stopped and caused `up` to restart it.
+		port := dashboardGuestPort(app, sd)
 		out, err := container.Exec(ctx, sd.Container, "sh", "-c",
-			"if cat /proc/net/tcp 2>/dev/null | awk '{print $2}' | grep -iq ':49CA'; then echo up; else echo down; fi")
+			fmt.Sprintf("if socat -T1 /dev/null TCP:127.0.0.1:%d >/dev/null 2>&1; then echo up; else echo down; fi", port))
 		if err != nil {
 			return false, err
 		}

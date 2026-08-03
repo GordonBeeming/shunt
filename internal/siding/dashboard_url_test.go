@@ -20,3 +20,17 @@ func TestDashboardURLIsRunnerAware(t *testing.T) {
 		t.Fatalf("explicit custom dashboard = %q", got)
 	}
 }
+
+func TestDashboardGuestPortUsesSidingContract(t *testing.T) {
+	app := state.App{
+		Runner:    runner.Aspire,
+		FrontDoor: []state.Route{{Key: "aspire-dashboard", Kind: state.KindHTTP, GuestPort: 15072}},
+	}
+	if got := dashboardGuestPort(app, state.Siding{}); got != 15072 {
+		t.Fatalf("app dashboard port = %d", got)
+	}
+	sd := state.Siding{FrontDoor: []state.Route{{Key: "aspire-dashboard", Kind: state.KindHTTP, GuestPort: 16072}}}
+	if got := dashboardGuestPort(app, sd); got != 16072 {
+		t.Fatalf("siding dashboard port = %d", got)
+	}
+}
