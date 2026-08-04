@@ -79,6 +79,11 @@ func withFileLock(ctx context.Context, path string, mode int, description string
 		return fmt.Errorf("open %s lock: %w", description, err)
 	}
 	defer lock.Close()
+	if err := lock.Chmod(0o600); err != nil {
+		return fmt.Errorf("secure %s lock: %w", description, err)
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
 		err = unix.Flock(int(lock.Fd()), mode|unix.LOCK_NB)
@@ -90,8 +95,8 @@ func withFileLock(ctx context.Context, path string, mode int, description string
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(25 * time.Millisecond):
+			return fmt.Errorf("lock %s: %w", description, ctx.Err())
+		case <-ticker.C:
 		}
 	}
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)

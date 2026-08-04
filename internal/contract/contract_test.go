@@ -77,7 +77,7 @@ func TestImageAndVolumeBoundaries(t *testing.T) {
 	valid := `{
       "runner": "node", "start": "npm start",
 		"prebakeImages": ["postgres:16", "mcr.microsoft.com/azure-storage/azurite:3.35.0", "alpine"],
-      "dataVolumes": ["pg-data", "azurite_data.1"],
+      "dataVolumes": ["x", "pg-data", "azurite_data.1"],
       "frontDoor": [{"key":"web","kind":"http","listenPort":3000,"resource":"web","guestPort":3000}]
     }`
 	if _, err := Load(writeContract(t, valid)); err != nil {
@@ -95,7 +95,6 @@ func TestImageAndVolumeBoundaries(t *testing.T) {
 		"nested volume":    `"dataVolumes":["data/postgres"]`,
 		"absolute volume":  `"dataVolumes":["/data/postgres"]`,
 		"windows path":     `"dataVolumes":["data\\postgres"]`,
-		"one character":    `"dataVolumes":["x"]`,
 		"colon":            `"dataVolumes":["pg:data"]`,
 		"space":            `"dataVolumes":["pg data"]`,
 		"leading hyphen":   `"dataVolumes":["-pg"]`,
@@ -112,13 +111,13 @@ func TestImageAndVolumeBoundaries(t *testing.T) {
 }
 
 func TestDockerVolumeNameGrammar(t *testing.T) {
-	valid := []string{"a1", "A_", "pg-data", "azurite_data.1"}
+	valid := []string{"a", "a1", "A_", "pg-data", "azurite_data.1"}
 	for _, volume := range valid {
 		if err := ValidateVolumeName(volume); err != nil {
 			t.Errorf("ValidateVolumeName(%q) error = %v", volume, err)
 		}
 	}
-	invalid := []string{"", "a", ".", "..", "-a", "_a", "pg:data", "pg data", "pg/data", `pg\data`}
+	invalid := []string{"", ".", "..", "-a", "_a", "pg:data", "pg data", "pg/data", `pg\data`}
 	for _, volume := range invalid {
 		if err := ValidateVolumeName(volume); err == nil {
 			t.Errorf("ValidateVolumeName(%q) succeeded", volume)

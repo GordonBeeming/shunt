@@ -98,7 +98,7 @@ func Load(repoPath string) (Contract, error) {
 	return c, nil
 }
 
-var dockerVolumeNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
+var dockerVolumeNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 // ValidateVolumeName matches the Docker engine's named-volume grammar.
 func ValidateVolumeName(volume string) error {

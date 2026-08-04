@@ -3,6 +3,9 @@ package siding
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,12 +37,33 @@ func TestWithProjectOperationSerializesAndHonorsCancellation(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("WithProjectOperation() error = %v; want deadline exceeded", err)
 	}
+	if !strings.Contains(err.Error(), "project lifecycle") {
+		t.Fatalf("WithProjectOperation() error = %v; want lock description", err)
+	}
 	if called {
 		t.Fatal("contending operation ran without acquiring the project lock")
 	}
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatalf("first operation failed: %v", err)
+	}
+}
+
+func TestWithProjectOperationSecuresExistingLockFile(t *testing.T) {
+	configDir := t.TempDir()
+	lockPath := filepath.Join(configDir, operationLockName)
+	if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WithProjectOperation(context.Background(), configDir, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("lock permissions = %o, want 600", got)
 	}
 }
 
