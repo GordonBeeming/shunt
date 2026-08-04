@@ -76,7 +76,7 @@ func newCleanupCmd() *cobra.Command {
 			}
 
 			for _, name := range selected {
-				if err := removeSiding(ctx, &app, name); err != nil {
+				if err := removeSiding(ctx, &app, name, force); err != nil {
 					return fmt.Errorf("clean up siding %q: %w", name, err)
 				}
 			}

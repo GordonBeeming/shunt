@@ -95,20 +95,23 @@ func newRmCmd() *cobra.Command {
 					}
 				}
 			}
-			return removeSiding(ctx, &app, name)
+			return removeSiding(ctx, &app, name, force)
 		},
 	}
 	c.Flags().BoolVarP(&force, "force", "f", false, "remove even if the siding is live or its worktree has uncommitted changes")
 	return c
 }
 
-func removeSiding(ctx context.Context, app *state.App, name string) error {
+func removeSiding(ctx context.Context, app *state.App, name string, force bool) error {
 	return siding.WithSidingOperation(ctx, app.ConfigDir, name, func() error {
 		current, err := state.LoadApp(app.ConfigDir)
 		if err != nil {
 			return err
 		}
 		*app = current
+		if app.LiveSiding == name && !force {
+			return fmt.Errorf("siding %q is live — switch away first, or pass --force", name)
+		}
 		return removeSidingLocked(ctx, app, name)
 	})
 }

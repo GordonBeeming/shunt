@@ -1642,7 +1642,9 @@ func hostStopUnlocked(ctx context.Context, app state.App) error {
 		seenPorts[r.ListenPort] = true
 		out, err := proc.Run(ctx, "docker", "ps", "--filter", fmt.Sprintf("publish=%d", r.ListenPort), "--format", "{{.ID}}")
 		if err != nil {
-			stopErrs = append(stopErrs, fmt.Errorf("list host Docker containers publishing port %d: %w", r.ListenPort, err))
+			// The CLI can remain installed after Docker Desktop/OrbStack stops. In
+			// that case there cannot be a reachable host daemon with a container
+			// holding this port, so preserve the daemon-free best-effort behavior.
 			continue
 		}
 		for _, id := range strings.Fields(out.Stdout) {

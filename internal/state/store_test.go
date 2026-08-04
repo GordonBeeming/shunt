@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -80,6 +82,43 @@ func TestUpdateAppSurfacesPublicationFailure(t *testing.T) {
 		return nil
 	}); err == nil {
 		t.Fatal("UpdateApp did not surface a state publication failure")
+	}
+}
+
+func TestWithLockSecuresExistingLockFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	lockPath := path + ".lock"
+	if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := withLock(context.Background(), path, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("lock permissions = %o, want 600", got)
+	}
+}
+
+func TestWithLockCancellationIdentifiesLockPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	locked, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locked.Close()
+	if err := syscall.Flock(int(locked.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(locked.Fd()), syscall.LOCK_UN)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = withLock(ctx, path, func() error { return nil })
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), path+".lock") {
+		t.Fatalf("withLock() error = %v", err)
 	}
 }
 

@@ -155,11 +155,16 @@ func withLock(ctx context.Context, path string, fn func() error) error {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return fmt.Errorf("create dir for lock: %w", err)
 	}
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return fmt.Errorf("open lock %s: %w", lockPath, err)
 	}
 	defer f.Close()
+	if err := f.Chmod(0o600); err != nil {
+		return fmt.Errorf("secure lock %s: %w", lockPath, err)
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
@@ -170,8 +175,8 @@ func withLock(ctx context.Context, path string, fn func() error) error {
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(25 * time.Millisecond):
+			return fmt.Errorf("lock %s: %w", lockPath, ctx.Err())
+		case <-ticker.C:
 		}
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
