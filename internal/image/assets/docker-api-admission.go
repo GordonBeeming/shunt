@@ -1,7 +1,7 @@
 // docker-api-admission is the in-guest Docker API gate. It forwards the
-// complete Docker HTTP API to a private dockerd socket except image-create,
-// which is the API operation used by docker pull (including loopback pulls),
-// and builds whose Dockerfile can reference an image not already loaded.
+// complete Docker HTTP API to a private dockerd socket except routes that can
+// pull images or access registries, opaque BuildKit tunnels, and builds whose
+// Dockerfile can reference an image not already loaded.
 package main
 
 import (
