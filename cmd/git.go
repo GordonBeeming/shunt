@@ -61,6 +61,6 @@ func resolveSidingWorktree() (string, error) {
 	if _, ok := app.Sidings[name]; !ok {
 		return "", fmt.Errorf("no siding %q in %q", name, app.Name)
 	}
-	src, _ := siding.Paths(app, name)
-	return src, nil
+	src, _, err := siding.Paths(app, name)
+	return src, err
 }

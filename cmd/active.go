@@ -73,7 +73,10 @@ func newActiveCmd() *cobra.Command {
 				Src:  app.RepoPath,
 			})
 			for name, s := range app.Sidings {
-				src, _ := siding.Paths(app, name)
+				src, _, err := siding.Paths(app, name)
+				if err != nil {
+					return err
+				}
 				guestUp := false
 				if st, err := container.State(ctx, s.Container); err == nil {
 					guestUp = st == "running"

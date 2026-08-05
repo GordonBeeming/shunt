@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/gordonbeeming/shunt/internal/siding"
-	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 )
 
@@ -43,16 +42,8 @@ func newReapplyCmd() *cobra.Command {
 				kept = "keeps code, resets data to baseline"
 			}
 			fmt.Printf("• recreating the guest for %q with current config (%s)…\n", name, kept)
-			newSd, err := siding.Recreate(ctx, app, sd, freshData)
+			_, err = siding.Recreate(ctx, app, sd, freshData)
 			if err != nil {
-				return err
-			}
-			app.Sidings[name] = newSd
-			if app.LiveSiding == name {
-				// The front door pointed at the old guest; it's gone now.
-				app.LiveSiding = ""
-			}
-			if err := state.SaveApp(app); err != nil {
 				return err
 			}
 			fmt.Printf("%s %q guest recreated — run `%s up %s` to start it\n", tick(), name, bin(), name)

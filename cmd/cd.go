@@ -48,7 +48,11 @@ func newCdCmd() *cobra.Command {
 				if _, ok := app.Sidings[name]; !ok {
 					return fmt.Errorf("no siding %q in %q", name, app.Name)
 				}
-				dir, _ = siding.Paths(app, name)
+				var pathErr error
+				dir, _, pathErr = siding.Paths(app, name)
+				if pathErr != nil {
+					return pathErr
+				}
 			}
 			// Guard a missing worktree (siding metadata without its checkout) so
 			// `cd "$(shunt cd …)"` never lands in a nonexistent path.

@@ -1,10 +1,12 @@
-// Package siding orchestrates a single experiment guest end to end: clone the
-// repo, launch the Aspire app inside an Apple container, bridge its loopback
-// endpoints to the guest IP, discover them, and point the host Caddy at them.
+// Package siding orchestrates one application experiment end to end: clone the
+// repo, prepare and launch its Apple container guest, bridge application
+// endpoints to the guest IP, and point the host Caddy at them.
 package siding
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,13 +14,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/gordonbeeming/shunt/internal/aspire"
 	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/contract"
+	"github.com/gordonbeeming/shunt/internal/databaseline"
+	"github.com/gordonbeeming/shunt/internal/dockerdpolicy"
 	"github.com/gordonbeeming/shunt/internal/fsclone"
-	"github.com/gordonbeeming/shunt/internal/hostdocker"
+	"github.com/gordonbeeming/shunt/internal/image"
+	"github.com/gordonbeeming/shunt/internal/imagecache"
 	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/runner"
 	"github.com/gordonbeeming/shunt/internal/state"
@@ -36,24 +42,34 @@ const (
 	// route's own port on the guest IP (host == guest); see Activate.
 	rsExtPort = 38890
 
-	startedMarker = "Distributed application started"
+	startedMarker        = "Distributed application started"
+	guestImageMarkerPath = "/var/lib/shunt/image-cache.json"
 )
 
-// Paths returns the host src and vol-root paths for a siding under the app's
-// config dir.
-func Paths(app state.App, name string) (src, volRoot string) {
-	base := filepath.Join(app.ConfigDir, name)
-	return filepath.Join(base, "src"), filepath.Join(base, "vol")
-}
+var (
+	planCachedImages         = imagecache.Plan
+	execGuest                = container.Exec
+	execGuestStdinFile       = container.ExecStdinFile
+	execGuestStdinFileDigest = container.ExecStdinFileDigest
+	removeGuest              = container.Remove
+	runGuest                 = container.Run
+	ensureBaseImage          = image.EnsureBuilt
+	stopGuest                = container.Stop
+	startGuest               = container.Start
+	mergeSiding              = MergeSidingState
+	guestRuntimeState        = container.State
+	prepareLifecycle         = PrepareGuest
+	stopLifecycleApp         = StopApp
+	startLifecycleApp        = StartApp
+	waitLifecycleReady       = WaitReady
+	cacheWarningWriter       = io.Writer(os.Stderr)
+	dockerdStartupWait       = 30 * time.Second
+	dockerdReadyPoll         = 500 * time.Millisecond
+)
 
-// guestWarmTar is where Spin mounts the project warm image cache, read-only.
-const guestWarmTar = "/mnt/base/images.tar"
-
-// WarmTarPath is the per-project warm image cache (a `docker save` tar produced
-// by `shunt warm`). Its presence means `up` should `docker load` it into a new
-// siding instead of pulling/rebuilding dependency images from scratch.
+// WarmTarPath is the per-project content-addressed image-cache directory.
 func WarmTarPath(app state.App) string {
-	return filepath.Join(app.ConfigDir, "base", "images.tar")
+	return filepath.Join(app.ConfigDir, "base", "images")
 }
 
 // IsWarmed reports whether a project warm cache exists.
@@ -87,10 +103,58 @@ func guestEnv(app state.App) map[string]string {
 	return env
 }
 
-// Spin clones the repo + data volumes and launches the guest. It does not wait
-// for the app to be ready (see Activate).
+// Spin creates the worktree, host-backed data set, and idle guest. It prepares
+// guest Docker, but does not start the application.
 func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (state.Siding, error) {
-	src, volRoot := Paths(app, name)
+	if _, err := SidingBase(app, name); err != nil {
+		return state.Siding{}, err
+	}
+	var created state.Siding
+	err := WithSidingOperation(ctx, app.ConfigDir, name, func() error {
+		current, err := state.LoadApp(app.ConfigDir)
+		if err != nil {
+			return err
+		}
+		app = current
+		if _, exists := app.Sidings[name]; exists {
+			return fmt.Errorf("siding %q already exists", name)
+		}
+		created, err = spin(ctx, app, name, branch, fromBranch)
+		if err != nil {
+			return errors.Join(err, cleanupFailedSpin(app, name, created.Container, created.Branch, fromBranch != ""))
+		}
+		created.CreatedAt = time.Now().Format(time.RFC3339)
+		if _, err := MergeSidingState(ctx, app.ConfigDir, created, false); err != nil {
+			return errors.Join(err, cleanupFailedSpin(app, name, created.Container, created.Branch, fromBranch != ""))
+		}
+		return nil
+	})
+	return created, err
+}
+
+func spin(ctx context.Context, app state.App, name, branch, fromBranch string) (state.Siding, error) {
+	if err := AssureImageCache(ctx, app); err != nil {
+		return state.Siding{}, err
+	}
+	if err := ensureBaseImage(ctx, false); err != nil {
+		return state.Siding{}, fmt.Errorf("ensure native base image: %w", err)
+	}
+	if err := EnsureVolumeBaselines(ctx, app); err != nil {
+		return state.Siding{}, err
+	}
+	src, volRoot, err := Paths(app, name)
+	if err != nil {
+		return state.Siding{}, err
+	}
+	if len(app.Volumes) > 0 {
+		manager, err := databaseline.New(app.ConfigDir, app.Volumes)
+		if err != nil {
+			return state.Siding{}, err
+		}
+		if _, err := manager.ResetVolumeRoot(ctx, volRoot); err != nil {
+			return state.Siding{}, fmt.Errorf("create siding data set: %w", err)
+		}
+	}
 	wtBranch := config.BranchPrefix() + name
 	if fromBranch != "" {
 		// Pick up an existing (remote) branch and stay ON it, so commits continue
@@ -116,17 +180,13 @@ func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (
 	// instant + shares blocks) and bind-mount it at /mnt/dvol/<vol>; `up` then
 	// points a guest Docker volume at it so Aspire mounts the host's test data.
 	for _, vol := range app.Volumes {
-		base := baselineDir(app, vol)
-		if _, err := os.Stat(base); err != nil {
-			continue // no baseline (host lacked it) — this siding starts empty for it
-		}
 		host := filepath.Join(volRoot, vol)
 		// cp -c needs the dest's parent to exist (the worktree clone creates src/,
 		// not vol/).
 		if err := os.MkdirAll(volRoot, 0o755); err != nil {
 			return state.Siding{}, err
 		}
-		if err := fsclone.CloneVolume(ctx, base, host); err != nil {
+		if err := os.MkdirAll(host, 0o755); err != nil {
 			return state.Siding{}, err
 		}
 		mounts = append(mounts, container.Mount{Host: host, Guest: "/mnt/dvol/" + vol})
@@ -147,16 +207,11 @@ func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (
 			mounts = append(mounts, container.Mount{Host: nugetHost, Guest: "/root/.nuget/packages"})
 		}
 	}
-	// Project warm image cache (from `shunt warm`): mount read-only so `up` can
-	// `docker load` the pre-built/pulled dependency images instead of rebuilding.
-	if IsWarmed(app) {
-		mounts = append(mounts, container.Mount{Host: WarmTarPath(app), Guest: guestWarmTar, ReadOnly: true})
-	}
 
 	guestName := config.ContainerName(app.Name, name)
 	if err := container.Run(ctx, container.RunOpts{
 		Name:      guestName,
-		Image:     config.BaseImageTag(),
+		Image:     image.Tag(),
 		Init:      true,
 		CapAddAll: true,
 		// Per-guest caps: the contract wins (heavy stacks like SQL + several
@@ -164,34 +219,109 @@ func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (
 		// else shunt's default. The runtime's own ~1 GB default OOMs Aspire.
 		Memory: orDefaultStr(app.Memory, config.GuestMemory()),
 		CPUs:   orDefaultStr(app.CPUs, config.GuestCPUs()),
-		// Rosetta lets amd64-only images (SQL Server) run on the arm64 guest —
-		// the same x86 translation Docker Desktop uses; qemu segfaults SQL Server.
+		// Rosetta lets amd64-only images such as SQL Server run on the arm64 guest;
+		// qemu segfaults SQL Server in this setup.
 		Rosetta: true,
 		Mounts:  mounts,
 		Env:     guestEnv(app),
 		// Idle keep-alive: the entrypoint starts dockerd + the dev cert, then this
-		// holds the guest open WITHOUT running Aspire. Run the app later with `up`,
+		// holds the guest open WITHOUT running the application. Use `up` later,
 		// so `new` is fast and you can edit code first.
 		Cmd: []string{"/bin/sh", "-lc", "exec sleep infinity"},
 	}); err != nil {
 		return state.Siding{}, err
 	}
-
-	return state.Siding{
+	sd := state.Siding{
 		Name:      name,
 		Branch:    wtBranch,
 		Container: guestName,
 		RSPort:    guestRSPort,
 		Bridges:   map[string]int{},
-	}, nil
+	}
+	if err := prepareGuestFromCache(ctx, app, sd); err != nil {
+		return sd, err
+	}
+	return sd, nil
+}
+
+func cleanupFailedSpin(app state.App, name, guest, branch string, keepBranch bool) error {
+	if _, err := SidingBase(app, name); err != nil {
+		return err
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	var cleanupErrs []error
+	if guest == "" {
+		guest = config.ContainerName(app.Name, name)
+	}
+	if err := container.Remove(cleanupCtx, guest); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("remove failed guest: %w", err))
+	}
+	src, _, err := Paths(app, name)
+	if err != nil {
+		cleanupErrs = append(cleanupErrs, err)
+		return errors.Join(cleanupErrs...)
+	}
+	removeBranch := branch
+	if keepBranch {
+		removeBranch = ""
+	} else if removeBranch == "" {
+		removeBranch = config.BranchPrefix() + name
+	}
+	if err := fsclone.RemoveWorktree(cleanupCtx, app.RepoPath, src, removeBranch); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("remove failed worktree: %w", err))
+	}
+	if err := RemoveFiles(app, name); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("remove failed siding files: %w", err))
+	}
+	return errors.Join(cleanupErrs...)
 }
 
 // Up brings a siding online: it makes sure the guest is live, starts the app if
 // it isn't already running, and (when bridge is true) bridges its routes to the
 // host. Progress lines are written to progress (os.Stdout for the CLI, io.Discard
-// for the dashboard, which runs it async and polls status). Returns the updated
-// siding for the caller to persist; it does not switch the front door.
+// for the dashboard, which runs it async and polls status). Up persists the latest
+// siding state and restores the front-door route when this siding was already live.
 func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progress io.Writer) (state.Siding, error) {
+	var updated state.Siding
+	wasLive := false
+	err := WithSidingOperation(ctx, app.ConfigDir, sd.Name, func() error {
+		current, err := state.LoadApp(app.ConfigDir)
+		if err != nil {
+			return err
+		}
+		latest, ok := current.Sidings[sd.Name]
+		if !ok {
+			return fmt.Errorf("no siding %q", sd.Name)
+		}
+		wasLive = current.LiveSiding == sd.Name
+		updated, err = up(ctx, current, latest, bridge, progress)
+		if err != nil {
+			return err
+		}
+		_, err = MergeSidingState(ctx, current.ConfigDir, updated, false)
+		return err
+	})
+	if err == nil && bridge && wasLive {
+		err = restoreLiveRoute(ctx, app.ConfigDir, sd.Name)
+	}
+	return updated, err
+}
+
+func restoreLiveRoute(ctx context.Context, configDir, name string) error {
+	return WithProjectOperation(ctx, configDir, func() error {
+		current, err := state.LoadApp(configDir)
+		if err != nil {
+			return err
+		}
+		if current.LiveSiding != "" && current.LiveSiding != name {
+			return nil
+		}
+		return switchLocked(ctx, &current, name)
+	})
+}
+
+func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progress io.Writer) (state.Siding, error) {
 	fmt.Fprintln(progress, "• checking the guest is up…")
 	if err := EnsureGuestLive(ctx, sd); err != nil {
 		// A cancelled/timed-out context is the caller giving up, not a broken guest —
@@ -204,22 +334,22 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		// branch, and data clones — so `up` self-heals instead of making the user
 		// reapply by hand.
 		fmt.Fprintf(progress, "• guest wouldn't come up (%v) — recreating it (keeps code + data)…\n", err)
-		healed, rerr := Recreate(ctx, app, sd, false)
+		healed, rerr := recreate(ctx, app, sd, false)
 		if rerr != nil {
 			return sd, fmt.Errorf("%w; auto-recreate also failed: %v", err, rerr)
 		}
 		sd = healed
 		// Persist the new container reference + cleared bridges now, so a failure in a
 		// later step doesn't leave disk state pointing at the old (removed) guest.
-		app.Sidings[sd.Name] = sd
-		_ = state.SaveApp(app)
+		if _, saveErr := MergeSidingState(ctx, app.ConfigDir, sd, false); saveErr != nil {
+			return sd, fmt.Errorf("save auto-recreated guest state: %w", saveErr)
+		}
 		if err := EnsureGuestLive(ctx, sd); err != nil {
 			return sd, err
 		}
 	}
 	// The guest is live again — clear any `stopped` marker `kill` left behind.
 	sd.Stopped = false
-
 	// Resolve this siding's own front door from its worktree contract (the guest runs
 	// the siding's code), so a route it declares applies without an `app add` in root.
 	// Always assign — nil (no contract) clears a stale set so EffRoutes falls back to
@@ -234,7 +364,11 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 	// never becomes healthy (its child projects all crashed) is half-dead — rebuild
 	// it rather than skip. A genuinely healthy live app is left alone so a re-up just
 	// re-activates instead of starting a second AppHost (port clash).
-	needStart := !AppRunning(ctx, app, sd)
+	appRunning, err := ProbeAppRunning(ctx, app, sd)
+	if err != nil {
+		return sd, fmt.Errorf("inspect application state: %w", err)
+	}
+	needStart := !appRunning
 	if !needStart {
 		fmt.Fprintln(progress, "• app process is up — checking it's actually serving…")
 		if healthyWithin(ctx, app, sd, 20*time.Second) {
@@ -245,40 +379,14 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		}
 	}
 	if needStart {
-		_ = StopApp(ctx, app, sd)
+		fmt.Fprintln(progress, "• preparing offline Docker images + data volumes…")
+		if err := PrepareGuest(ctx, app, sd); err != nil {
+			return sd, err
+		}
+		if err := StopApp(ctx, app, sd); err != nil {
+			return sd, err
+		}
 		_, _ = container.Exec(ctx, sd.Container, "sh", "-c", "> "+appLogPath)
-
-		fmt.Fprintln(progress, "• checking the in-guest Docker daemon…")
-		if e := EnsureDockerd(ctx, sd); e != nil {
-			return sd, e
-		}
-		if e := CreateBindVolumes(ctx, app, sd); e != nil {
-			fmt.Fprintf(progress, "  (data volume bind failed: %v — continuing with empty volumes)\n", e)
-		}
-		// Keep the host as the canonical cache: warm the project tar from the host
-		// once, then load it into the guest so the siding never pulls from the net.
-		tar := WarmTarPath(app)
-		if len(app.PrebakeImages) > 0 && hostdocker.Available(ctx) {
-			if _, statErr := os.Stat(tar); statErr != nil {
-				fmt.Fprintln(progress, "• warming the host image cache (one-time)…")
-				if _, e := hostdocker.Ensure(ctx, app.PrebakeImages); e != nil {
-					return sd, fmt.Errorf("warm host cache: %w", e)
-				}
-				if e := os.MkdirAll(filepath.Dir(tar), 0o755); e != nil {
-					return sd, e
-				}
-				if e := hostdocker.Save(ctx, app.PrebakeImages, tar); e != nil {
-					return sd, e
-				}
-			}
-		}
-		if loaded, e := LoadWarm(ctx, app, sd); e != nil {
-			fmt.Fprintf(progress, "  (warm load failed: %v)\n", e)
-		} else if loaded {
-			fmt.Fprintln(progress, "• loaded dependency images from cache (no pull)")
-		} else {
-			fmt.Fprintln(progress, "• no warm cache — declare prebakeImages + run `warm`, or it'll build/pull cold")
-		}
 
 		fmt.Fprintf(progress, "• starting the app in %q…\n", sd.Name)
 		if err := StartApp(ctx, app, sd); err != nil {
@@ -300,18 +408,6 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 	if err := Activate(ctx, app, &sd); err != nil {
 		return sd, err
 	}
-	// If this siding is the live one, re-point Caddy at the (possibly new) guest IP.
-	// A self-heal recreate can change the IP, and the dashboard Start path has no
-	// separate live-refresh like the CLI's `up` does — so do it here for both callers.
-	if app.LiveSiding == sd.Name {
-		// A siding-added route (one the app-level set lacks) has no Caddy server yet —
-		// create it before pointing, or PointCaddy would have nothing to aim at.
-		if err := ensureSidingRoutes(ctx, caddy.NewAdmin(), app, sd); err != nil {
-			fmt.Fprintf(progress, "  (couldn't create siding-added front-door route(s): %v — run `switch` to fix)\n", err)
-		} else if err := PointCaddy(ctx, app, &sd); err != nil {
-			fmt.Fprintf(progress, "  (front-door refresh failed: %v — run `switch` to fix)\n", err)
-		}
-	}
 	return sd, nil
 }
 
@@ -330,15 +426,21 @@ const appLogPath = "/var/log/apphost.log"
 // re-runs the entrypoint (dockerd + dev cert). Returns an error only if the guest
 // genuinely can't be brought back (e.g. it no longer exists → the caller says new).
 func EnsureGuestLive(ctx context.Context, sd state.Siding) error {
-	if _, err := container.Exec(ctx, sd.Container, "true"); err == nil {
-		return nil // truly alive
+	if _, err := execGuest(ctx, sd.Container, "true"); err == nil {
+		if _, err := execGuest(ctx, sd.Container, image.GuestCapabilityCheck()...); err != nil {
+			return fmt.Errorf("guest for %q uses a stale base image: %w", sd.Name, err)
+		}
+		return nil
 	}
-	_ = container.Stop(ctx, sd.Container) // clear the zombie/stopped state
-	if err := container.Start(ctx, sd.Container); err != nil {
+	_ = stopGuest(ctx, sd.Container) // clear the zombie/stopped state
+	if err := startGuest(ctx, sd.Container); err != nil {
 		return fmt.Errorf("guest for %q wouldn't restart: %w", sd.Name, err)
 	}
 	for i := 0; i < 20; i++ {
-		if _, err := container.Exec(ctx, sd.Container, "true"); err == nil {
+		if _, err := execGuest(ctx, sd.Container, "true"); err == nil {
+			if _, err := execGuest(ctx, sd.Container, image.GuestCapabilityCheck()...); err != nil {
+				return fmt.Errorf("guest for %q uses a stale base image: %w", sd.Name, err)
+			}
 			return nil
 		}
 		select {
@@ -356,27 +458,35 @@ func EnsureGuestLive(ctx context.Context, sd state.Siding) error {
 // though the guest is "running" — Aspire then reports the runtime unhealthy. This
 // clears the stale state and (re)starts dockerd, waiting for it to answer.
 func EnsureDockerd(ctx context.Context, sd state.Siding) error {
-	if out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "docker info >/dev/null 2>&1 && echo ok"); strings.Contains(out, "ok") {
-		return nil
-	}
-	_, _ = container.Exec(ctx, sd.Container, "sh", "-c",
-		"pkill dockerd 2>/dev/null; pkill containerd 2>/dev/null; rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid 2>/dev/null; true")
-	if err := container.ExecDetached(ctx, sd.Container, "/bin/sh", "-lc", "dockerd > /var/log/dockerd.log 2>&1"); err != nil {
-		return err
-	}
-	for i := 0; i < 20; i++ {
-		if out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "docker info >/dev/null 2>&1 && echo ok"); strings.Contains(out, "ok") {
+	check := fmt.Sprintf("test -s %s && grep -qx 'version=%s' %s && docker info >/dev/null 2>&1", dockerdpolicy.ReadyMarker, dockerdpolicy.PolicyVersion, dockerdpolicy.ReadyMarker)
+	deadline := time.Now().Add(dockerdStartupWait)
+	for {
+		if _, err := execGuest(ctx, sd.Container, "sh", "-c", check); err == nil {
 			return nil
 		}
-		time.Sleep(2 * time.Second)
+		if !time.Now().Before(deadline) {
+			break
+		}
+		timer := time.NewTimer(dockerdReadyPoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
-	return fmt.Errorf("in-guest Docker daemon didn't become healthy (see `dockerd` log in the guest)")
+	if _, err := execGuest(ctx, sd.Container, dockerdpolicy.EnsureCommand); err != nil {
+		return fmt.Errorf("ensure in-guest Docker offline policy: %w", err)
+	}
+	if _, err := execGuest(ctx, sd.Container, "sh", "-c", check); err != nil {
+		return fmt.Errorf("verify in-guest Docker offline policy marker: %w", err)
+	}
+	return nil
 }
 
-// StartApp runs the Aspire AppHost inside an already-running siding guest (build
-// + dependency image pulls happen here). It's detached and its output goes to
-// appLogPath. The guest's env (Development, Aspire endpoints) was set at Spin
-// time and is inherited by the exec.
+// StartApp starts the configured runner inside an already-prepared guest. Image
+// assurance and loading happen before this call. Output goes to appLogPath and
+// the guest environment configured by Spin is inherited by the process.
 //
 // It runs plain `dotnet run` for reliability. `dotnet watch` was tried for
 // hot-reload, but its static-web-assets watcher chokes on Linux under the .NET 10
@@ -400,11 +510,8 @@ func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 		runCmd = fmt.Sprintf(`export PATH="$PATH:/root/.dotnet/tools"; export ASPIRE_CLI_START_TIMEOUT="${ASPIRE_CLI_START_TIMEOUT:-1800}"; cd /workspace && aspire start --apphost "%s" --non-interactive > %s 2>&1`,
 			app.AppHostPath, appLogPath)
 	} else {
-		wd := "/workspace"
-		if app.Workdir != "" {
-			wd = "/workspace/" + app.Workdir
-		}
-		runCmd = fmt.Sprintf("cd %s && %s > %s 2>&1", wd, app.Start, appLogPath)
+		_, err := container.Exec(ctx, sd.Container, "/bin/sh", "-lc", nonAspireStartScript(app))
+		return err
 	}
 	return container.ExecDetached(ctx, sd.Container, "/bin/sh", "-lc", runCmd)
 }
@@ -412,6 +519,9 @@ func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 // aspirePortHex are the Aspire host ports (dashboard 18888, OTLP 18889, resource
 // service 18890, MCP 18891) as the hex used in /proc/net/tcp local addresses.
 const aspirePortHex = "49C8 49C9 49CA 49CB"
+
+const aspireProcessKillScript = `pkill -9 -x dotnet 2>/dev/null
+pkill -9 -x aspire 2>/dev/null`
 
 // StopApp stops the app inside the guest WITHOUT touching the guest, dockerd, or
 // the dependency containers (which run under dockerd on other ports), so a
@@ -424,6 +534,23 @@ const aspirePortHex = "49C8 49C9 49CA 49CB"
 // them via the socket inode in /proc/net/tcp (name-agnostic; catches the
 // compiled AppHost binary, dashboard, and DCP).
 func StopApp(ctx context.Context, app state.App, sd state.Siding) error {
+	if app.Runner != "" && app.Runner != runner.Aspire {
+		var stopErrs []error
+		if app.Stop != "" {
+			wd := "/workspace"
+			if app.Workdir != "" {
+				wd += "/" + app.Workdir
+			}
+			if _, err := container.Exec(ctx, sd.Container, "/bin/sh", "-lc", fmt.Sprintf("cd %s && %s", shellQuote(wd), app.Stop)); err != nil {
+				stopErrs = append(stopErrs, fmt.Errorf("run configured stop command: %w", err))
+			}
+		}
+		if _, err := container.Exec(ctx, sd.Container, "/bin/sh", "-lc", nonAspireStopScript()); err != nil {
+			stopErrs = append(stopErrs, fmt.Errorf("stop process group: %w", err))
+		}
+		return errors.Join(stopErrs...)
+	}
+	var stopErrs []error
 	// Clean stop first (best-effort) — the force-kill below is the safety net.
 	if app.Runner == "" || app.Runner == runner.Aspire {
 		// Match `aspire start`: `aspire stop` cleanly shuts down the managed AppHost.
@@ -436,7 +563,9 @@ func StopApp(ctx context.Context, app state.App, sd state.Siding) error {
 		if app.Workdir != "" {
 			wd = "/workspace/" + app.Workdir
 		}
-		_, _ = container.Exec(ctx, sd.Container, "/bin/sh", "-lc", fmt.Sprintf("cd %s && %s", wd, app.Stop))
+		if _, err := container.Exec(ctx, sd.Container, "/bin/sh", "-lc", fmt.Sprintf("cd %s && %s", shellQuote(wd), app.Stop)); err != nil {
+			stopErrs = append(stopErrs, fmt.Errorf("run configured stop command: %w", err))
+		}
 	}
 	script := `
 # Reap the whole managed app tree. ` + "`aspire start`" + ` detaches the AppHost plus its
@@ -445,8 +574,9 @@ func StopApp(ctx context.Context, app state.App, sd state.Siding) error {
 # to pile up across re-ups (26 deep once), thrashing the guest until nothing could
 # finish. In a shunt guest every dotnet/aspire process is the app, so a broad kill is
 # safe and actually reaps the tree.
-pkill -9 -f dotnet 2>/dev/null
-pkill -9 -f aspire 2>/dev/null
+# Match executable names instead of full command lines. The script itself is
+# passed inline to sh -c, so pkill -f also matches and SIGKILLs this shell.
+` + aspireProcessKillScript + `
 for hex in ` + aspirePortHex + `; do
   for f in /proc/net/tcp /proc/net/tcp6; do
     ino=$(awk -v h=":$hex" '$2 ~ h"$" {print $10; exit}' "$f" 2>/dev/null)
@@ -467,23 +597,225 @@ for i in $(seq 1 15); do
   [ -z "$busy" ] && break
   sleep 1
 done
+busy=
+for hex in ` + aspirePortHex + `; do
+  cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '{print $2}' | grep -iq ":$hex" && busy=1
+done
+[ -z "$busy" ] || { echo "Aspire process tree still owns a managed port after SIGKILL" >&2; exit 1; }
 true`
-	_, err := container.Exec(ctx, sd.Container, "sh", "-c", script)
-	return err
+	if _, err := container.Exec(ctx, sd.Container, "sh", "-c", script); err != nil {
+		stopErrs = append(stopErrs, fmt.Errorf("force-stop application processes: %w", err))
+	}
+	return errors.Join(stopErrs...)
 }
 
-// LoadWarm streams the project's warm-cache tar from the host into the guest's
-// Docker store (via `docker load`, no bind mount), so Aspire reuses the images
-// instead of pulling/rebuilding. No-op if the project isn't warmed.
+func nonAspireStartScript(app state.App) string {
+	wd := "/workspace"
+	if app.Workdir != "" {
+		wd += "/" + app.Workdir
+	}
+	run := fmt.Sprintf("cd %s && exec %s", shellQuote(wd), app.Start)
+	return `if [ -s /run/shunt-app.pid ]; then
+  old=$(cat /run/shunt-app.pid)
+  if /bin/kill -0 -- "-$old" 2>/dev/null; then
+    echo "shunt app process group $old is already running" >&2
+    exit 1
+  fi
+  rm -f /run/shunt-app.pid
+fi
+setsid /bin/sh -lc ` + shellQuote(run) + " > " + shellQuote(appLogPath) + ` 2>&1 &
+pid=$!
+tmp=$(mktemp /run/.shunt-app.pid.XXXXXX)
+printf '%s\n' "$pid" > "$tmp"
+mv -f "$tmp" /run/shunt-app.pid`
+}
+
+func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'" }
+
+func nonAspireStopScript() string {
+	return `pid=$(cat /run/shunt-app.pid 2>/dev/null) || exit 0
+/bin/kill -TERM -- "-$pid" 2>/dev/null || true
+for i in $(seq 1 50); do /bin/kill -0 -- "-$pid" 2>/dev/null || { rm -f /run/shunt-app.pid; exit 0; }; sleep .1; done
+/bin/kill -KILL -- "-$pid" 2>/dev/null || true
+for i in $(seq 1 50); do /bin/kill -0 -- "-$pid" 2>/dev/null || { rm -f /run/shunt-app.pid; exit 0; }; sleep .1; done
+echo "process group $pid is still running after SIGKILL" >&2
+exit 1`
+}
+
+// LoadWarm imports only cache refs that are absent or changed in this guest. It
+// verifies every ref in the selected generation in one Docker operation before
+// atomically recording the marker that future preparations compare against.
 func LoadWarm(ctx context.Context, app state.App, sd state.Siding) (bool, error) {
-	tar := WarmTarPath(app)
-	if _, err := os.Stat(tar); err != nil {
+	if len(app.PrebakeImages) == 0 && len(app.PrebakeBuilds) == 0 {
 		return false, nil
 	}
-	if err := container.ExecStdinFile(ctx, sd.Container, tar, "docker", "load"); err != nil {
+	cachePath := WarmTarPath(app)
+	if _, err := os.Stat(cachePath); err != nil {
 		return false, err
 	}
-	return true, nil
+	marker, err := readGuestImageMarker(ctx, sd)
+	if err != nil {
+		return false, err
+	}
+	imageIDs, err := guestImageIDs(ctx, app, sd)
+	if err != nil {
+		return false, err
+	}
+	plan, err := planCachedImages(ctx, cachePath, imagecache.GuestState{Marker: marker, ImageIDs: imageIDs})
+	if err != nil {
+		return false, err
+	}
+	defer plan.Release()
+	for _, image := range plan.Images {
+		digest, err := execGuestStdinFileDigest(ctx, sd.Container, image.Path, "docker", "load")
+		if err != nil {
+			return false, fmt.Errorf("load cached image %q: %w", image.Ref, err)
+		}
+		if digest != image.Checksum {
+			return false, fmt.Errorf("verify cached image %q while loading: checksum %s, want %s", image.Ref, digest, image.Checksum)
+		}
+	}
+	imageIDs, err = guestImageIDs(ctx, app, sd)
+	if err != nil {
+		return false, fmt.Errorf("verify cached image generation %q: %w", plan.Generation, err)
+	}
+	configured, err := configuredImageRefs(app)
+	if err != nil {
+		return false, fmt.Errorf("verify cached image generation %q: %w", plan.Generation, err)
+	}
+	for _, ref := range configured {
+		if strings.TrimSpace(imageIDs[ref]) == "" {
+			return false, fmt.Errorf("verify cached image generation %q: image %q is unavailable after load", plan.Generation, ref)
+		}
+	}
+	observedMarker := imagecache.GuestMarker{Generation: plan.Generation, Images: imageIDs, Digests: plan.Marker.Digests}
+	if err := writeGuestImageMarker(ctx, sd, observedMarker); err != nil {
+		return false, err
+	}
+	return len(plan.Images) > 0, nil
+}
+
+func guestImageIDs(ctx context.Context, app state.App, sd state.Siding) (map[string]string, error) {
+	configured, err := configuredImageRefs(app)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]string, len(configured))
+	if len(configured) == 0 {
+		return result, nil
+	}
+	out, err := execGuest(ctx, sd.Container, "docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}")
+	if err != nil {
+		return nil, fmt.Errorf("list guest images: %w", err)
+	}
+	present := make(map[string]bool, len(configured))
+	for _, ref := range strings.Fields(out) {
+		parsed, parseErr := name.ParseReference(ref)
+		if parseErr == nil {
+			present[parsed.Name()] = true
+		}
+	}
+	existing := make([]string, 0, len(configured))
+	for _, ref := range configured {
+		if present[ref] {
+			existing = append(existing, ref)
+		}
+	}
+	if len(existing) == 0 {
+		return result, nil
+	}
+	args := append([]string{"docker", "image", "inspect", "--format", "{{.Id}}"}, existing...)
+	out, err = execGuest(ctx, sd.Container, args...)
+	if err != nil {
+		return nil, fmt.Errorf("inspect guest image IDs: %w", err)
+	}
+	ids := strings.Fields(out)
+	if len(ids) != len(existing) {
+		return nil, fmt.Errorf("inspect guest image IDs returned %d values for %d refs", len(ids), len(existing))
+	}
+	for i, ref := range existing {
+		result[ref] = ids[i]
+	}
+	return result, nil
+}
+
+func readGuestImageMarker(ctx context.Context, sd state.Siding) (imagecache.GuestMarker, error) {
+	out, err := execGuest(ctx, sd.Container, "sh", "-c", "test ! -f "+guestImageMarkerPath+" || cat "+guestImageMarkerPath)
+	if err != nil {
+		return imagecache.GuestMarker{}, fmt.Errorf("read guest image-cache marker: %w", err)
+	}
+	if strings.TrimSpace(out) == "" {
+		return imagecache.GuestMarker{}, nil
+	}
+	var marker imagecache.GuestMarker
+	if err := json.Unmarshal([]byte(out), &marker); err != nil {
+		return imagecache.GuestMarker{}, nil
+	}
+	return marker, nil
+}
+
+func writeGuestImageMarker(ctx context.Context, sd state.Siding, marker imagecache.GuestMarker) error {
+	data, err := json.Marshal(marker)
+	if err != nil {
+		return fmt.Errorf("encode guest image-cache marker: %w", err)
+	}
+	markerFile, err := os.CreateTemp("", "shunt-image-marker-*.json")
+	if err != nil {
+		return fmt.Errorf("create guest image-cache marker temp: %w", err)
+	}
+	markerPath := markerFile.Name()
+	defer os.Remove(markerPath)
+	if _, err := markerFile.Write(data); err != nil {
+		_ = markerFile.Close()
+		return fmt.Errorf("write guest image-cache marker temp: %w", err)
+	}
+	if err := markerFile.Close(); err != nil {
+		return fmt.Errorf("close guest image-cache marker temp: %w", err)
+	}
+	script := "set -e; mkdir -p /var/lib/shunt; tmp=$(mktemp /var/lib/shunt/.image-cache.XXXXXX); cat >\"$tmp\"; chmod 600 \"$tmp\"; mv -f \"$tmp\" " + guestImageMarkerPath
+	if err := execGuestStdinFile(ctx, sd.Container, markerPath, "sh", "-c", script); err != nil {
+		return fmt.Errorf("record guest image-cache generation: %w", err)
+	}
+	return nil
+}
+
+// PrepareGuest makes the guest's Docker state ready before any application
+// runner can start.
+func PrepareGuest(ctx context.Context, app state.App, sd state.Siding) error {
+	if err := AssureImageCache(ctx, app); err != nil {
+		return err
+	}
+	return prepareGuestFromCache(ctx, app, sd)
+}
+
+func prepareGuestFromCache(ctx context.Context, app state.App, sd state.Siding) error {
+	if err := EnsureDockerd(ctx, sd); err != nil {
+		return err
+	}
+	if err := CreateBindVolumes(ctx, app, sd); err != nil {
+		return err
+	}
+	if _, err := LoadWarm(ctx, app, sd); err != nil {
+		return fmt.Errorf("load dependency image cache: %w", err)
+	}
+	return EnsureDockerd(ctx, sd)
+}
+
+// AssureImageCache fetches only configured tags missing from the project's
+// archive. A complete archive is reused without a registry call.
+func AssureImageCache(ctx context.Context, app state.App) error {
+	if len(app.PrebakeImages) == 0 && len(app.PrebakeBuilds) == 0 {
+		return nil
+	}
+	if _, err := assureImageSources(ctx, WarmTarPath(app), app.PrebakeImages, localBuildSources(app)); err != nil {
+		var cleanupErr *imagecache.CommittedCleanupError
+		if errors.As(err, &cleanupErr) {
+			fmt.Fprintf(cacheWarningWriter, "warning: dependency image cache published, but automatic collection failed at %s: %v\n", WarmTarPath(app), cleanupErr)
+			return nil
+		}
+		return fmt.Errorf("assure dependency image cache: %w", err)
+	}
+	return nil
 }
 
 // WaitStarted blocks until the AppHost log says the app started, the guest exits,
@@ -588,7 +920,10 @@ func RouteFromContract(appName string, r contract.FrontDoorRoute, listenPort int
 // Returns nil when the siding has no readable/valid contract, so the caller falls
 // back to the app-level set rather than failing an `up`/`switch`.
 func resolveSidingFrontDoor(app state.App, sd state.Siding) ([]state.Route, error) {
-	src, _ := Paths(app, sd.Name)
+	src, _, err := Paths(app, sd.Name)
+	if err != nil {
+		return nil, err
+	}
 	path := filepath.Join(src, contract.FileName)
 	if _, err := os.Stat(path); err != nil {
 		return nil, nil // no siding contract → the app-level set (not an error)
@@ -832,7 +1167,18 @@ func DashboardURL(app state.App, sd state.Siding) string {
 	if sd.LastIP == "" {
 		return ""
 	}
-	port := guestDashboardPort
+	port := dashboardGuestPort(app, sd)
+	if port == 0 {
+		return ""
+	}
+	return fmt.Sprintf("http://%s:%d", sd.LastIP, port)
+}
+
+func dashboardGuestPort(app state.App, sd state.Siding) int {
+	port := 0
+	if app.Runner == "" || app.Runner == runner.Aspire {
+		port = guestDashboardPort
+	}
 	for _, r := range EffRoutes(app, sd) {
 		if r.Kind == state.KindHTTP && r.GuestPort != 0 &&
 			(r.Resource == "aspire-dashboard" || r.Key == "aspire-dashboard" || r.Key == "dashboard") {
@@ -840,7 +1186,7 @@ func DashboardURL(app state.App, sd state.Siding) string {
 			break
 		}
 	}
-	return fmt.Sprintf("http://%s:%d", sd.LastIP, port)
+	return port
 }
 
 // expandHome replaces a leading ~ with the user's home dir.
@@ -896,7 +1242,12 @@ func WaitReady(ctx context.Context, app state.App, sd state.Siding, timeout time
 			shown = len(lines)
 		}
 		tail.Update(fmt.Sprintf("⏳ waiting for %s to listen… (%s)", app.Runner, time.Since(start).Round(time.Second)), fresh)
-		if allPortsListening(ctx, app, sd) {
+		ready, err := ProbeAppRunning(ctx, app, sd)
+		if err != nil {
+			tail.Freeze()
+			return fmt.Errorf("probe %s readiness: %w", app.Runner, err)
+		}
+		if ready {
 			tail.Stop(fmt.Sprintf("✓ %s up (%s)", app.Runner, time.Since(start).Round(time.Second)))
 			return nil
 		}
@@ -1009,54 +1360,56 @@ func healthTarget(app state.App) (port int, path string, tls bool) {
 // `up` re-activates instead of restarting (and colliding with) a live AppHost —
 // some apps never log the "started" marker, so a log check alone re-launches it.
 func AppRunning(ctx context.Context, app state.App, sd state.Siding) bool {
+	running, _ := ProbeAppRunning(ctx, app, sd)
+	return running
+}
+
+// ProbeAppRunning reports process state without treating a failed guest probe as
+// a stopped application.
+func ProbeAppRunning(ctx context.Context, app state.App, sd state.Siding) (bool, error) {
 	if app.Runner == "" || app.Runner == runner.Aspire {
-		// The resource-service port (18890 = hex 49CA) being bound means the
-		// AppHost is running.
-		out, _ := container.Exec(ctx, sd.Container, "sh", "-c",
-			"cat /proc/net/tcp 2>/dev/null | awk '{print $2}' | grep -iq ':49CA' && echo up")
-		return strings.Contains(out, "up")
+		// Probe the dashboard route the AppHost actually exposes. Newer Aspire CLI
+		// versions no longer leave the old resource-service port (18890) listening,
+		// which made a live AppHost look stopped and caused `up` to restart it.
+		port := dashboardGuestPort(app, sd)
+		out, err := container.Exec(ctx, sd.Container, "sh", "-c",
+			fmt.Sprintf("if socat -T1 /dev/null TCP:127.0.0.1:%d >/dev/null 2>&1; then echo up; else echo down; fi", port))
+		if err != nil {
+			return false, err
+		}
+		return strings.Contains(out, "up"), nil
 	}
-	return allPortsListening(ctx, app, sd)
+	checks := make([]string, 0, len(EffRoutes(app, sd)))
+	for _, route := range EffRoutes(app, sd) {
+		if route.GuestPort == 0 {
+			return false, nil
+		}
+		checks = append(checks, fmt.Sprintf("socat -T1 /dev/null TCP:127.0.0.1:%d >/dev/null 2>&1", route.GuestPort))
+	}
+	script := "if " + strings.Join(checks, " && ") + "; then echo up; else echo down; fi"
+	if len(checks) == 0 {
+		script = "echo up"
+	}
+	out, err := container.Exec(ctx, sd.Container, "sh", "-c", script)
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(out, "up"), nil
 }
 
-// baselineDir is where a project's one-time host-volume extraction lives — the
-// APFS source each siding cp -c clones from.
-func baselineDir(app state.App, vol string) string {
-	return filepath.Join(app.ConfigDir, "baseline", vol)
-}
-
-// EnsureVolumeBaselines extracts each declared host Docker named volume to an
-// APFS baseline dir under the project's config (one-time, the only expensive
-// step — e.g. a 50 GB SQL volume copied once), so `new` can cp -c (copy-on-write)
-// an instant per-siding clone from it. Skips volumes already extracted or absent
-// on the host. Requires host Docker (online once for the tiny alpine helper).
+// EnsureVolumeBaselines creates an explicit empty canonical generation when a
+// project first declares data volumes. Later generations only come from an
+// explicit siding promotion; host Docker is never probed or imported.
 func EnsureVolumeBaselines(ctx context.Context, app state.App) error {
 	if len(app.Volumes) == 0 {
 		return nil
 	}
-	if !hostdocker.Available(ctx) {
-		fmt.Println("• host Docker unavailable — sidings start with empty data volumes")
-		return nil
+	manager, err := databaseline.New(app.ConfigDir, app.Volumes)
+	if err != nil {
+		return err
 	}
-	for _, vol := range app.Volumes {
-		base := baselineDir(app, vol)
-		if _, err := os.Stat(base); err == nil {
-			continue // already extracted
-		}
-		if !hostdocker.HasVolume(ctx, vol) {
-			fmt.Printf("  (skip data volume %q — not on host Docker)\n", vol)
-			continue
-		}
-		fmt.Printf("• extracting data volume %q from host (one-time baseline)…\n", vol)
-		if err := os.MkdirAll(base, 0o755); err != nil {
-			return err
-		}
-		if err := hostdocker.ExtractVolumeToDir(ctx, vol, base); err != nil {
-			_ = os.RemoveAll(base) // don't leave a half-extracted baseline
-			return fmt.Errorf("extract host volume %q: %w", vol, err)
-		}
-	}
-	return nil
+	_, err = manager.InitializeEmpty(ctx)
+	return err
 }
 
 // CreateBindVolumes points a guest Docker named volume at each siding's cp -c
@@ -1066,14 +1419,36 @@ func EnsureVolumeBaselines(ctx context.Context, app state.App) error {
 // created, and routes Spin didn't clone because there was no baseline).
 func CreateBindVolumes(ctx context.Context, app state.App, sd state.Siding) error {
 	for _, vol := range app.Volumes {
+		if err := contract.ValidateVolumeName(vol); err != nil {
+			return fmt.Errorf("invalid data volume %q: %w", vol, err)
+		}
 		dev := "/mnt/dvol/" + vol
-		if out, _ := container.Exec(ctx, sd.Container, "sh", "-c", "test -d "+dev+" && echo yes"); !strings.Contains(out, "yes") {
-			continue // no cp -c clone mounted for this volume
+		probe := `if [ -d "$1" ]; then echo directory; elif [ -e "$1" ]; then echo not-directory; else echo absent; fi`
+		out, err := execGuest(ctx, sd.Container, "sh", "-c", probe, "shunt-volume-probe", dev)
+		if err != nil {
+			return fmt.Errorf("probe host-backed mount for volume %q: %w", vol, err)
 		}
-		if out, _ := container.Exec(ctx, sd.Container, "docker", "volume", "inspect", vol); strings.Contains(out, vol) {
-			continue // already created
+		switch strings.TrimSpace(out) {
+		case "absent":
+			continue
+		case "directory":
+		case "not-directory":
+			return fmt.Errorf("host-backed mount for volume %q exists but is not a directory", vol)
+		default:
+			return fmt.Errorf("probe host-backed mount for volume %q returned %q", vol, strings.TrimSpace(out))
 		}
-		if _, err := container.Exec(ctx, sd.Container, "docker", "volume", "create",
+		out, err = execGuest(ctx, sd.Container, "docker", "volume", "ls", "--quiet", "--filter", "name=^"+vol+"$")
+		if err != nil {
+			return fmt.Errorf("probe Docker volume %q: %w", vol, err)
+		}
+		existing := strings.Fields(out)
+		if len(existing) == 1 && existing[0] == vol {
+			continue
+		}
+		if len(existing) != 0 {
+			return fmt.Errorf("probe Docker volume %q returned unexpected names: %s", vol, strings.Join(existing, ", "))
+		}
+		if _, err := execGuest(ctx, sd.Container, "docker", "volume", "create",
 			"--driver", "local", "--opt", "type=none", "--opt", "o=bind", "--opt", "device="+dev, vol); err != nil {
 			return fmt.Errorf("create bind-backed volume %q: %w", vol, err)
 		}
@@ -1088,6 +1463,23 @@ func CreateBindVolumes(ctx context.Context, app state.App, sd state.Siding) erro
 // is `up`/`restart` (or `restart host` for the native app); keeping the two
 // independent lets you, say, switch to the host to run just the DB yourself.
 func Switch(ctx context.Context, app *state.App, target string) error {
+	if app == nil {
+		return errors.New("app is required")
+	}
+	return WithProjectOperation(ctx, app.ConfigDir, func() error {
+		current, err := state.LoadApp(app.ConfigDir)
+		if err != nil {
+			return err
+		}
+		if err := switchLocked(ctx, &current, target); err != nil {
+			return err
+		}
+		*app = current
+		return nil
+	})
+}
+
+func switchLocked(ctx context.Context, app *state.App, target string) error {
 	admin := caddy.NewAdmin()
 	wasHost := app.LiveSiding == state.HostTarget
 
@@ -1133,7 +1525,9 @@ func Switch(ctx context.Context, app *state.App, target string) error {
 		// the front-door servers were removed — stop it (best-effort) so it releases
 		// them, then re-create every server (this siding's full set, incl. any it adds)
 		// so Caddy re-binds before pointing at the guest.
-		HostStop(ctx, *app)
+		if err := hostStopUnlocked(ctx, *app); err != nil {
+			return fmt.Errorf("stop native host before switching: %w", err)
+		}
 		eff := *app
 		eff.FrontDoor = EffRoutes(*app, sd)
 		if err := caddy.EnsureFrontDoor(ctx, admin, eff); err != nil {
@@ -1193,6 +1587,12 @@ func hostShellCmd(ctx context.Context, app state.App, command string) error {
 // copy serves the front-door ports directly. aspire → `aspire start` (managed,
 // background); other runners → the contract's start command.
 func HostStart(ctx context.Context, app state.App) error {
+	return WithProjectOperation(ctx, app.ConfigDir, func() error {
+		return hostStartUnlocked(ctx, app)
+	})
+}
+
+func hostStartUnlocked(ctx context.Context, app state.App) error {
 	cmd := app.Start
 	if app.Runner == "" || app.Runner == runner.Aspire {
 		// Raise the CLI start timeout past its 120s default for a heavy cold start.
@@ -1207,45 +1607,131 @@ func HostStart(ctx context.Context, app state.App) error {
 	return nil
 }
 
-// HostStop stops the natively-running app (best-effort — fine if nothing's
-// running), freeing the front-door ports. aspire → `aspire stop`; else the
-// contract's stop command. It also stops any host Docker container still
+// HostStop stops the natively-running app, freeing the front-door ports.
+// aspire → `aspire stop`; else the contract's stop command. It reports stop
+// failures rather than racing a siding against a process that may still own a
+// port. It also stops any host Docker container still
 // publishing a front-door port: `aspire stop` leaves persistent-lifetime deps
 // (e.g. the SQL container behind the layer4 route) running, and those hold the
 // ports a siding switch needs to re-bind.
-func HostStop(ctx context.Context, app state.App) {
+func HostStop(ctx context.Context, app state.App) error {
+	return WithProjectOperation(ctx, app.ConfigDir, func() error {
+		return hostStopUnlocked(ctx, app)
+	})
+}
+
+func hostStopUnlocked(ctx context.Context, app state.App) error {
+	var stopErrs []error
 	cmd := app.Stop
 	if app.Runner == "" || app.Runner == runner.Aspire {
 		cmd = "aspire stop --non-interactive"
 	}
 	if cmd != "" {
-		_ = hostShellCmd(ctx, app, cmd)
+		if err := hostShellCmd(ctx, app, cmd); err != nil {
+			stopErrs = append(stopErrs, fmt.Errorf("stop native application: %w", err))
+		}
 	}
+	if !proc.Look("docker") {
+		return errors.Join(stopErrs...)
+	}
+	seenPorts := map[int]bool{}
 	for _, r := range app.FrontDoor {
+		if seenPorts[r.ListenPort] {
+			continue
+		}
+		seenPorts[r.ListenPort] = true
 		out, err := proc.Run(ctx, "docker", "ps", "--filter", fmt.Sprintf("publish=%d", r.ListenPort), "--format", "{{.ID}}")
 		if err != nil {
-			continue // no host docker / not reachable — nothing to free
+			// The CLI can remain installed after Docker Desktop/OrbStack stops. In
+			// that case there cannot be a reachable host daemon with a container
+			// holding this port, so preserve the daemon-free best-effort behavior.
+			continue
 		}
 		for _, id := range strings.Fields(out.Stdout) {
-			_, _ = proc.Run(ctx, "docker", "stop", id) // stop (keeps data); host-restart re-creates it
+			if _, err := proc.Run(ctx, "docker", "stop", id); err != nil {
+				stopErrs = append(stopErrs, fmt.Errorf("stop host Docker container %s publishing port %d: %w", id, r.ListenPort, err))
+			}
 		}
 	}
+	return errors.Join(stopErrs...)
 }
 
-// Restart stops the app in the guest and starts it again (the configured stop +
-// start), keeping the guest, dockerd, deps, and data up, then waits for it to be
-// ready. This is the "bring a down route back up" path. Shared by `shunt restart`
-// and the dashboard.
+// HostRestart serializes the native stop/start pair with switches and app
+// registration so a host process cannot race Caddy for the same front-door ports.
+func HostRestart(ctx context.Context, app state.App) error {
+	return WithProjectOperation(ctx, app.ConfigDir, func() error {
+		if err := hostStopUnlocked(ctx, app); err != nil {
+			return err
+		}
+		return hostStartUnlocked(ctx, app)
+	})
+}
+
+// Restart stops the application, re-assures and loads its configured images,
+// starts the runner, and waits for readiness. The guest and data stay in place.
 func Restart(ctx context.Context, app state.App, sd state.Siding) error {
-	if err := StopApp(ctx, app, sd); err != nil {
+	wasLive := false
+	recreatedGuest := false
+	err := WithSidingOperation(ctx, app.ConfigDir, sd.Name, func() error {
+		current, err := state.LoadApp(app.ConfigDir)
+		if err != nil {
+			return err
+		}
+		latest, ok := current.Sidings[sd.Name]
+		if !ok {
+			return fmt.Errorf("no siding %q", sd.Name)
+		}
+		wasLive = current.LiveSiding == sd.Name
+		if err := EnsureGuestLive(ctx, latest); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			recreated, recreateErr := recreate(ctx, current, latest, false)
+			if recreateErr != nil {
+				return fmt.Errorf("guest for %q needs recreation (%v), but recreation failed: %w", sd.Name, err, recreateErr)
+			}
+			latest = recreated
+			recreatedGuest = true
+		}
+		if err := restart(ctx, current, latest); err != nil {
+			return err
+		}
+		if recreatedGuest {
+			if err := Activate(ctx, current, &latest); err != nil {
+				return fmt.Errorf("restore bridges after guest recreation: %w", err)
+			}
+			if _, err := MergeSidingState(ctx, current.ConfigDir, latest, false); err != nil {
+				return fmt.Errorf("save recreated guest bridges: %w", err)
+			}
+		}
+		return nil
+	})
+	if err == nil && recreatedGuest && wasLive {
+		err = restoreLiveRoute(ctx, app.ConfigDir, sd.Name)
+	}
+	return err
+}
+
+func restart(ctx context.Context, app state.App, sd state.Siding) error {
+	guestState, err := guestRuntimeState(ctx, sd.Container)
+	if err != nil {
+		return fmt.Errorf("inspect guest for %q: %w", sd.Name, err)
+	}
+	if guestState != "running" {
+		return fmt.Errorf("the guest for %q isn't running (state=%s)", sd.Name, guestState)
+	}
+	if err := prepareLifecycle(ctx, app, sd); err != nil {
+		return err
+	}
+	if err := stopLifecycleApp(ctx, app, sd); err != nil {
 		return err
 	}
 	// Clear the old start marker so WaitReady waits for the fresh run.
 	_, _ = container.Exec(ctx, sd.Container, "sh", "-c", "> "+appLogPath)
-	if err := StartApp(ctx, app, sd); err != nil {
+	if err := startLifecycleApp(ctx, app, sd); err != nil {
 		return err
 	}
-	return WaitReady(ctx, app, sd, 15*time.Minute)
+	return waitLifecycleReady(ctx, app, sd, 15*time.Minute)
 }
 
 // orDefaultStr returns v if non-empty, else def.
@@ -1256,18 +1742,38 @@ func orDefaultStr(v, def string) string {
 	return v
 }
 
-// Recreate rebuilds a siding's guest with the current app config (memory, cpus,
+// Recreate rebuilds an idle siding guest with the current app config (memory, cpus,
 // mounts, env) — for "reapply config to an existing siding". It keeps the
 // worktree, branch, and data (the on-disk src + cp -c volume clones), replacing
 // only the container, so guest-creation settings take effect. Run `up` after to
 // start the app (the guest's Docker is fresh, so bind volumes + bridges rebuild).
 func Recreate(ctx context.Context, app state.App, sd state.Siding, freshData bool) (state.Siding, error) {
-	src, volRoot := Paths(app, sd.Name)
-	// Remove the old guest first: with --fresh-data we clear + re-clone the host data
-	// dirs below, and doing that while the guest still bind-mounts them risks EBUSY /
-	// partial deletes. (Without --fresh-data this is just the plain container swap.)
-	if err := container.Remove(ctx, sd.Container); err != nil {
+	var recreated state.Siding
+	err := WithSidingOperation(ctx, app.ConfigDir, sd.Name, func() error {
+		current, err := state.LoadApp(app.ConfigDir)
+		if err != nil {
+			return err
+		}
+		latest, ok := current.Sidings[sd.Name]
+		if !ok {
+			return fmt.Errorf("no siding %q", sd.Name)
+		}
+		recreated, err = recreate(ctx, current, latest, freshData)
+		return err
+	})
+	return recreated, err
+}
+
+func recreate(ctx context.Context, app state.App, sd state.Siding, freshData bool) (state.Siding, error) {
+	src, volRoot, err := Paths(app, sd.Name)
+	if err != nil {
 		return sd, err
+	}
+	if err := AssureImageCache(ctx, app); err != nil {
+		return sd, err
+	}
+	if err := ensureBaseImage(ctx, false); err != nil {
+		return sd, fmt.Errorf("ensure native base image before replacing guest: %w", err)
 	}
 	mounts := []container.Mount{{Host: src, Guest: "/workspace"}}
 	// Standing per-siding output dir — recordings/logs land here, outside the
@@ -1278,38 +1784,32 @@ func Recreate(ctx context.Context, app state.App, sd state.Siding, freshData boo
 		return sd, err
 	}
 	mounts = append(mounts, container.Mount{Host: outDir, Guest: "/out"})
+	var baseline *databaseline.Manager
+	if freshData && len(app.Volumes) > 0 {
+		baseline, err = databaseline.New(app.ConfigDir, app.Volumes)
+		if err != nil {
+			return sd, err
+		}
+		if _, err := baseline.InitializeEmpty(ctx); err != nil {
+			return sd, err
+		}
+	}
 	for _, vol := range app.Volumes {
 		host := filepath.Join(volRoot, vol)
-		// --fresh-data: reset this volume to the project baseline while the worktree
-		// (code) is left untouched.
-		if freshData {
-			// `vol` comes from the contract, so refuse anything that isn't a plain name
-			// before it reaches RemoveAll — a value like "../x" must never escape volRoot.
-			if vol != filepath.Base(vol) || vol == "." || vol == ".." {
-				return sd, fmt.Errorf("refusing to reset data volume with unsafe name %q", vol)
-			}
-			// Always clear the current clone, then re-clone from the baseline. CloneVolume
-			// no-ops when the baseline is absent (leaving the volume empty — exactly how
-			// `new` starts a siding whose host lacked this volume) and surfaces real stat /
-			// cp errors rather than swallowing them.
-			if err := os.RemoveAll(host); err != nil {
-				return sd, fmt.Errorf("reset data volume %q: %w", vol, err)
-			}
-			if err := os.MkdirAll(volRoot, 0o755); err != nil {
+		if !freshData {
+			if err := os.MkdirAll(host, 0o755); err != nil {
 				return sd, err
 			}
-			if err := fsclone.CloneVolume(ctx, baselineDir(app, vol), host); err != nil {
-				return sd, fmt.Errorf("re-clone data volume %q from baseline: %w", vol, err)
-			}
 		}
-		if _, err := os.Stat(host); err == nil {
-			mounts = append(mounts, container.Mount{Host: host, Guest: "/mnt/dvol/" + vol})
-		}
+		mounts = append(mounts, container.Mount{Host: host, Guest: "/mnt/dvol/" + vol})
 	}
 	for _, m := range app.Mounts {
 		host, err := expandHome(m.Host)
 		if err != nil {
 			return sd, err
+		}
+		if _, err := os.Stat(host); err != nil {
+			return sd, fmt.Errorf("inspect configured mount %q: %w", host, err)
 		}
 		mounts = append(mounts, container.Mount{Host: host, Guest: m.Guest, ReadOnly: m.ReadOnly})
 	}
@@ -1318,12 +1818,31 @@ func Recreate(ctx context.Context, app state.App, sd state.Siding, freshData boo
 			mounts = append(mounts, container.Mount{Host: nugetHost, Guest: "/root/.nuget/packages"})
 		}
 	}
-	if IsWarmed(app) {
-		mounts = append(mounts, container.Mount{Host: WarmTarPath(app), Guest: guestWarmTar, ReadOnly: true})
+	// Everything that can be checked without disrupting the current guest is now
+	// ready. Fresh data is reset only after removal because the guest bind-mounts
+	// those directories while it exists.
+	if err := removeGuest(ctx, sd.Container); err != nil {
+		return sd, err
 	}
-	if err := container.Run(ctx, container.RunOpts{
+	sd.Bridges = map[string]int{}
+	sd.LastIP = ""
+	sd.Stopped = true
+	if _, err := mergeSiding(ctx, app.ConfigDir, sd, true); err != nil {
+		return sd, fmt.Errorf("guest removed, but replacement state could not be saved: %w", err)
+	}
+	if baseline != nil {
+		if _, err := baseline.ResetVolumeRoot(ctx, volRoot); err != nil {
+			return sd, fmt.Errorf("reset siding data after guest removal: %w", err)
+		}
+	}
+	for _, vol := range app.Volumes {
+		if err := os.MkdirAll(filepath.Join(volRoot, vol), 0o755); err != nil {
+			return sd, err
+		}
+	}
+	if err := runGuest(ctx, container.RunOpts{
 		Name:      sd.Container,
-		Image:     config.BaseImageTag(),
+		Image:     image.Tag(),
 		Init:      true,
 		CapAddAll: true,
 		Memory:    orDefaultStr(app.Memory, config.GuestMemory()),
@@ -1335,6 +1854,13 @@ func Recreate(ctx context.Context, app state.App, sd state.Siding, freshData boo
 	}); err != nil {
 		return sd, err
 	}
-	sd.Bridges = map[string]int{} // fresh guest Docker — rebuild bind volumes + bridges on next up
+	sd.Stopped = false
+	if _, err := mergeSiding(ctx, app.ConfigDir, sd, true); err != nil {
+		stopErr := stopGuest(context.WithoutCancel(ctx), sd.Container)
+		return sd, errors.Join(fmt.Errorf("replacement guest started, but its state could not be saved: %w", err), stopErr)
+	}
+	if err := prepareGuestFromCache(ctx, app, sd); err != nil {
+		return sd, err
+	}
 	return sd, nil
 }

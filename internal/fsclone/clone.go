@@ -4,9 +4,11 @@ package fsclone
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
@@ -134,26 +136,186 @@ func RemoveWorktree(ctx context.Context, repoPath, dest, branch string) error {
 	return nil
 }
 
-// CloneVolume APFS-clones a baseline data dir to dest (cp -c, copy-on-write —
-// near-instant and space-efficient until written). No-op if src doesn't exist.
+// CloneVolume creates a fidelity-checked copy-on-write clone of a baseline data
+// directory. No-op if src doesn't exist.
 func CloneVolume(ctx context.Context, src, dest string) error {
-	if _, err := os.Stat(src); err != nil {
+	info, err := os.Lstat(src)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return fmt.Errorf("stat baseline %s: %w", src, err)
 	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("baseline %s is not a directory", src)
+	}
 	// `cp -c -R src dest` copies src *inside* dest when dest already exists
 	// (dest/<basename>/… instead of overwriting dest/…), so a re-clone of the same
 	// siding would nest. Clear a stale dest first — it's this siding's own COW
 	// clone, cheap to recreate.
-	if _, err := os.Stat(dest); err == nil {
+	if _, err := os.Lstat(dest); err == nil {
 		if err := os.RemoveAll(dest); err != nil {
 			return fmt.Errorf("clear stale volume clone %s: %w", dest, err)
 		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect stale volume clone %s: %w", dest, err)
 	}
-	if _, err := proc.Run(ctx, "cp", "-c", "-R", src, dest); err != nil {
-		return fmt.Errorf("cp -c %s -> %s: %w", src, dest, err)
+	if err := cloneVolumeTree(ctx, src, dest); err != nil {
+		return fmt.Errorf("clone volume %s -> %s: %w", src, dest, err)
 	}
 	return nil
+}
+
+// VolumeSetResult preserves the commit point when cleanup of a replaced root
+// fails after an atomic installation.
+type VolumeSetResult struct {
+	Committed     bool
+	RecoveryPaths []string
+}
+
+// VolumeSetCleanupError reports whether the destination committed and the
+// exact paths left for deterministic cleanup.
+type VolumeSetCleanupError struct {
+	Committed     bool
+	RecoveryPaths []string
+	Err           error
+}
+
+func (e *VolumeSetCleanupError) Error() string {
+	return fmt.Sprintf("volume root committed=%t, but cleanup failed; recover from %v: %v", e.Committed, e.RecoveryPaths, e.Err)
+}
+
+func (e *VolumeSetCleanupError) Unwrap() error { return e.Err }
+
+type volumeSetOps struct {
+	rename     func(string, string) error
+	renameSwap func(string, string) error
+	remove     func(string) error
+}
+
+// CloneVolumeSet creates a complete copy-on-write volume root before replacing
+// destination, so callers never expose a mixture of old and reset volumes.
+func CloneVolumeSet(ctx context.Context, sourceRoot, destinationRoot string, volumes []string) error {
+	_, err := CloneVolumeSetResult(ctx, sourceRoot, destinationRoot, volumes)
+	return err
+}
+
+// CloneVolumeSetResult is CloneVolumeSet with an explicit post-commit cleanup
+// result for callers that must distinguish an unchanged destination from an
+// installed destination whose retired root still needs removal.
+func CloneVolumeSetResult(ctx context.Context, sourceRoot, destinationRoot string, volumes []string) (VolumeSetResult, error) {
+	return cloneVolumeSet(ctx, sourceRoot, destinationRoot, volumes, volumeSetOps{
+		rename: os.Rename, renameSwap: renameSwap, remove: os.RemoveAll,
+	})
+}
+
+func cloneVolumeSet(ctx context.Context, sourceRoot, destinationRoot string, volumes []string, ops volumeSetOps) (VolumeSetResult, error) {
+	if err := validateVolumeNames(volumes); err != nil {
+		return VolumeSetResult{}, err
+	}
+	parent := filepath.Dir(destinationRoot)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return VolumeSetResult{}, fmt.Errorf("create volume root parent: %w", err)
+	}
+	stage, err := os.MkdirTemp(parent, ".volumes-stage-")
+	if err != nil {
+		return VolumeSetResult{}, fmt.Errorf("create volume stage: %w", err)
+	}
+
+	for _, volume := range volumes {
+		if err := ctx.Err(); err != nil {
+			return cleanupVolumeSetFailure(ops, stage, err)
+		}
+		source := filepath.Join(sourceRoot, volume)
+		destination := filepath.Join(stage, volume)
+		info, err := os.Lstat(source)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return cleanupVolumeSetFailure(ops, stage, fmt.Errorf("stat source volume %q: %w", volume, err))
+			}
+			if err := os.MkdirAll(destination, 0o755); err != nil {
+				return cleanupVolumeSetFailure(ops, stage, fmt.Errorf("create empty volume %q: %w", volume, err))
+			}
+			continue
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return cleanupVolumeSetFailure(ops, stage, fmt.Errorf("source volume %q is not a directory", volume))
+		}
+		if err := CloneVolume(ctx, source, destination); err != nil {
+			return cleanupVolumeSetFailure(ops, stage, fmt.Errorf("clone volume %q: %w", volume, err))
+		}
+	}
+
+	if err := validateVolumeRoot(stage, volumes); err != nil {
+		return cleanupVolumeSetFailure(ops, stage, err)
+	}
+	if _, err := os.Lstat(destinationRoot); os.IsNotExist(err) {
+		if err := ops.rename(stage, destinationRoot); err != nil {
+			return cleanupVolumeSetFailure(ops, stage, fmt.Errorf("install volume root: %w", err))
+		}
+		return VolumeSetResult{Committed: true}, nil
+	} else if err != nil {
+		return cleanupVolumeSetFailure(ops, stage, fmt.Errorf("stat destination volume root: %w", err))
+	}
+
+	if err := ops.renameSwap(stage, destinationRoot); err != nil {
+		return cleanupVolumeSetFailure(ops, stage, fmt.Errorf("swap volume root: %w", err))
+	}
+	if err := ops.remove(stage); err != nil {
+		paths := existingVolumePaths(stage)
+		result := VolumeSetResult{Committed: true, RecoveryPaths: paths}
+		return result, &VolumeSetCleanupError{Committed: true, RecoveryPaths: paths, Err: fmt.Errorf("remove replaced root: %w", err)}
+	}
+	return VolumeSetResult{Committed: true}, nil
+}
+
+func cleanupVolumeSetFailure(ops volumeSetOps, stage string, operationErr error) (VolumeSetResult, error) {
+	if err := ops.remove(stage); err != nil {
+		paths := existingVolumePaths(stage)
+		result := VolumeSetResult{RecoveryPaths: paths}
+		return result, &VolumeSetCleanupError{RecoveryPaths: paths, Err: errors.Join(operationErr, fmt.Errorf("remove uncommitted stage: %w", err))}
+	}
+	return VolumeSetResult{}, operationErr
+}
+
+func existingVolumePaths(paths ...string) []string {
+	var result []string
+	for _, path := range paths {
+		if _, err := os.Lstat(path); err == nil {
+			result = append(result, filepath.Clean(path))
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func validateVolumeNames(volumes []string) error {
+	seen := make(map[string]struct{}, len(volumes))
+	for _, volume := range volumes {
+		if volume == "" || volume == "." || volume == ".." || filepath.Base(volume) != volume {
+			return fmt.Errorf("unsafe data volume name %q", volume)
+		}
+		if _, exists := seen[volume]; exists {
+			return fmt.Errorf("duplicate data volume name %q", volume)
+		}
+		seen[volume] = struct{}{}
+	}
+	return nil
+}
+
+func validateVolumeRoot(root string, volumes []string) error {
+	for _, volume := range volumes {
+		info, err := os.Lstat(filepath.Join(root, volume))
+		if err != nil {
+			return fmt.Errorf("validate volume %q: %w", volume, err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("validate volume %q: not a directory", volume)
+		}
+	}
+	return nil
+}
+
+func renameSwap(from, to string) error {
+	return renamexSwap(from, to)
 }

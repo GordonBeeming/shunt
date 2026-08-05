@@ -2,6 +2,7 @@ package fsclone
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,6 +76,69 @@ func TestVerifyCommitNamesMissingRef(t *testing.T) {
 	}
 }
 
+func TestCloneVolumeSetReplacesWholeRoot(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "baseline")
+	destination := filepath.Join(root, "siding", "vol")
+	writeTestFile(t, filepath.Join(source, "db"), "value", "new db")
+	writeTestFile(t, filepath.Join(source, "cache"), "value", "new cache")
+	writeTestFile(t, filepath.Join(destination, "db"), "value", "old db")
+	writeTestFile(t, filepath.Join(destination, "cache"), "value", "old cache")
+
+	if err := CloneVolumeSet(context.Background(), source, destination, []string{"db", "cache"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct{ volume, want string }{{"db", "new db"}, {"cache", "new cache"}} {
+		got, err := os.ReadFile(filepath.Join(destination, test.volume, "value"))
+		if err != nil || string(got) != test.want {
+			t.Fatalf("%s = %q, %v; want %q", test.volume, got, err, test.want)
+		}
+	}
+}
+
+func TestCloneVolumeSetRejectsUnsafeNames(t *testing.T) {
+	if err := CloneVolumeSet(context.Background(), t.TempDir(), filepath.Join(t.TempDir(), "dest"), []string{"../db"}); err == nil {
+		t.Fatal("CloneVolumeSet() error = nil")
+	}
+}
+
+func TestCloneVolumeSetReportsCommittedCleanupFailure(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "baseline")
+	destination := filepath.Join(root, "siding", "vol")
+	writeTestFile(t, filepath.Join(source, "db"), "value", "new")
+	writeTestFile(t, filepath.Join(destination, "db"), "value", "old")
+	var retired string
+	result, err := cloneVolumeSet(context.Background(), source, destination, []string{"db"}, volumeSetOps{
+		rename: os.Rename,
+		renameSwap: func(stage, current string) error {
+			retired = stage
+			return renameSwap(stage, current)
+		},
+		remove: func(path string) error {
+			if path == retired {
+				return errors.New("cleanup denied")
+			}
+			return os.RemoveAll(path)
+		},
+	})
+	var cleanup *VolumeSetCleanupError
+	if !result.Committed || !errors.As(err, &cleanup) {
+		t.Fatalf("cloneVolumeSet() = %#v, %v", result, err)
+	}
+	if len(result.RecoveryPaths) != 1 || result.RecoveryPaths[0] != retired {
+		t.Fatalf("recovery paths = %v, want %s", result.RecoveryPaths, retired)
+	}
+	got, readErr := os.ReadFile(filepath.Join(destination, "db", "value"))
+	if readErr != nil || string(got) != "new" {
+		t.Fatalf("destination = %q, %v", got, readErr)
+	}
+	old, readErr := os.ReadFile(filepath.Join(retired, "db", "value"))
+	if readErr != nil || string(old) != "old" {
+		t.Fatalf("retired root = %q, %v", old, readErr)
+	}
+}
+
 func newWorktreeTestRepo(t *testing.T) (repo, mainCommit, workspaceCommit string) {
 	t.Helper()
 	repo = filepath.Join(t.TempDir(), "repo")
@@ -104,6 +168,9 @@ func newWorktreeTestRepo(t *testing.T) (repo, mainCommit, workspaceCommit string
 
 func writeTestFile(t *testing.T, dir, name, contents string) {
 	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o644); err != nil {
 		t.Fatal(err)
 	}
