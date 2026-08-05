@@ -461,7 +461,7 @@ func adoptStagedImage(root string, stage *stagedImageRecord) error {
 		if err != nil {
 			return err
 		}
-		if err := linkImmutableObject(source, destination, blob.Size); err != nil {
+		if err := linkImmutableObject(source, destination, blob.Size, blob.Digest); err != nil {
 			return fmt.Errorf("adopt image blob %s: %w", blob.Digest, err)
 		}
 	}
@@ -490,7 +490,7 @@ func adoptStagedImage(root string, stage *stagedImageRecord) error {
 	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
-	if err := linkImmutableObject(source, destination, info.Size()); err != nil {
+	if err := linkImmutableObject(source, destination, info.Size(), stage.record.ExportChecksum); err != nil {
 		return fmt.Errorf("adopt image export %s: %w", stage.record.Ref, err)
 	}
 	return nil
@@ -519,13 +519,16 @@ func recoveryExportPath(root, relative string) (string, error) {
 	return recovery, nil
 }
 
-func linkImmutableObject(source, destination string, expectedSize int64) error {
+func linkImmutableObject(source, destination string, expectedSize int64, expectedDigest string) error {
 	info, err := os.Lstat(source)
 	if err != nil {
 		return err
 	}
 	if !info.Mode().IsRegular() || info.Size() != expectedSize {
 		return fmt.Errorf("staged object is not a regular %d-byte file", expectedSize)
+	}
+	if err := verifyFile(source, expectedDigest, expectedSize); err != nil {
+		return fmt.Errorf("verify staged immutable object: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		return err
@@ -542,8 +545,16 @@ func linkImmutableObject(source, destination string, expectedSize int64) error {
 	if err != nil {
 		return err
 	}
-	if !existing.Mode().IsRegular() || existing.Size() != expectedSize {
-		return fmt.Errorf("immutable destination already exists with unexpected type or size")
+	if existing.Mode().IsRegular() && existing.Size() == expectedSize {
+		if err := verifyFile(destination, expectedDigest, expectedSize); err == nil {
+			return os.Chmod(destination, 0o600)
+		}
+	}
+	if err := os.Remove(destination); err != nil {
+		return fmt.Errorf("replace corrupt immutable destination: %w", err)
+	}
+	if err := os.Link(source, destination); err != nil {
+		return fmt.Errorf("replace corrupt immutable destination: %w", err)
 	}
 	return os.Chmod(destination, 0o600)
 }

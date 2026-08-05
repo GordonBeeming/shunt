@@ -93,7 +93,7 @@ func TestFormatDataPromoteErrorReportsCommittedRestoreFailure(t *testing.T) {
 	}
 }
 
-func TestFormatDataPromoteErrorReportsDurabilityUncertaintyWithoutRetry(t *testing.T) {
+func TestCommittedDataWarningReportsDurabilityUncertaintyWithoutRetry(t *testing.T) {
 	durabilityFailure := &databaseline.CommittedDurabilityError{
 		Operation: "baseline manifest",
 		Err:       errors.New("directory sync failed"),
@@ -102,8 +102,9 @@ func TestFormatDataPromoteErrorReportsDurabilityUncertaintyWithoutRetry(t *testi
 	if !strings.Contains(err.Error(), "visible but durability is unconfirmed") || !strings.Contains(err.Error(), "do not retry") {
 		t.Fatalf("formatDataPromoteError() = %q", err)
 	}
-	if _, ok := committedDataWarning("data baseline", databaseline.Result{Committed: true}, durabilityFailure); ok {
-		t.Fatal("durability uncertainty was treated as a successful cleanup warning")
+	warning, ok := committedDataWarning("data baseline rollback", databaseline.Result{Committed: true}, durabilityFailure)
+	if !ok || !strings.Contains(warning, "do not retry") || !strings.Contains(warning, "durability is unconfirmed") {
+		t.Fatalf("committedDataWarning() = %q, %v", warning, ok)
 	}
 }
 

@@ -268,6 +268,24 @@ func (m *Manager) InitializeEmpty(ctx context.Context) (Result, error) {
 	})
 }
 
+// Initialized reports whether this volume set already has a valid canonical
+// baseline. It does not create, repair, or remove any baseline state.
+func (m *Manager) Initialized(ctx context.Context) (bool, error) {
+	if len(m.Volumes) == 0 {
+		return false, nil
+	}
+	var initialized bool
+	_, err := m.withLock(ctx, func() (Result, error) {
+		state, _, err := m.loadState()
+		if err != nil {
+			return Result{}, err
+		}
+		initialized = state != nil
+		return Result{}, nil
+	})
+	return initialized, err
+}
+
 // PromoteWithLifecycle keeps quiescence, capture, and manifest publication
 // serialized. Restore and retired-generation cleanup run after releasing the
 // canonical mutation lock.

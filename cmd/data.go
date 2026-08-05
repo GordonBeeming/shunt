@@ -144,6 +144,10 @@ func newDataRollbackCmd() *cobra.Command {
 }
 
 func committedDataWarning(operation string, result databaseline.Result, err error) (string, bool) {
+	var durabilityErr *databaseline.CommittedDurabilityError
+	if result.Committed && errors.As(err, &durabilityErr) {
+		return fmt.Sprintf("warning: %s committed but durability is unconfirmed; do not retry: %v", operation, durabilityErr), true
+	}
 	var cleanupErr *databaseline.CommittedCleanupError
 	if !result.Committed || !errors.As(err, &cleanupErr) {
 		return "", false

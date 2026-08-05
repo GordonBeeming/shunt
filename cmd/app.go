@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/contract"
+	"github.com/gordonbeeming/shunt/internal/databaseline"
 	"github.com/gordonbeeming/shunt/internal/resolve"
 	"github.com/gordonbeeming/shunt/internal/runner"
 	"github.com/gordonbeeming/shunt/internal/siding"
@@ -73,6 +75,11 @@ func newAppAddCmd() *cobra.Command {
 					return existErr
 				}
 				updating := existErr == nil
+				if updating {
+					if err := validateBaselineVolumeChange(ctx, existing, ct.Volumes); err != nil {
+						return err
+					}
+				}
 				app := state.App{
 					Name:          loc.Project,
 					RepoPath:      cwd,
@@ -199,6 +206,40 @@ func newAppAddCmd() *cobra.Command {
 			})
 		},
 	}
+}
+
+func validateBaselineVolumeChange(ctx context.Context, existing state.App, requested []string) error {
+	if sameVolumeNames(existing.Volumes, requested) || len(existing.Volumes) == 0 {
+		return nil
+	}
+	baseline, err := databaseline.New(existing.ConfigDir, existing.Volumes)
+	if err != nil {
+		return fmt.Errorf("inspect existing data baseline: %w", err)
+	}
+	initialized, err := baseline.Initialized(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect existing data baseline: %w", err)
+	}
+	if initialized {
+		return errors.New("dataVolumes cannot change after a data baseline is initialized; keep the existing volume set or remove the baseline deliberately before re-registering the app")
+	}
+	return nil
+}
+
+func sameVolumeNames(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(left))
+	for _, name := range left {
+		seen[name] = struct{}{}
+	}
+	for _, name := range right {
+		if _, ok := seen[name]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // freePort returns a free TCP port on the host not already in used.
