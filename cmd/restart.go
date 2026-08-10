@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/gordonbeeming/shunt/internal/siding"
-	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 )
 
@@ -22,26 +21,21 @@ func newRestartCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// restart can bounce the host too (it re-runs the native app), so the
-			// bare picker includes `host` and starts on whatever's live — unlike
-			// up/kill/logs, which are guest-only (sidingArg).
+			if err := ensureNoRemovalInProgress(app, "restart"); err != nil {
+				return err
+			}
 			var name string
 			if len(args) > 0 {
 				name = args[0]
-			} else if name, err = pickSiding(ctx, app, true); err != nil {
+			} else if name, err = pickSiding(ctx, app); err != nil {
 				return err
-			}
-			if name == state.HostTarget {
-				fmt.Println("• restarting your local app on the host…")
-				if err := siding.HostRestart(ctx, app); err != nil {
-					return err
-				}
-				fmt.Println(tick() + " host app restarted")
-				return nil
 			}
 			sd, ok := app.Sidings[name]
 			if !ok {
 				return fmt.Errorf("no siding %q — create it with `"+bin()+" new %s`", name, name)
+			}
+			if err := siding.RequireGuest(sd); err != nil {
+				return err
 			}
 			fmt.Printf("• stopping the application process in %q (keeping deps + data up)…\n", name)
 			fmt.Println("• rebuilding + restarting…")

@@ -28,13 +28,13 @@ func AddWorktree(ctx context.Context, repoPath, dest, newBranch, baseBranch stri
 			return err
 		}
 	}
-	// Clear any existing worktree at this path first — a previous siding of this
-	// name, or a half-finished `new` that failed after creating the worktree,
+	// Clear any existing worktree at this exact path first — a previous siding of
+	// this name, or a half-finished `new` that failed after creating the worktree,
 	// leaves it checked out on newBranch, and `-B` can't force-update a branch
-	// still in use by a live worktree. Remove + prune frees the branch so the add
-	// below succeeds on retry.
-	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "remove", "--force", dest)
-	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "prune")
+	// still in use by a live worktree.
+	if err := clearRegisteredWorktree(ctx, repoPath, dest); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return fmt.Errorf("create siding dir: %w", err)
 	}
@@ -99,8 +99,9 @@ func verifyCommit(ctx context.Context, repoPath, ref string) error {
 // itself, so commits continue it and `git push` goes back to the same branch.
 // Used by `new --from <branch>` to pick up an existing remote branch in a siding.
 func AddWorktreeTracking(ctx context.Context, repoPath, dest, branch string) error {
-	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "remove", "--force", dest)
-	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "prune")
+	if err := clearRegisteredWorktree(ctx, repoPath, dest); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return fmt.Errorf("create siding dir: %w", err)
 	}
@@ -121,19 +122,376 @@ func AddWorktreeTracking(ctx context.Context, repoPath, dest, branch string) err
 	if _, err := proc.Run(ctx, "git", addArgs...); err != nil {
 		return fmt.Errorf("git worktree add (branch %q): %w", branch, err)
 	}
-	_, _ = proc.Run(ctx, "git", "-C", dest, "branch", "--set-upstream-to=origin/"+branch, branch)
+	if _, err := proc.Run(ctx, "git", "-C", dest, "branch", "--set-upstream-to=origin/"+branch, branch); err != nil {
+		return fmt.Errorf("set upstream for branch %q: %w", branch, err)
+	}
 	return nil
 }
 
 // RemoveWorktree tears down a siding's worktree at dest and deletes its branch,
 // leaving the main repo clean (no dangling worktree registration).
 func RemoveWorktree(ctx context.Context, repoPath, dest, branch string) error {
-	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "remove", "--force", dest)
-	_, _ = proc.Run(ctx, "git", "-C", repoPath, "worktree", "prune")
+	if err := removeExactRegisteredWorktree(ctx, repoPath, dest); err != nil {
+		return err
+	}
 	if branch != "" {
-		_, _ = proc.Run(ctx, "git", "-C", repoPath, "branch", "-D", branch)
+		result, err := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+		if err != nil && result.ExitCode != 1 {
+			return fmt.Errorf("inspect branch %q in owner %q: %w", branch, repoPath, err)
+		}
+		if err == nil {
+			if _, err := proc.Run(ctx, "git", "-C", repoPath, "branch", "-D", branch); err != nil {
+				return fmt.Errorf("delete branch %q in owner %q: %w", branch, repoPath, err)
+			}
+		}
 	}
 	return nil
+}
+
+// WorktreeQuarantine identifies a worktree that has been atomically moved out
+// of its live path while its Git registration is still intact.
+type WorktreeQuarantine struct {
+	OwnerPath    string
+	OriginalPath string
+	RecoveryPath string
+	Branch       string
+}
+
+// WorktreeQuarantineFor returns the deterministic recovery location for an
+// operation without changing the filesystem.
+func WorktreeQuarantineFor(repoPath, dest, branch, operationID string) WorktreeQuarantine {
+	var safeID strings.Builder
+	for _, r := range operationID {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("-_", r) {
+			safeID.WriteRune(r)
+		} else {
+			safeID.WriteByte('-')
+		}
+	}
+	if safeID.Len() == 0 {
+		safeID.WriteString("operation")
+	}
+	return WorktreeQuarantine{
+		OwnerPath: repoPath, OriginalPath: dest,
+		RecoveryPath: filepath.Join(filepath.Dir(dest), "."+filepath.Base(dest)+".shunt-removing-"+safeID.String()),
+		Branch:       branch,
+	}
+}
+
+// QuarantineWorktree atomically moves an exactly registered worktree to its
+// recovery path. Git registration and branch retirement happen separately,
+// after the caller has validated the quarantined bytes.
+func QuarantineWorktree(ctx context.Context, repoPath, dest, branch, operationID string) (WorktreeQuarantine, error) {
+	quarantine := WorktreeQuarantineFor(repoPath, dest, branch, operationID)
+	if err := ctx.Err(); err != nil {
+		return quarantine, err
+	}
+	registered, err := worktreeRegistered(ctx, repoPath, dest)
+	if err != nil {
+		return quarantine, err
+	}
+	if !registered {
+		return quarantine, fmt.Errorf("refuse to quarantine unregistered worktree path %q", dest)
+	}
+	if _, err := os.Lstat(quarantine.RecoveryPath); err == nil {
+		return quarantine, fmt.Errorf("recovery path %q already exists", quarantine.RecoveryPath)
+	} else if !os.IsNotExist(err) {
+		return quarantine, fmt.Errorf("inspect recovery path %q: %w", quarantine.RecoveryPath, err)
+	}
+	if err := os.Rename(dest, quarantine.RecoveryPath); err != nil {
+		return quarantine, fmt.Errorf("quarantine worktree %q at recovery path %q: %w", dest, quarantine.RecoveryPath, err)
+	}
+	return quarantine, nil
+}
+
+// RestoreQuarantinedWorktree puts quarantined bytes back at their original
+// path. It never overwrites a path recreated after quarantine.
+func RestoreQuarantinedWorktree(quarantine WorktreeQuarantine) error {
+	if _, err := os.Lstat(quarantine.OriginalPath); err == nil {
+		return fmt.Errorf("original path %q was recreated; recovery remains at %q", quarantine.OriginalPath, quarantine.RecoveryPath)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect original path %q; recovery remains at %q: %w", quarantine.OriginalPath, quarantine.RecoveryPath, err)
+	}
+	if err := os.Rename(quarantine.RecoveryPath, quarantine.OriginalPath); err != nil {
+		return fmt.Errorf("restore worktree %q from recovery path %q: %w", quarantine.OriginalPath, quarantine.RecoveryPath, err)
+	}
+	if _, err := proc.Run(context.Background(), "git", "-C", quarantine.OwnerPath, "worktree", "repair", quarantine.OriginalPath); err != nil {
+		return fmt.Errorf("worktree bytes were restored to %q, but its exact Git registration could not be repaired: %w", quarantine.OriginalPath, err)
+	}
+	registered, err := worktreeRegistered(context.Background(), quarantine.OwnerPath, quarantine.OriginalPath)
+	if err != nil {
+		return fmt.Errorf("verify restored worktree registration at %q: %w", quarantine.OriginalPath, err)
+	}
+	if !registered {
+		return fmt.Errorf("worktree bytes were restored to %q, but it is not exactly registered there", quarantine.OriginalPath)
+	}
+	return nil
+}
+
+// RetireQuarantinedWorktree repairs the exact registration to the recovery
+// path, keeps that Git metadata usable while deleting the validated bytes, then
+// retires only that registration and branch after deletion succeeds.
+func RetireQuarantinedWorktree(ctx context.Context, quarantine WorktreeQuarantine) error {
+	return retireQuarantinedWorktree(ctx, quarantine, os.RemoveAll)
+}
+
+func retireQuarantinedWorktree(ctx context.Context, quarantine WorktreeQuarantine, remove func(string) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(quarantine.OriginalPath); err == nil {
+		return fmt.Errorf("original path %q was recreated; recovery remains at %q", quarantine.OriginalPath, quarantine.RecoveryPath)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect original path %q; recovery remains at %q: %w", quarantine.OriginalPath, quarantine.RecoveryPath, err)
+	}
+	if _, err := os.Lstat(quarantine.RecoveryPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("recovery path %q is missing", quarantine.RecoveryPath)
+		}
+		return fmt.Errorf("inspect recovery path %q: %w", quarantine.RecoveryPath, err)
+	}
+	adminPath, metadataRoot, err := repairQuarantinedWorktreeRegistration(ctx, quarantine)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("retire quarantined worktree; recovery remains at %q: %w", quarantine.RecoveryPath, err)
+	}
+	if err := remove(quarantine.RecoveryPath); err != nil {
+		return fmt.Errorf("remove validated quarantine; recovery remains at %q with its Git registration intact: %w", quarantine.RecoveryPath, err)
+	}
+	if err := os.RemoveAll(adminPath); err != nil {
+		return fmt.Errorf("remove exact worktree registration %q after deleting its bytes: %w", adminPath, err)
+	}
+	if _, err := os.Lstat(adminPath); !os.IsNotExist(err) {
+		if err == nil {
+			return fmt.Errorf("exact worktree registration %q remains after removal", adminPath)
+		}
+		return fmt.Errorf("verify exact worktree registration removal %q: %w", adminPath, err)
+	}
+	if err := syncDirectory(metadataRoot); err != nil {
+		return fmt.Errorf("durably retire exact worktree registration %q: %w", adminPath, err)
+	}
+	if quarantine.Branch != "" {
+		result, err := proc.Run(ctx, "git", "-C", quarantine.OwnerPath, "show-ref", "--verify", "--quiet", "refs/heads/"+quarantine.Branch)
+		if err != nil && result.ExitCode != 1 {
+			return fmt.Errorf("inspect branch %q after deleting its worktree: %w", quarantine.Branch, err)
+		}
+		if err == nil {
+			if _, err := proc.Run(ctx, "git", "-C", quarantine.OwnerPath, "branch", "-D", quarantine.Branch); err != nil {
+				return fmt.Errorf("delete branch %q after deleting its worktree: %w", quarantine.Branch, err)
+			}
+		}
+	}
+	return nil
+}
+
+// repairQuarantinedWorktreeRegistration updates only the named linked
+// worktree's reverse pointer after its atomic filesystem rename. It returns the
+// exact administrative entry to retire later, after validating that entry is a
+// direct child of the owner's worktree metadata directory.
+func repairQuarantinedWorktreeRegistration(ctx context.Context, quarantine WorktreeQuarantine) (adminPath, metadataRoot string, err error) {
+	if _, err := proc.Run(ctx, "git", "-C", quarantine.OwnerPath, "worktree", "repair", quarantine.RecoveryPath); err != nil {
+		return "", "", fmt.Errorf("repair quarantined worktree registration at %q; recovery remains there: %w", quarantine.RecoveryPath, err)
+	}
+	registered, err := worktreeRegistered(ctx, quarantine.OwnerPath, quarantine.RecoveryPath)
+	if err != nil {
+		return "", "", fmt.Errorf("verify repaired worktree registration at %q: %w", quarantine.RecoveryPath, err)
+	}
+	if !registered {
+		return "", "", fmt.Errorf("repaired worktree %q is not exactly registered", quarantine.RecoveryPath)
+	}
+	originalRegistered, err := worktreeRegistered(ctx, quarantine.OwnerPath, quarantine.OriginalPath)
+	if err != nil {
+		return "", "", fmt.Errorf("verify original worktree registration %q after repair: %w", quarantine.OriginalPath, err)
+	}
+	if originalRegistered {
+		return "", "", fmt.Errorf("original worktree %q remains registered after repair; recovery remains at %q", quarantine.OriginalPath, quarantine.RecoveryPath)
+	}
+	if quarantine.Branch != "" {
+		result, err := proc.Run(ctx, "git", "-C", quarantine.RecoveryPath, "symbolic-ref", "--quiet", "--short", "HEAD")
+		if err != nil {
+			return "", "", fmt.Errorf("inspect repaired worktree branch at %q: %w", quarantine.RecoveryPath, err)
+		}
+		if branch := strings.TrimSpace(result.Stdout); branch != quarantine.Branch {
+			return "", "", fmt.Errorf("repaired worktree %q is on branch %q, expected %q", quarantine.RecoveryPath, branch, quarantine.Branch)
+		}
+	}
+	adminPath, metadataRoot, err = validatedLinkedWorktreeAdminPath(ctx, quarantine.OwnerPath, quarantine.RecoveryPath)
+	if err != nil {
+		return "", "", fmt.Errorf("validate repaired worktree registration at %q: %w", quarantine.RecoveryPath, err)
+	}
+	return adminPath, metadataRoot, nil
+}
+
+func validatedLinkedWorktreeAdminPath(ctx context.Context, ownerPath, worktreePath string) (string, string, error) {
+	dotGitPath := filepath.Join(worktreePath, ".git")
+	dotGitInfo, err := os.Lstat(dotGitPath)
+	if err != nil {
+		return "", "", fmt.Errorf("inspect linked-worktree pointer: %w", err)
+	}
+	if !dotGitInfo.Mode().IsRegular() || dotGitInfo.Mode()&os.ModeSymlink != 0 {
+		return "", "", fmt.Errorf("linked-worktree pointer %q is not a regular file", dotGitPath)
+	}
+	dotGit, err := os.ReadFile(dotGitPath)
+	if err != nil {
+		return "", "", fmt.Errorf("read linked-worktree pointer: %w", err)
+	}
+	const prefix = "gitdir: "
+	pointer := strings.TrimSpace(string(dotGit))
+	if !strings.HasPrefix(pointer, prefix) || strings.TrimSpace(strings.TrimPrefix(pointer, prefix)) == "" {
+		return "", "", fmt.Errorf("linked-worktree pointer %q is malformed", dotGitPath)
+	}
+	adminPath := strings.TrimSpace(strings.TrimPrefix(pointer, prefix))
+	if !filepath.IsAbs(adminPath) {
+		adminPath = filepath.Join(worktreePath, adminPath)
+	}
+	adminPath, err = filepath.Abs(adminPath)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve linked-worktree administration path absolutely: %w", err)
+	}
+	adminInfo, err := os.Lstat(adminPath)
+	if err != nil {
+		return "", "", fmt.Errorf("inspect linked-worktree administration path: %w", err)
+	}
+	if !adminInfo.IsDir() || adminInfo.Mode()&os.ModeSymlink != 0 {
+		return "", "", fmt.Errorf("linked-worktree administration path %q is not a real directory", adminPath)
+	}
+	adminPath, err = filepath.EvalSymlinks(adminPath)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve linked-worktree administration path: %w", err)
+	}
+
+	result, err := proc.Run(ctx, "git", "-C", ownerPath, "rev-parse", "--git-path", "worktrees")
+	if err != nil {
+		return "", "", fmt.Errorf("resolve owner worktree metadata directory: %w", err)
+	}
+	metadataRoot := strings.TrimSpace(result.Stdout)
+	if !filepath.IsAbs(metadataRoot) {
+		metadataRoot = filepath.Join(ownerPath, metadataRoot)
+	}
+	metadataRoot, err = filepath.EvalSymlinks(metadataRoot)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve owner worktree metadata directory: %w", err)
+	}
+	relative, err := filepath.Rel(metadataRoot, adminPath)
+	if err != nil || relative == "." || filepath.IsAbs(relative) || filepath.Dir(relative) != "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("linked-worktree administration path %q is not an exact child of %q", adminPath, metadataRoot)
+	}
+
+	reversePath := filepath.Join(adminPath, "gitdir")
+	reverseInfo, err := os.Lstat(reversePath)
+	if err != nil {
+		return "", "", fmt.Errorf("inspect linked-worktree reverse pointer: %w", err)
+	}
+	if !reverseInfo.Mode().IsRegular() || reverseInfo.Mode()&os.ModeSymlink != 0 {
+		return "", "", fmt.Errorf("linked-worktree reverse pointer %q is not a regular file", reversePath)
+	}
+	reverse, err := os.ReadFile(reversePath)
+	if err != nil {
+		return "", "", fmt.Errorf("read linked-worktree reverse pointer: %w", err)
+	}
+	reverseTarget := strings.TrimSpace(string(reverse))
+	if !filepath.IsAbs(reverseTarget) {
+		reverseTarget = filepath.Join(adminPath, reverseTarget)
+	}
+	reverseTarget, err = filepath.EvalSymlinks(reverseTarget)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve linked-worktree reverse pointer: %w", err)
+	}
+	wantDotGit, err := filepath.EvalSymlinks(dotGitPath)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve linked-worktree pointer path: %w", err)
+	}
+	if filepath.Clean(reverseTarget) != filepath.Clean(wantDotGit) {
+		return "", "", fmt.Errorf("linked-worktree reverse pointer targets %q, expected %q", reverseTarget, wantDotGit)
+	}
+	return adminPath, metadataRoot, nil
+}
+
+func clearRegisteredWorktree(ctx context.Context, repoPath, dest string) error {
+	return removeExactRegisteredWorktree(ctx, repoPath, dest)
+}
+
+// removeExactRegisteredWorktree retires only dest's Git registration. Git's
+// path-targeted remove also handles an exactly registered worktree whose bytes
+// are already absent, so repository-wide pruning is neither needed nor safe:
+// it could retire an unrelated siding's recoverable registration.
+func removeExactRegisteredWorktree(ctx context.Context, repoPath, dest string) error {
+	registered, err := worktreeRegistered(ctx, repoPath, dest)
+	if err != nil {
+		return err
+	}
+	if registered {
+		if _, err := proc.Run(ctx, "git", "-C", repoPath, "worktree", "remove", "--force", dest); err != nil {
+			return fmt.Errorf("remove exact worktree %q from owner %q: %w", dest, repoPath, err)
+		}
+	} else if _, err := os.Lstat(dest); err == nil {
+		return fmt.Errorf("refuse to remove unregistered worktree path %q from repository %q", dest, repoPath)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect worktree destination %q: %w", dest, err)
+	}
+	stillRegistered, err := worktreeRegistered(ctx, repoPath, dest)
+	if err != nil {
+		return fmt.Errorf("verify exact worktree registration removal for %q: %w", dest, err)
+	}
+	if stillRegistered {
+		return fmt.Errorf("exact worktree registration for %q remains after removal", dest)
+	}
+	return nil
+}
+
+func worktreeRegistered(ctx context.Context, repoPath, dest string) (bool, error) {
+	result, err := proc.Run(ctx, "git", "-C", repoPath, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false, fmt.Errorf("list worktrees for owner %q: %w", repoPath, err)
+	}
+	want, err := canonicalWorktreePath(dest)
+	if err != nil {
+		return false, fmt.Errorf("resolve worktree destination %q: %w", dest, err)
+	}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		if !strings.HasPrefix(line, "worktree ") {
+			continue
+		}
+		got, err := canonicalWorktreePath(strings.TrimPrefix(line, "worktree "))
+		if err == nil && filepath.Clean(got) == filepath.Clean(want) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func canonicalWorktreePath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return resolved, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	ancestor := abs
+	var suffix []string
+	for {
+		if resolved, resolveErr := filepath.EvalSymlinks(ancestor); resolveErr == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return resolved, nil
+		} else if !os.IsNotExist(resolveErr) {
+			return "", resolveErr
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return abs, nil
+		}
+		suffix = append(suffix, filepath.Base(ancestor))
+		ancestor = parent
+	}
 }
 
 // CloneVolume creates a fidelity-checked copy-on-write clone of a baseline data

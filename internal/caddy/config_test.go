@@ -2,11 +2,71 @@ package caddy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/gordonbeeming/shunt/internal/state"
 )
+
+func TestSnapshotAndRestoreRoutesTouchesOnlyAffectedServers(t *testing.T) {
+	oldBody := json.RawMessage(`{"listen":["127.0.0.1:5000"],"routes":[{"old":true}]}`)
+	configBody := `{"apps":{"http":{"servers":{"srv_sample_web":` + string(oldBody) + `,"srv_other_web":{"unrelated":true}}},"layer4":{"servers":{}}}}`
+	var deleted []string
+	var operations []string
+	putBodies := map[string][]byte{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/config/":
+			_, _ = io.WriteString(w, configBody)
+		case request.Method == http.MethodDelete:
+			operations = append(operations, "delete "+request.URL.Path)
+			deleted = append(deleted, request.URL.Path)
+			if request.URL.Path == "/config/apps/layer4/servers/srv_sample_db" {
+				http.NotFound(w, request)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case request.Method == http.MethodPut:
+			operations = append(operations, "put "+request.URL.Path)
+			body, _ := io.ReadAll(request.Body)
+			putBodies[request.URL.Path] = body
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	admin := &Admin{base: server.URL, http: server.Client()}
+	routes := []state.Route{
+		{Key: "web", Kind: state.KindHTTP},
+		{Key: "db", Kind: state.KindLayer4},
+	}
+	snapshot, err := SnapshotRoutes(context.Background(), admin, "sample", routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreRoutes(context.Background(), admin, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	wantHTTP := "/config/apps/http/servers/srv_sample_web"
+	wantLayer4 := "/config/apps/layer4/servers/srv_sample_db"
+	if len(deleted) != 2 || deleted[0] != wantHTTP || deleted[1] != wantLayer4 {
+		t.Fatalf("deleted=%v", deleted)
+	}
+	if !bytes.Equal(putBodies[wantHTTP], oldBody) || putBodies[wantLayer4] != nil {
+		t.Fatalf("put bodies=%v", putBodies)
+	}
+	if _, touched := putBodies["/config/apps/http/servers/srv_other_web"]; touched {
+		t.Fatal("unrelated route was overwritten")
+	}
+	if len(operations) != 3 || operations[0] != "delete "+wantHTTP || operations[1] != "delete "+wantLayer4 || operations[2] != "put "+wantHTTP {
+		t.Fatalf("restore ordering=%v", operations)
+	}
+}
 
 func TestRouteIDAndServerName(t *testing.T) {
 	if got, want := RouteID("myapp", "http", "frontend"), "app_myapp_http_frontend"; got != want {

@@ -129,7 +129,7 @@ func newDashboardCmd() *cobra.Command {
 	var install, serve bool
 	c := &cobra.Command{
 		Use:   "dashboard",
-		Short: "Open the shunt web dashboard (browse ports, switch/restart sidings)",
+		Short: "Open the hostless dashboard (inspect, start, switch, stop, and park sidings)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()

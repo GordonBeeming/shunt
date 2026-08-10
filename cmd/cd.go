@@ -21,8 +21,7 @@ func newCdCmd() *cobra.Command {
 			"  cd \"$(" + bin() + " cd <name>)\"\n\n" +
 			"Handy as a shell function: `scd() { cd \"$(" + bin() + " cd \"$@\")\"; }`.\n" +
 			"Siding is taken from the name arg, else the one your cwd is inside, else the live\n" +
-			"target. `host` (passed explicitly, or when it's the live target) prints the original\n" +
-			"repo checkout rather than a siding.",
+			"target. The legacy `host` target is no longer executable; choose a siding.",
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -42,9 +41,11 @@ func newCdCmd() *cobra.Command {
 			if name == "" {
 				return fmt.Errorf("which siding? pass a name, or make one live with `%s switch`", bin())
 			}
-			// "host" isn't a siding — it's the original repo checkout.
-			dir := app.RepoPath
-			if name != state.HostTarget {
+			if name == state.HostTarget {
+				return fmt.Errorf("host is no longer a work target; choose a siding")
+			}
+			dir := ""
+			{
 				if _, ok := app.Sidings[name]; !ok {
 					return fmt.Errorf("no siding %q in %q", name, app.Name)
 				}

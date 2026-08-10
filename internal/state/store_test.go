@@ -6,9 +6,106 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 )
+
+func TestUpdateRegistryPreservesConcurrentProjectRegistrations(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(2)
+	var done sync.WaitGroup
+	done.Add(2)
+	for name, path := range map[string]string{"alpha": "/projects/alpha", "beta": "/projects/beta"} {
+		name, path := name, path
+		go func() {
+			defer done.Done()
+			ready.Done()
+			<-start
+			if _, err := UpdateRegistry(context.Background(), func(reg *Registry) error {
+				reg.Projects[name] = path
+				return nil
+			}); err != nil {
+				t.Errorf("register %s: %v", name, err)
+			}
+		}()
+	}
+	ready.Wait()
+	close(start)
+	done.Wait()
+	reg, err := LoadRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reg.Projects["alpha"] != "/projects/alpha" || reg.Projects["beta"] != "/projects/beta" {
+		t.Fatalf("concurrent registry = %#v", reg.Projects)
+	}
+}
+
+func TestLoadAppProjectsLegacyStateWithoutPublishingMigration(t *testing.T) {
+	dir := t.TempDir()
+	legacy := `{"name":"app","repoPath":"/legacy/repo","configDir":"` + dir + `","sidings":{"one":{"name":"one","branch":"feature"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := LoadApp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Version != 0 {
+		t.Fatalf("read projection changed persisted version marker: %d", app.Version)
+	}
+	if app.ControlRepoPath != filepath.Join(dir, ".control.git") || app.BaseSiding != "one" {
+		t.Fatalf("legacy projection = %#v", app)
+	}
+	siding := app.Sidings["one"]
+	if siding.WorktreeRepoPath != "/legacy/repo" || siding.MaterializationPhase != PhaseGuest {
+		t.Fatalf("legacy siding projection = %#v", siding)
+	}
+	onDisk, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if err != nil || string(onDisk) != legacy {
+		t.Fatalf("LoadApp rewrote state: %q, %v", onDisk, err)
+	}
+}
+
+func TestEnsureV2AndBaseSelection(t *testing.T) {
+	app := App{RepoPath: "/legacy", ConfigDir: "/cfg", Sidings: map[string]Siding{
+		"one": {Name: "one"},
+		"two": {Name: "two", WorktreeRepoPath: "/managed", MaterializationPhase: PhaseParked},
+	}}
+	if !NeedsBaseSelection(app) {
+		t.Fatal("multiple legacy sidings should require base selection")
+	}
+	if !EnsureV2(&app) || app.Version != StateVersion {
+		t.Fatalf("EnsureV2() app = %#v", app)
+	}
+	if got := WorktreeOwner(app, app.Sidings["one"]); got != "/legacy" {
+		t.Fatalf("legacy owner = %q", got)
+	}
+	if got := WorktreeOwner(app, app.Sidings["two"]); got != "/managed" {
+		t.Fatalf("managed owner = %q", got)
+	}
+	if app.Sidings["one"].MaterializationPhase != PhaseGuest {
+		t.Fatalf("legacy phase = %q", app.Sidings["one"].MaterializationPhase)
+	}
+}
+
+func TestV2SidingDefaultsToManagedWorktreeOwner(t *testing.T) {
+	app := App{Version: StateVersion, RepoPath: "/legacy", ConfigDir: "/cfg", ControlRepoPath: "/cfg/.control.git", Sidings: map[string]Siding{
+		"new": {Name: "new"},
+	}}
+	EnsureV2(&app)
+	if got := app.Sidings["new"].WorktreeRepoPath; got != app.ControlRepoPath {
+		t.Fatalf("v2 worktree owner = %q, want %q", got, app.ControlRepoPath)
+	}
+	app.BaseSiding = "missing"
+	if !NeedsBaseSelection(app) {
+		t.Fatal("missing designated base should require selection")
+	}
+}
 
 func TestSaveLoadAppRoundTrip(t *testing.T) {
 	dir := t.TempDir()
@@ -41,6 +138,24 @@ func TestSaveLoadAppRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRemovalJournalRoundTripPreservesSafetyPolicy(t *testing.T) {
+	dir := t.TempDir()
+	app := App{ConfigDir: dir, Sidings: map[string]Siding{"one": {Name: "one"}}, Removal: &RemovalOperation{
+		ID: "remove-one", Siding: "one", Stage: RemovalBasePinned, StartedAt: "2026-01-01T00:00:00Z",
+		Force: false, Safety: "content-sensitive-fingerprint", Removing: []string{"one", "two"},
+	}}
+	if err := SaveApp(app); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadApp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Removal == nil || loaded.Removal.Force || loaded.Removal.Safety != "content-sensitive-fingerprint" || len(loaded.Removal.Removing) != 2 {
+		t.Fatalf("removal journal = %#v", loaded.Removal)
+	}
+}
+
 func TestUpdateAppRollsBackCallbackFailure(t *testing.T) {
 	dir := t.TempDir()
 	app := App{ConfigDir: dir, Memory: "4g", Sidings: map[string]Siding{}}
@@ -70,7 +185,7 @@ func TestUpdateAppSurfacesPublicationFailure(t *testing.T) {
 	if err := SaveApp(app); err != nil {
 		t.Fatal(err)
 	}
-	stateFile := filepath.Join(dir, "state.json")
+	stateFile := filepath.Join(dir, stateFilename)
 	if err := os.Remove(stateFile); err != nil {
 		t.Fatal(err)
 	}
@@ -131,6 +246,80 @@ func TestLoadAppNotFound(t *testing.T) {
 func TestSaveAppRequiresConfigDir(t *testing.T) {
 	if err := SaveApp(App{Name: "x"}); err == nil {
 		t.Error("expected error when ConfigDir is empty")
+	}
+}
+
+func TestStateV2IgnoresLaterLegacyWrites(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := legacyStatePath(dir)
+	legacy := `{"name":"app","configDir":"` + dir + `","memory":"4g","sidings":{}}`
+	if err := os.WriteFile(legacyPath, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := LoadApp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveApp(app); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(statePath(dir)); err != nil {
+		t.Fatalf("versioned state was not published: %v", err)
+	}
+
+	legacy = `{"name":"app","configDir":"` + dir + `","memory":"16g","sidings":{}}`
+	if err := os.WriteFile(legacyPath, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadApp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Memory != "4g" || loaded.Version != StateVersion {
+		t.Fatalf("LoadApp() used rewritten legacy state: %#v", loaded)
+	}
+
+}
+
+func TestLoadAppRejectsUnsupportedVersionedState(t *testing.T) {
+	dir := t.TempDir()
+	path := statePath(dir)
+	if err := os.WriteFile(path, []byte(`{"version":3,"configDir":"`+dir+`","sidings":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadApp(dir); err == nil || !strings.Contains(err.Error(), "unsupported state version 3") {
+		t.Fatalf("LoadApp() error = %v", err)
+	}
+	if err := SaveApp(App{Version: StateVersion, ConfigDir: dir, Sidings: map[string]Siding{}}); err == nil || !strings.Contains(err.Error(), "unsupported state version 3") {
+		t.Fatalf("SaveApp() error = %v", err)
+	}
+}
+
+func TestSaveAppRejectsUnsupportedNewState(t *testing.T) {
+	dir := t.TempDir()
+	err := SaveApp(App{Version: StateVersion + 1, ConfigDir: dir, Sidings: map[string]Siding{}})
+	if err == nil || !strings.Contains(err.Error(), "unsupported state version 3") {
+		t.Fatalf("SaveApp() error = %v", err)
+	}
+	if _, statErr := os.Stat(statePath(dir)); !os.IsNotExist(statErr) {
+		t.Fatalf("unsupported state was published: %v", statErr)
+	}
+}
+
+func TestWriteJSONReportsCommittedDurabilityFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), stateFilename)
+	sentinel := errors.New("directory sync denied")
+	err := writeJSONWithDirectorySync(path, map[string]string{"value": "published"}, func(string) error {
+		return sentinel
+	})
+	var committed *CommittedDurabilityError
+	if !errors.As(err, &committed) || !errors.Is(err, sentinel) {
+		t.Fatalf("writeJSONWithDirectorySync() error = %v", err)
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr != nil || !strings.Contains(string(data), "published") {
+		t.Fatalf("published state = %q, %v", data, readErr)
 	}
 }
 

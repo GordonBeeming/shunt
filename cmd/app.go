@@ -7,17 +7,68 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/contract"
 	"github.com/gordonbeeming/shunt/internal/databaseline"
+	"github.com/gordonbeeming/shunt/internal/fsclone"
 	"github.com/gordonbeeming/shunt/internal/resolve"
 	"github.com/gordonbeeming/shunt/internal/runner"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 )
+
+var (
+	appAddEnsureControl = fsclone.EnsureControlRepo
+	appAddPrepareCaddy  = func(ctx context.Context) (*caddy.Admin, error) {
+		admin := caddy.NewAdmin()
+		if err := admin.Ping(ctx); err != nil {
+			return nil, err
+		}
+		return admin, nil
+	}
+	appAddDeleteRoute = func(ctx context.Context, admin *caddy.Admin, path string) error {
+		return admin.Delete(ctx, path)
+	}
+	appAddEnsureFrontDoor = caddy.EnsureFrontDoor
+	appAddSnapshotCaddy   = caddy.SnapshotRoutes
+	appAddRestoreCaddy    = caddy.RestoreRoutes
+	appAddPointCaddy      = siding.PointCaddy
+	appAddSaveApp         = state.SaveApp
+	appAddUpdateRegistry  = state.UpdateRegistry
+	appAddRollbackState   = func(updating bool, existing state.App, published state.App) error {
+		if updating {
+			return state.SaveApp(existing)
+		}
+		err := os.Remove(filepath.Join(published.ConfigDir, "state-v2.json"))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+)
+
+// appAddRecoveryError reports the one split-publication case that is safe to
+// retry: app state and Caddy are already visible, but the registry update did
+// not publish. Its text deliberately omits internal state paths while Unwrap
+// retains both causes for diagnostics and errors.Is/errors.As.
+type appAddRecoveryError struct {
+	appPublication      error
+	registryPublication error
+	command             string
+}
+
+func (e *appAddRecoveryError) Error() string {
+	return fmt.Sprintf("app state and Caddy routes are visible, but registration is incomplete because state durability was unconfirmed and the channel registry update did not publish; run `%s` again from this repository to safely finish the idempotent registration", e.command)
+}
+
+func (e *appAddRecoveryError) Unwrap() []error {
+	return []error{e.appPublication, e.registryPublication}
+}
 
 func newAppCmd() *cobra.Command {
 	c := &cobra.Command{Use: "app", Short: "Manage registered apps"}
@@ -76,65 +127,71 @@ func newAppAddCmd() *cobra.Command {
 				}
 				updating := existErr == nil
 				if updating {
+					if err := siding.EnsureNoRemovalInProgress(existing, "update app registration"); err != nil {
+						return err
+					}
 					if err := validateBaselineVolumeChange(ctx, existing, ct.Volumes); err != nil {
 						return err
 					}
 				}
+				controlRepoPath := filepath.Join(loc.ConfigDir, ".control.git")
+				originalRepoPath := cwd
+				if updating {
+					if existing.ControlRepoPath != "" {
+						controlRepoPath = existing.ControlRepoPath
+					}
+					if existing.RepoPath != "" {
+						originalRepoPath = existing.RepoPath
+					}
+					if repoOrigin == "" {
+						repoOrigin = existing.RepoOrigin
+					}
+				}
+				seedCommit, err := appAddEnsureControl(ctx, controlRepoPath, cwd, repoOrigin, "")
+				if err != nil {
+					return fmt.Errorf("initialize managed Git control repository: %w", err)
+				}
+
 				app := state.App{
-					Name:          loc.Project,
-					RepoPath:      cwd,
-					RepoOrigin:    repoOrigin,
-					Runner:        runnerKind,
-					Start:         startCmd,
-					Stop:          ct.Stop,
-					Workdir:       workdir,
-					AppHostPath:   ct.AppHost,
-					ConfigDir:     loc.ConfigDir,
-					Env:           ct.Env,
-					Mounts:        ct.Mounts,
-					PrebakeImages: ct.PrebakeImages,
-					PrebakeBuilds: ct.PrebakeBuilds,
-					Volumes:       ct.Volumes,
-					Memory:        ct.Memory,
-					CPUs:          ct.CPUs,
-					HealthPort:    ct.HealthPort,
-					HealthPath:    ct.HealthPath,
-					DisableCache:  ct.DisableCache,
-					Sidings:       map[string]state.Siding{},
+					Version:         state.StateVersion,
+					Name:            loc.Project,
+					RepoPath:        originalRepoPath,
+					RepoOrigin:      repoOrigin,
+					ControlRepoPath: controlRepoPath,
+					BaseCommit:      seedCommit,
+					Runner:          runnerKind,
+					Start:           startCmd,
+					Stop:            ct.Stop,
+					Workdir:         workdir,
+					AppHostPath:     ct.AppHost,
+					ConfigDir:       loc.ConfigDir,
+					Env:             ct.Env,
+					Mounts:          ct.Mounts,
+					PrebakeImages:   ct.PrebakeImages,
+					PrebakeBuilds:   ct.PrebakeBuilds,
+					Volumes:         ct.Volumes,
+					Memory:          ct.Memory,
+					CPUs:            ct.CPUs,
+					HealthPort:      ct.HealthPort,
+					HealthPath:      ct.HealthPath,
+					DisableCache:    ct.DisableCache,
+					Sidings:         map[string]state.Siding{},
 				}
 				if updating {
 					app.Sidings = existing.Sidings
+					app.BaseSiding = existing.BaseSiding
+					if existing.BaseCommit != "" {
+						app.BaseCommit = existing.BaseCommit
+					}
+					app.Removal = existing.Removal
 					app.LiveSiding = existing.LiveSiding
-				}
-
-				admin := caddy.NewAdmin()
-				if err := admin.Ping(ctx); err != nil {
-					return fmt.Errorf("caddy admin API not reachable — run `"+bin()+" init` first: %w", err)
-				}
-				// Drop any existing Caddy server whose route was renamed or removed in
-				// the contract. Without this the old server keeps squatting its listen
-				// port, and Caddy 500s when the new (renamed) server tries to claim the
-				// same port. The live siding's upstreams are restored by re-activating
-				// after the re-register.
-				if updating {
-					keep := map[string]bool{}
-					for _, r := range ct.FrontDoor {
-						keep[r.Kind+"/"+r.Key] = true
-					}
-					for _, r := range existing.FrontDoor {
-						if keep[r.Kind+"/"+r.Key] {
-							continue
-						}
-						if p, _, perr := caddy.ServerForRoute(loc.Project, r, false); perr == nil {
-							_ = admin.Delete(ctx, p)
-						}
+					if app.LiveSiding == state.HostTarget {
+						app.LiveSiding = ""
 					}
 				}
+				state.EnsureV2(&app)
 				assigned := map[int]bool{}
 				for _, r := range ct.FrontDoor {
-					// Fixed apps use the exact declared port (Entra/config point at it);
-					// otherwise pick a random free host port — preserved across re-adds —
-					// so different apps and channels never collide.
 					port := r.ListenPort
 					if !ct.FixedPorts {
 						port = 0
@@ -149,43 +206,93 @@ func newAppAddCmd() *cobra.Command {
 						}
 					}
 					assigned[port] = true
-					// Build the route via the shared helper so the field mapping (CaddyID, TLS,
-					// guestPort) stays identical to the siding-contract path in internal/siding.
 					app.FrontDoor = append(app.FrontDoor, siding.RouteFromContract(loc.Project, r, port))
 				}
-				// Register (delete-then-put) every front-door server in one place, shared
-				// with the switch-back-from-host path (caddy.EnsureFrontDoor).
-				if err := caddy.EnsureFrontDoor(ctx, admin, app); err != nil {
-					return err
-				}
 
-				if err := state.SaveApp(app); err != nil {
-					return err
+				admin, err := appAddPrepareCaddy(ctx)
+				if err != nil {
+					return fmt.Errorf("caddy admin API not reachable — run `"+bin()+" init` first: %w", err)
 				}
-				reg, err := state.LoadRegistry()
+				affectedRoutes := append([]state.Route(nil), app.FrontDoor...)
+				if updating {
+					affectedRoutes = append(affectedRoutes, existing.FrontDoor...)
+				}
+				snapshot, err := appAddSnapshotCaddy(ctx, admin, app.Name, affectedRoutes)
 				if err != nil {
 					return err
 				}
-				reg.Projects[app.Name] = app.ConfigDir
-				if err := state.SaveRegistry(reg); err != nil {
-					return err
+				rollbackCaddy := func(cause error) error {
+					if rollbackErr := restoreAppAddCaddy(ctx, admin, snapshot); rollbackErr != nil {
+						return errors.Join(cause, fmt.Errorf("restore Caddy routes after app registration failure: %w", rollbackErr))
+					}
+					return cause
 				}
-
-				// The delete-then-put above reset every route to the placeholder dial,
-				// so a re-`app add` of a live app would drop its front door. Re-point the
-				// live siding back at itself (best effort — its socat bridges are still
-				// up, so this just re-patches Caddy).
-				if updating && app.LiveSiding != "" {
-					if sd, ok := app.Sidings[app.LiveSiding]; ok && len(sd.Bridges) > 0 {
-						if err := siding.PointCaddy(ctx, app, &sd); err != nil {
-							fmt.Printf("  (front door not re-pointed at %q: %v — run `%s switch %s`)\n",
-								app.LiveSiding, err, bin(), app.LiveSiding)
-						} else {
-							app.Sidings[app.LiveSiding] = sd
-							if err := state.SaveApp(app); err != nil {
-								return fmt.Errorf("save restored live route state: %w", err)
+				if updating {
+					keep := map[string]bool{}
+					for _, r := range app.FrontDoor {
+						keep[r.Kind+"/"+r.Key] = true
+					}
+					for _, r := range existing.FrontDoor {
+						if keep[r.Kind+"/"+r.Key] {
+							continue
+						}
+						if p, _, perr := caddy.ServerForRoute(loc.Project, r, false); perr != nil {
+							return rollbackCaddy(perr)
+						} else if snapshot.Contains(p) {
+							if err := appAddDeleteRoute(ctx, admin, p); err != nil {
+								return rollbackCaddy(fmt.Errorf("remove obsolete Caddy route %q: %w", r.Key, err))
 							}
 						}
+					}
+				}
+				if err := appAddEnsureFrontDoor(ctx, admin, app); err != nil {
+					return rollbackCaddy(err)
+				}
+
+				if updating && app.LiveSiding != "" {
+					if sd, ok := app.Sidings[app.LiveSiding]; ok && len(sd.Bridges) > 0 {
+						if err := appAddPointCaddy(ctx, app, &sd); err != nil {
+							return rollbackCaddy(fmt.Errorf("restore live Caddy routes for %q: %w", app.LiveSiding, err))
+						}
+						app.Sidings[app.LiveSiding] = sd
+					}
+				}
+
+				var durabilityErrs []error
+				var appPublicationErr error
+				if err := appAddSaveApp(app); err != nil {
+					var committed *state.CommittedDurabilityError
+					if !errors.As(err, &committed) {
+						return rollbackCaddy(fmt.Errorf("publish app state: %w", err))
+					}
+					appPublicationErr = err
+					durabilityErrs = append(durabilityErrs, fmt.Errorf("app state publication durability: %w", err))
+				}
+				_, registryErr := appAddUpdateRegistry(ctx, func(reg *state.Registry) error {
+					reg.Projects[app.Name] = app.ConfigDir
+					return nil
+				})
+				if registryErr != nil {
+					var committed *state.CommittedDurabilityError
+					if errors.As(registryErr, &committed) {
+						durabilityErrs = append(durabilityErrs, fmt.Errorf("registry publication durability: %w", registryErr))
+					} else if appPublicationErr != nil {
+						return &appAddRecoveryError{
+							appPublication:      appPublicationErr,
+							registryPublication: registryErr,
+							command:             bin() + " app add",
+						}
+					} else {
+						rollbackErr := appAddRollbackState(updating, existing, app)
+						caddyErr := restoreAppAddCaddy(ctx, admin, snapshot)
+						joined := []error{fmt.Errorf("publish app registry: %w", registryErr)}
+						if rollbackErr != nil {
+							joined = append(joined, fmt.Errorf("roll back app state after registry publication failure: %w", rollbackErr))
+						}
+						if caddyErr != nil {
+							joined = append(joined, fmt.Errorf("restore Caddy routes after registry publication failure: %w", caddyErr))
+						}
+						return errors.Join(joined...)
 					}
 				}
 
@@ -202,10 +309,16 @@ func newAppAddCmd() *cobra.Command {
 					fmt.Printf("  %-10s %-6s localhost:%d  ->  %s/%s\n", r.Key, r.Kind, r.ListenPort, r.Resource, r.Endpoint)
 				}
 				fmt.Println("next: `" + bin() + " new <name>` to create a siding")
-				return nil
+				return errors.Join(durabilityErrs...)
 			})
 		},
 	}
+}
+
+func restoreAppAddCaddy(ctx context.Context, admin *caddy.Admin, snapshot caddy.RouteSnapshot) error {
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	return appAddRestoreCaddy(restoreCtx, admin, snapshot)
 }
 
 func validateBaselineVolumeChange(ctx context.Context, existing state.App, requested []string) error {

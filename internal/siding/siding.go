@@ -58,13 +58,32 @@ var (
 	startGuest               = container.Start
 	mergeSiding              = MergeSidingState
 	guestRuntimeState        = container.State
+	observeGuest             = container.ObserveGuest
+	guestCapabilityProbe     = probeGuestCapability
+	guestLivenessAttempts    = 20
+	guestLivenessPoll        = time.Second
 	prepareLifecycle         = PrepareGuest
 	stopLifecycleApp         = StopApp
 	startLifecycleApp        = StartApp
 	waitLifecycleReady       = WaitReady
-	cacheWarningWriter       = io.Writer(os.Stderr)
-	dockerdStartupWait       = 30 * time.Second
-	dockerdReadyPoll         = 500 * time.Millisecond
+	upMaterialize            = materialize
+	upEnsureGuestLive        = EnsureGuestLive
+	upResolveFrontDoor       = resolveSidingFrontDoor
+	upProbeAppRunning        = ProbeAppRunning
+	upPrepareGuest           = PrepareGuest
+	upStopApp                = StopApp
+	upStartApp               = StartApp
+	upWaitReady              = WaitReady
+	upActivate               = Activate
+	upGuestIP                = container.IP
+	upClearAppLog            = func(ctx context.Context, guest string) {
+		_, _ = container.Exec(ctx, guest, "sh", "-c", "> "+appLogPath)
+	}
+	upSiding           = up
+	upRestoreLiveRoute = restoreLiveRoute
+	cacheWarningWriter = io.Writer(os.Stderr)
+	dockerdStartupWait = 30 * time.Second
+	dockerdReadyPoll   = 500 * time.Millisecond
 )
 
 // WarmTarPath is the per-project content-addressed image-cache directory.
@@ -103,19 +122,22 @@ func guestEnv(app state.App) map[string]string {
 	return env
 }
 
-// Spin creates the worktree, host-backed data set, and idle guest. It prepares
-// guest Docker, but does not start the application.
+// Spin creates only the managed Git worktree. Up grows it through data and guest
+// materialization when the application is actually needed.
 func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (state.Siding, error) {
 	if _, err := SidingBase(app, name); err != nil {
 		return state.Siding{}, err
 	}
 	var created state.Siding
-	err := WithSidingOperation(ctx, app.ConfigDir, name, func() error {
+	err := WithProjectSidingOperation(ctx, app.ConfigDir, name, func() error {
 		current, err := state.LoadApp(app.ConfigDir)
 		if err != nil {
 			return err
 		}
 		app = current
+		if err := EnsureNoRemovalInProgress(app, "create siding"); err != nil {
+			return err
+		}
 		if _, exists := app.Sidings[name]; exists {
 			return fmt.Errorf("siding %q already exists", name)
 		}
@@ -124,7 +146,26 @@ func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (
 			return errors.Join(err, cleanupFailedSpin(app, name, created.Container, created.Branch, fromBranch != ""))
 		}
 		created.CreatedAt = time.Now().Format(time.RFC3339)
-		if _, err := MergeSidingState(ctx, app.ConfigDir, created, false); err != nil {
+		if app.BaseSiding == "" && len(app.Sidings) == 0 {
+			src, _, pathErr := Paths(app, name)
+			if pathErr != nil {
+				return pathErr
+			}
+			commit, commitErr := proc.Run(ctx, "git", "-C", src, "rev-parse", "--verify", "HEAD^{commit}")
+			if commitErr != nil {
+				return commitErr
+			}
+			pinned, pinErr := fsclone.PinBaseCommit(ctx, app.ControlRepoPath, created.WorktreeRepoPath, strings.TrimSpace(commit.Stdout))
+			if pinErr != nil {
+				return pinErr
+			}
+			app.BaseSiding, app.BaseCommit = name, pinned
+		}
+		app.Sidings[name] = created
+		if err := state.SaveApp(app); err != nil {
+			if isCommittedStatePublication(err) {
+				return err
+			}
 			return errors.Join(err, cleanupFailedSpin(app, name, created.Container, created.Branch, fromBranch != ""))
 		}
 		return nil
@@ -133,115 +174,26 @@ func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (
 }
 
 func spin(ctx context.Context, app state.App, name, branch, fromBranch string) (state.Siding, error) {
-	if err := AssureImageCache(ctx, app); err != nil {
-		return state.Siding{}, err
-	}
-	if err := ensureBaseImage(ctx, false); err != nil {
-		return state.Siding{}, fmt.Errorf("ensure native base image: %w", err)
-	}
-	if err := EnsureVolumeBaselines(ctx, app); err != nil {
-		return state.Siding{}, err
-	}
-	src, volRoot, err := Paths(app, name)
+	src, _, err := Paths(app, name)
 	if err != nil {
 		return state.Siding{}, err
 	}
-	if len(app.Volumes) > 0 {
-		manager, err := databaseline.New(app.ConfigDir, app.Volumes)
-		if err != nil {
-			return state.Siding{}, err
-		}
-		if _, err := manager.ResetVolumeRoot(ctx, volRoot); err != nil {
-			return state.Siding{}, fmt.Errorf("create siding data set: %w", err)
-		}
+	owner := app.ControlRepoPath
+	if owner == "" {
+		owner = app.RepoPath
 	}
 	wtBranch := config.BranchPrefix() + name
 	if fromBranch != "" {
-		// Pick up an existing (remote) branch and stay ON it, so commits continue
-		// that branch and push back to it — rather than forking a new prefixed
-		// siding branch off a start point.
 		wtBranch = fromBranch
-		if err := fsclone.AddWorktreeTracking(ctx, app.RepoPath, src, fromBranch); err != nil {
+		if _, err := fsclone.AddWorktreeFromRemoteBranch(ctx, owner, src, fromBranch); err != nil {
 			return state.Siding{}, err
 		}
-	} else if err := fsclone.AddWorktree(ctx, app.RepoPath, src, wtBranch, branch); err != nil {
+	} else if err := fsclone.AddWorktree(ctx, owner, src, wtBranch, branch); err != nil {
 		return state.Siding{}, err
 	}
-
-	mounts := []container.Mount{{Host: src, Guest: "/workspace"}}
-	// Standing per-siding output dir — recordings/logs land here, outside the
-	// worktree so they're never committable.
-	outDir := filepath.Join(filepath.Dir(src), "out")
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return state.Siding{}, err
-	}
-	mounts = append(mounts, container.Mount{Host: outDir, Guest: "/out"})
-	// Copy-on-write each declared data volume from the project baseline (cp -c,
-	// instant + shares blocks) and bind-mount it at /mnt/dvol/<vol>; `up` then
-	// points a guest Docker volume at it so Aspire mounts the host's test data.
-	for _, vol := range app.Volumes {
-		host := filepath.Join(volRoot, vol)
-		// cp -c needs the dest's parent to exist (the worktree clone creates src/,
-		// not vol/).
-		if err := os.MkdirAll(volRoot, 0o755); err != nil {
-			return state.Siding{}, err
-		}
-		if err := os.MkdirAll(host, 0o755); err != nil {
-			return state.Siding{}, err
-		}
-		mounts = append(mounts, container.Mount{Host: host, Guest: "/mnt/dvol/" + vol})
-	}
-	// Explicit per-project mounts from the contract (e.g. user-secrets) — shunt
-	// honors these verbatim, no app-specific magic.
-	for _, m := range app.Mounts {
-		host, err := expandHome(m.Host)
-		if err != nil {
-			return state.Siding{}, err
-		}
-		mounts = append(mounts, container.Mount{Host: host, Guest: m.Guest, ReadOnly: m.ReadOnly})
-	}
-	// Reuse the host's NuGet package cache so `dotnet restore` doesn't re-download
-	// every package for every siding — the single biggest first-run speedup.
-	if nugetHost, err := expandHome("~/.nuget/packages"); err == nil {
-		if _, statErr := os.Stat(nugetHost); statErr == nil {
-			mounts = append(mounts, container.Mount{Host: nugetHost, Guest: "/root/.nuget/packages"})
-		}
-	}
-
-	guestName := config.ContainerName(app.Name, name)
-	if err := container.Run(ctx, container.RunOpts{
-		Name:      guestName,
-		Image:     image.Tag(),
-		Init:      true,
-		CapAddAll: true,
-		// Per-guest caps: the contract wins (heavy stacks like SQL + several
-		// projects + nested Docker need headroom), else the user-config default,
-		// else shunt's default. The runtime's own ~1 GB default OOMs Aspire.
-		Memory: orDefaultStr(app.Memory, config.GuestMemory()),
-		CPUs:   orDefaultStr(app.CPUs, config.GuestCPUs()),
-		// Rosetta lets amd64-only images such as SQL Server run on the arm64 guest;
-		// qemu segfaults SQL Server in this setup.
-		Rosetta: true,
-		Mounts:  mounts,
-		Env:     guestEnv(app),
-		// Idle keep-alive: the entrypoint starts dockerd + the dev cert, then this
-		// holds the guest open WITHOUT running the application. Use `up` later,
-		// so `new` is fast and you can edit code first.
-		Cmd: []string{"/bin/sh", "-lc", "exec sleep infinity"},
-	}); err != nil {
-		return state.Siding{}, err
-	}
-	sd := state.Siding{
-		Name:      name,
-		Branch:    wtBranch,
-		Container: guestName,
-		RSPort:    guestRSPort,
-		Bridges:   map[string]int{},
-	}
-	if err := prepareGuestFromCache(ctx, app, sd); err != nil {
-		return sd, err
-	}
-	return sd, nil
+	return state.Siding{Name: name, Branch: wtBranch, WorktreeRepoPath: owner,
+		MaterializationPhase: state.PhaseWorktree, Container: config.ContainerName(app.Name, name),
+		RSPort: guestRSPort, Bridges: map[string]int{}}, nil
 }
 
 func cleanupFailedSpin(app state.App, name, guest, branch string, keepBranch bool) error {
@@ -254,9 +206,6 @@ func cleanupFailedSpin(app state.App, name, guest, branch string, keepBranch boo
 	if guest == "" {
 		guest = config.ContainerName(app.Name, name)
 	}
-	if err := container.Remove(cleanupCtx, guest); err != nil {
-		cleanupErrs = append(cleanupErrs, fmt.Errorf("remove failed guest: %w", err))
-	}
 	src, _, err := Paths(app, name)
 	if err != nil {
 		cleanupErrs = append(cleanupErrs, err)
@@ -268,7 +217,11 @@ func cleanupFailedSpin(app state.App, name, guest, branch string, keepBranch boo
 	} else if removeBranch == "" {
 		removeBranch = config.BranchPrefix() + name
 	}
-	if err := fsclone.RemoveWorktree(cleanupCtx, app.RepoPath, src, removeBranch); err != nil {
+	owner := app.ControlRepoPath
+	if owner == "" {
+		owner = app.RepoPath
+	}
+	if err := fsclone.RemoveWorktree(cleanupCtx, owner, src, removeBranch); err != nil {
 		cleanupErrs = append(cleanupErrs, fmt.Errorf("remove failed worktree: %w", err))
 	}
 	if err := RemoveFiles(app, name); err != nil {
@@ -290,12 +243,15 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		if err != nil {
 			return err
 		}
+		if err := EnsureNoRemovalInProgress(current, "up"); err != nil {
+			return err
+		}
 		latest, ok := current.Sidings[sd.Name]
 		if !ok {
 			return fmt.Errorf("no siding %q", sd.Name)
 		}
 		wasLive = current.LiveSiding == sd.Name
-		updated, err = up(ctx, current, latest, bridge, progress)
+		updated, err = upSiding(ctx, current, latest, bridge, progress)
 		if err != nil {
 			return err
 		}
@@ -303,7 +259,7 @@ func Up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		return err
 	})
 	if err == nil && bridge && wasLive {
-		err = restoreLiveRoute(ctx, app.ConfigDir, sd.Name)
+		err = upRestoreLiveRoute(ctx, app.ConfigDir, sd.Name)
 	}
 	return updated, err
 }
@@ -314,6 +270,9 @@ func restoreLiveRoute(ctx context.Context, configDir, name string) error {
 		if err != nil {
 			return err
 		}
+		if err := EnsureNoRemovalInProgress(current, "restore live route"); err != nil {
+			return err
+		}
 		if current.LiveSiding != "" && current.LiveSiding != name {
 			return nil
 		}
@@ -322,11 +281,20 @@ func restoreLiveRoute(ctx context.Context, configDir, name string) error {
 }
 
 func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progress io.Writer) (state.Siding, error) {
+	var err error
+	sd, err = upMaterialize(ctx, app, sd, progress)
+	if err != nil {
+		return sd, err
+	}
 	fmt.Fprintln(progress, "• checking the guest is up…")
-	if err := EnsureGuestLive(ctx, sd); err != nil {
+	if err := upEnsureGuestLive(ctx, sd); err != nil {
 		// A cancelled/timed-out context is the caller giving up, not a broken guest —
 		// surface it rather than recreating.
 		if ctx.Err() != nil {
+			return sd, err
+		}
+		var recreateRequired *GuestRecreateRequiredError
+		if !errors.As(err, &recreateRequired) {
 			return sd, err
 		}
 		// The guest container is missing or wedged (e.g. a cgroup-kill wedge left it
@@ -344,7 +312,7 @@ func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		if _, saveErr := MergeSidingState(ctx, app.ConfigDir, sd, false); saveErr != nil {
 			return sd, fmt.Errorf("save auto-recreated guest state: %w", saveErr)
 		}
-		if err := EnsureGuestLive(ctx, sd); err != nil {
+		if err := upEnsureGuestLive(ctx, sd); err != nil {
 			return sd, err
 		}
 	}
@@ -354,7 +322,7 @@ func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 	// the siding's code), so a route it declares applies without an `app add` in root.
 	// Always assign — nil (no contract) clears a stale set so EffRoutes falls back to
 	// the app-level routes; a broken contract is a warning here, not a hard failure.
-	fd, ferr := resolveSidingFrontDoor(app, sd)
+	fd, ferr := upResolveFrontDoor(app, sd)
 	if ferr != nil {
 		fmt.Fprintf(progress, "  (siding front door: %v — using the app-level routes)\n", ferr)
 	}
@@ -364,7 +332,7 @@ func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 	// never becomes healthy (its child projects all crashed) is half-dead — rebuild
 	// it rather than skip. A genuinely healthy live app is left alone so a re-up just
 	// re-activates instead of starting a second AppHost (port clash).
-	appRunning, err := ProbeAppRunning(ctx, app, sd)
+	appRunning, err := upProbeAppRunning(ctx, app, sd)
 	if err != nil {
 		return sd, fmt.Errorf("inspect application state: %w", err)
 	}
@@ -380,33 +348,93 @@ func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 	}
 	if needStart {
 		fmt.Fprintln(progress, "• preparing offline Docker images + data volumes…")
-		if err := PrepareGuest(ctx, app, sd); err != nil {
+		if err := upPrepareGuest(ctx, app, sd); err != nil {
 			return sd, err
 		}
-		if err := StopApp(ctx, app, sd); err != nil {
+		if err := upStopApp(ctx, app, sd); err != nil {
 			return sd, err
 		}
-		_, _ = container.Exec(ctx, sd.Container, "sh", "-c", "> "+appLogPath)
+		upClearAppLog(ctx, sd.Container)
 
 		fmt.Fprintf(progress, "• starting the app in %q…\n", sd.Name)
-		if err := StartApp(ctx, app, sd); err != nil {
+		if err := upStartApp(ctx, app, sd); err != nil {
 			return sd, err
 		}
 		// Non-blocking: the app keeps building in the background; the eager bridges
 		// serve each route as it comes up.
 		fmt.Fprintln(progress, "• starting the app (it keeps building in the background)…")
-		_ = WaitReady(ctx, app, sd, 45*time.Second)
+		_ = upWaitReady(ctx, app, sd, 45*time.Second)
 	}
 
 	if !bridge {
-		if ip, e := container.IP(ctx, sd.Container); e == nil {
+		if ip, e := upGuestIP(ctx, sd.Container); e == nil {
 			sd.LastIP = ip
 		}
 		return sd, nil
 	}
 	fmt.Fprintln(progress, "• discovering endpoints + bridging to the host…")
-	if err := Activate(ctx, app, &sd); err != nil {
+	if err := upActivate(ctx, app, &sd); err != nil {
 		return sd, err
+	}
+	return sd, nil
+}
+
+// GuestRecreateRequiredError carries typed evidence that replacing the named
+// guest is safe. Untyped runtime/control-plane errors must never trigger it.
+type GuestRecreateRequiredError struct {
+	Name   string
+	Reason string
+	Err    error
+}
+
+func (e *GuestRecreateRequiredError) Error() string {
+	return fmt.Sprintf("guest for %q requires recreation (%s): %v", e.Name, e.Reason, e.Err)
+}
+func (e *GuestRecreateRequiredError) Unwrap() error { return e.Err }
+
+func materialize(ctx context.Context, app state.App, sd state.Siding, progress io.Writer) (state.Siding, error) {
+	phase := sd.MaterializationPhase
+	if phase == "" {
+		phase = state.PhaseGuest
+	}
+	if phase == state.PhaseWorktree {
+		fmt.Fprintln(progress, "• creating the siding data set…")
+		src, volRoot, err := Paths(app, sd.Name)
+		if err != nil {
+			return sd, err
+		}
+		if len(app.Volumes) > 0 {
+			if err := EnsureVolumeBaselines(ctx, app); err != nil {
+				return sd, err
+			}
+			manager, err := databaseline.New(app.ConfigDir, app.Volumes)
+			if err != nil {
+				return sd, err
+			}
+			if _, err := manager.ResetVolumeRoot(ctx, volRoot); err != nil {
+				return sd, err
+			}
+		}
+		if err := os.MkdirAll(filepath.Join(filepath.Dir(src), "out"), 0o755); err != nil {
+			return sd, err
+		}
+		sd.MaterializationPhase = state.PhaseData
+		if _, err := MergeSidingState(ctx, app.ConfigDir, sd, false); err != nil {
+			return sd, err
+		}
+		phase = state.PhaseData
+	}
+	if phase == state.PhaseData || phase == state.PhaseParked {
+		fmt.Fprintln(progress, "• creating the guest…")
+		created, err := recreate(ctx, app, sd, false)
+		if err != nil {
+			return sd, err
+		}
+		sd = created
+		sd.MaterializationPhase = state.PhaseGuest
+		if _, err := MergeSidingState(ctx, app.ConfigDir, sd, false); err != nil {
+			return sd, err
+		}
 	}
 	return sd, nil
 }
@@ -427,29 +455,72 @@ const appLogPath = "/var/log/apphost.log"
 // genuinely can't be brought back (e.g. it no longer exists → the caller says new).
 func EnsureGuestLive(ctx context.Context, sd state.Siding) error {
 	if _, err := execGuest(ctx, sd.Container, "true"); err == nil {
-		if _, err := execGuest(ctx, sd.Container, image.GuestCapabilityCheck()...); err != nil {
-			return fmt.Errorf("guest for %q uses a stale base image: %w", sd.Name, err)
+		match, err := guestCapabilityProbe(ctx, sd.Container)
+		if err != nil {
+			return fmt.Errorf("check guest capability for %q: %w", sd.Name, err)
+		}
+		if !match {
+			return &GuestRecreateRequiredError{Name: sd.Name, Reason: "stale base image", Err: errors.New("capability predicate mismatch")}
 		}
 		return nil
 	}
-	_ = stopGuest(ctx, sd.Container) // clear the zombie/stopped state
+	observation := observeGuest(ctx, sd.Container)
+	if observation.State == container.GuestAbsent {
+		return &GuestRecreateRequiredError{Name: sd.Name, Reason: "guest absent", Err: errors.New("named guest is absent")}
+	}
+	if observation.State == container.GuestUnavailable {
+		return fmt.Errorf("inspect guest for %q after liveness failure: runtime unavailable", sd.Name)
+	}
+	if err := stopGuest(ctx, sd.Container); err != nil {
+		return fmt.Errorf("stop guest for %q after liveness failure: %w", sd.Name, err)
+	}
 	if err := startGuest(ctx, sd.Container); err != nil {
+		if observeGuest(ctx, sd.Container).State == container.GuestAbsent {
+			return &GuestRecreateRequiredError{Name: sd.Name, Reason: "guest disappeared during restart", Err: err}
+		}
 		return fmt.Errorf("guest for %q wouldn't restart: %w", sd.Name, err)
 	}
-	for i := 0; i < 20; i++ {
+	for i := 0; i < guestLivenessAttempts; i++ {
 		if _, err := execGuest(ctx, sd.Container, "true"); err == nil {
-			if _, err := execGuest(ctx, sd.Container, image.GuestCapabilityCheck()...); err != nil {
-				return fmt.Errorf("guest for %q uses a stale base image: %w", sd.Name, err)
+			match, err := guestCapabilityProbe(ctx, sd.Container)
+			if err != nil {
+				return fmt.Errorf("check guest capability for %q after restart: %w", sd.Name, err)
+			}
+			if !match {
+				return &GuestRecreateRequiredError{Name: sd.Name, Reason: "stale base image", Err: errors.New("capability predicate mismatch")}
 			}
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Second):
+		case <-time.After(guestLivenessPoll):
 		}
 	}
-	return fmt.Errorf("guest for %q didn't become reachable after a restart", sd.Name)
+	return fmt.Errorf("guest for %q did not become reachable after restart; runtime state remains uncertain", sd.Name)
+}
+
+func probeGuestCapability(ctx context.Context, guest string) (bool, error) {
+	args := image.GuestCapabilityCheck()
+	if len(args) < 4 || args[0] != "sh" || args[1] != "-c" {
+		return false, errors.New("invalid guest capability predicate")
+	}
+	const match = "shunt-capability:match"
+	const mismatch = "shunt-capability:mismatch"
+	wrapped := "if " + args[2] + "; then printf '" + match + "'; else printf '" + mismatch + "'; fi"
+	probeArgs := append([]string{"sh", "-c", wrapped}, args[3:]...)
+	out, err := execGuest(ctx, guest, probeArgs...)
+	if err != nil {
+		return false, err
+	}
+	switch strings.TrimSpace(out) {
+	case match:
+		return true, nil
+	case mismatch:
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected guest capability response")
+	}
 }
 
 // EnsureDockerd makes sure the in-guest Docker daemon is healthy before Aspire
@@ -1457,11 +1528,8 @@ func CreateBindVolumes(ctx context.Context, app state.App, sd state.Siding) erro
 	return nil
 }
 
-// Switch points the app's stable front door at a target: either a siding or the
-// special `host` target (the local app running natively from the main repo).
-// Switch only repoints — it never starts or builds the app. Bringing the app up
-// is `up`/`restart` (or `restart host` for the native app); keeping the two
-// independent lets you, say, switch to the host to run just the DB yourself.
+// Switch points the app's stable front door at a siding. It only repoints; use
+// Up or Restart to start or rebuild the application.
 func Switch(ctx context.Context, app *state.App, target string) error {
 	if app == nil {
 		return errors.New("app is required")
@@ -1469,6 +1537,9 @@ func Switch(ctx context.Context, app *state.App, target string) error {
 	return WithProjectOperation(ctx, app.ConfigDir, func() error {
 		current, err := state.LoadApp(app.ConfigDir)
 		if err != nil {
+			return err
+		}
+		if err := EnsureNoRemovalInProgress(current, "switch"); err != nil {
 			return err
 		}
 		if err := switchLocked(ctx, &current, target); err != nil {
@@ -1480,36 +1551,20 @@ func Switch(ctx context.Context, app *state.App, target string) error {
 }
 
 func switchLocked(ctx context.Context, app *state.App, target string) error {
-	admin := caddy.NewAdmin()
-	wasHost := app.LiveSiding == state.HostTarget
-
 	if target == state.HostTarget {
-		// Step the front door aside so the native app can bind the real ports
-		// directly. We deliberately don't start it — that's `restart host` (or you,
-		// e.g. running only the database). Ports stay dead until something binds them.
-		// Only tear it down when coming FROM a siding: if the host is already live the
-		// front door is already aside, and deleting absent servers would error. When
-		// it does run, a failure (e.g. Caddy admin down) propagates so we don't mark
-		// the host live while Caddy still holds the ports.
-		if !wasHost {
-			// Tear down the front-door servers for whatever's live now — use the live
-			// siding's own route set so a route it added (beyond the app-level set) is
-			// removed too.
-			out := *app
-			if live, ok := app.Sidings[app.LiveSiding]; ok {
-				out.FrontDoor = EffRoutes(*app, live)
-			}
-			if err := caddy.RemoveFrontDoor(ctx, admin, out); err != nil {
-				return err
-			}
-		}
-		app.LiveSiding = state.HostTarget
-		return state.SaveApp(*app)
+		return fmt.Errorf("host is no longer a switch target; create or choose a siding")
 	}
+	if app.LiveSiding == state.HostTarget {
+		app.LiveSiding = ""
+	}
+	admin := caddy.NewAdmin()
 
 	sd, ok := app.Sidings[target]
 	if !ok {
 		return fmt.Errorf("no siding %q", target)
+	}
+	if sd.MaterializationPhase != "" && sd.MaterializationPhase != state.PhaseGuest {
+		return fmt.Errorf("siding %q is %s; run `shunt up %s` first", target, sd.MaterializationPhase, target)
 	}
 	// The guest runs this siding's worktree, so its own .shunt.app.json is
 	// authoritative for its front door — resolve it (a route it adds/drops applies
@@ -1520,28 +1575,7 @@ func switchLocked(ctx context.Context, app *state.App, target string) error {
 		return fmt.Errorf("switch to %q: %w", target, ferr)
 	}
 	sd.FrontDoor = fd
-	if wasHost {
-		// Coming back from the host, the local app may still hold the real ports and
-		// the front-door servers were removed — stop it (best-effort) so it releases
-		// them, then re-create every server (this siding's full set, incl. any it adds)
-		// so Caddy re-binds before pointing at the guest.
-		if err := hostStopUnlocked(ctx, *app); err != nil {
-			return fmt.Errorf("stop native host before switching: %w", err)
-		}
-		eff := *app
-		eff.FrontDoor = EffRoutes(*app, sd)
-		if err := caddy.EnsureFrontDoor(ctx, admin, eff); err != nil {
-			return err
-		}
-		// If the switch fails after we've re-bound the front door, step it aside
-		// again — otherwise state still says host while Caddy holds the ports with
-		// nothing behind them. On success LiveSiding is the target, so this is a no-op.
-		defer func() {
-			if app.LiveSiding == state.HostTarget {
-				_ = caddy.RemoveFrontDoor(ctx, admin, eff)
-			}
-		}()
-	} else {
+	{
 		// Already on a siding: the shared app-level servers are up. First tear down any
 		// server the target no longer wants — the previously-live siding's extra routes,
 		// or app-level routes this siding's contract drops — so they don't keep serving
@@ -1573,100 +1607,6 @@ func switchLocked(ctx context.Context, app *state.App, target string) error {
 	return state.SaveApp(*app)
 }
 
-// hostShellCmd runs a command on the HOST (not a guest) in the app's main repo,
-// via a login shell so the user's PATH (incl. the aspire global tool) is loaded.
-func hostShellCmd(ctx context.Context, app state.App, command string) error {
-	// Set the working directory via cmd.Dir rather than injecting `cd %q` — in a
-	// login shell, double quotes don't stop `$`/backtick expansion, so a repo path
-	// with those characters would be mis-evaluated.
-	_, err := proc.RunInDir(ctx, app.RepoPath, "sh", "-lc", command)
-	return err
-}
-
-// HostStart runs the app natively on the host from the main repo, so the local
-// copy serves the front-door ports directly. aspire → `aspire start` (managed,
-// background); other runners → the contract's start command.
-func HostStart(ctx context.Context, app state.App) error {
-	return WithProjectOperation(ctx, app.ConfigDir, func() error {
-		return hostStartUnlocked(ctx, app)
-	})
-}
-
-func hostStartUnlocked(ctx context.Context, app state.App) error {
-	cmd := app.Start
-	if app.Runner == "" || app.Runner == runner.Aspire {
-		// Raise the CLI start timeout past its 120s default for a heavy cold start.
-		cmd = fmt.Sprintf("ASPIRE_CLI_START_TIMEOUT=900 aspire start --apphost \"%s\" --non-interactive", app.AppHostPath)
-	}
-	if cmd == "" {
-		return fmt.Errorf("no host start command for runner %q — set `start` in the contract", app.Runner)
-	}
-	if err := hostShellCmd(ctx, app, cmd); err != nil {
-		return fmt.Errorf("host start: %w", err)
-	}
-	return nil
-}
-
-// HostStop stops the natively-running app, freeing the front-door ports.
-// aspire → `aspire stop`; else the contract's stop command. It reports stop
-// failures rather than racing a siding against a process that may still own a
-// port. It also stops any host Docker container still
-// publishing a front-door port: `aspire stop` leaves persistent-lifetime deps
-// (e.g. the SQL container behind the layer4 route) running, and those hold the
-// ports a siding switch needs to re-bind.
-func HostStop(ctx context.Context, app state.App) error {
-	return WithProjectOperation(ctx, app.ConfigDir, func() error {
-		return hostStopUnlocked(ctx, app)
-	})
-}
-
-func hostStopUnlocked(ctx context.Context, app state.App) error {
-	var stopErrs []error
-	cmd := app.Stop
-	if app.Runner == "" || app.Runner == runner.Aspire {
-		cmd = "aspire stop --non-interactive"
-	}
-	if cmd != "" {
-		if err := hostShellCmd(ctx, app, cmd); err != nil {
-			stopErrs = append(stopErrs, fmt.Errorf("stop native application: %w", err))
-		}
-	}
-	if !proc.Look("docker") {
-		return errors.Join(stopErrs...)
-	}
-	seenPorts := map[int]bool{}
-	for _, r := range app.FrontDoor {
-		if seenPorts[r.ListenPort] {
-			continue
-		}
-		seenPorts[r.ListenPort] = true
-		out, err := proc.Run(ctx, "docker", "ps", "--filter", fmt.Sprintf("publish=%d", r.ListenPort), "--format", "{{.ID}}")
-		if err != nil {
-			// The CLI can remain installed after Docker Desktop/OrbStack stops. In
-			// that case there cannot be a reachable host daemon with a container
-			// holding this port, so preserve the daemon-free best-effort behavior.
-			continue
-		}
-		for _, id := range strings.Fields(out.Stdout) {
-			if _, err := proc.Run(ctx, "docker", "stop", id); err != nil {
-				stopErrs = append(stopErrs, fmt.Errorf("stop host Docker container %s publishing port %d: %w", id, r.ListenPort, err))
-			}
-		}
-	}
-	return errors.Join(stopErrs...)
-}
-
-// HostRestart serializes the native stop/start pair with switches and app
-// registration so a host process cannot race Caddy for the same front-door ports.
-func HostRestart(ctx context.Context, app state.App) error {
-	return WithProjectOperation(ctx, app.ConfigDir, func() error {
-		if err := hostStopUnlocked(ctx, app); err != nil {
-			return err
-		}
-		return hostStartUnlocked(ctx, app)
-	})
-}
-
 // Restart stops the application, re-assures and loads its configured images,
 // starts the runner, and waits for readiness. The guest and data stay in place.
 func Restart(ctx context.Context, app state.App, sd state.Siding) error {
@@ -1677,13 +1617,23 @@ func Restart(ctx context.Context, app state.App, sd state.Siding) error {
 		if err != nil {
 			return err
 		}
+		if err := EnsureNoRemovalInProgress(current, "restart"); err != nil {
+			return err
+		}
 		latest, ok := current.Sidings[sd.Name]
 		if !ok {
 			return fmt.Errorf("no siding %q", sd.Name)
 		}
+		if err := RequireGuest(latest); err != nil {
+			return err
+		}
 		wasLive = current.LiveSiding == sd.Name
 		if err := EnsureGuestLive(ctx, latest); err != nil {
 			if ctx.Err() != nil {
+				return err
+			}
+			var recreateRequired *GuestRecreateRequiredError
+			if !errors.As(err, &recreateRequired) {
 				return err
 			}
 			recreated, recreateErr := recreate(ctx, current, latest, false)
@@ -1754,9 +1704,15 @@ func Recreate(ctx context.Context, app state.App, sd state.Siding, freshData boo
 		if err != nil {
 			return err
 		}
+		if err := EnsureNoRemovalInProgress(current, "recreate guest"); err != nil {
+			return err
+		}
 		latest, ok := current.Sidings[sd.Name]
 		if !ok {
 			return fmt.Errorf("no siding %q", sd.Name)
+		}
+		if err := RequireGuest(latest); err != nil {
+			return err
 		}
 		recreated, err = recreate(ctx, current, latest, freshData)
 		return err
@@ -1856,6 +1812,9 @@ func recreate(ctx context.Context, app state.App, sd state.Siding, freshData boo
 	}
 	sd.Stopped = false
 	if _, err := mergeSiding(ctx, app.ConfigDir, sd, true); err != nil {
+		if isCommittedStatePublication(err) {
+			return sd, fmt.Errorf("replacement guest started and its state is visible but durability is unconfirmed: %w", err)
+		}
 		stopErr := stopGuest(context.WithoutCancel(ctx), sd.Container)
 		return sd, errors.Join(fmt.Errorf("replacement guest started, but its state could not be saved: %w", err), stopErr)
 	}

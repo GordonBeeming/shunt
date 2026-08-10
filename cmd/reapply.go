@@ -18,7 +18,7 @@ func newReapplyCmd() *cobra.Command {
 		Long: "Guest resource caps and mounts are fixed when the guest is created, so changing them\n" +
 			"(e.g. `shunt config memory` or a contract `memory`/`cpus`) needs the guest recreated.\n" +
 			"This removes + recreates only the container — your worktree, branch, and data clones stay.\n" +
-			"Run `up` afterwards to start the app (the fresh guest re-clones bind volumes + bridges).\n\n" +
+			"Run `up` afterwards to start the app (the fresh guest reattaches the existing data and rebuilds bridges).\n\n" +
 			"With --fresh-data, each data volume is reset to the project baseline (the current\n" +
 			"clone is dropped and cp -c re-cloned), so the siding restarts with the seeded data\n" +
 			"while your worktree (code) is left untouched.",
@@ -29,6 +29,9 @@ func newReapplyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := ensureNoRemovalInProgress(app, "reapply"); err != nil {
+				return err
+			}
 			name, err := sidingArg(ctx, app, args)
 			if err != nil {
 				return err
@@ -36,6 +39,9 @@ func newReapplyCmd() *cobra.Command {
 			sd, ok := app.Sidings[name]
 			if !ok {
 				return fmt.Errorf("no siding %q", name)
+			}
+			if err := siding.RequireGuest(sd); err != nil {
+				return err
 			}
 			kept := "keeps code + data"
 			if freshData {

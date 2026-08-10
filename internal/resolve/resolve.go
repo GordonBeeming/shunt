@@ -41,7 +41,7 @@ func From(dir string) (Location, error) {
 	for i := len(parts) - 1; i >= 0; i-- {
 		if parts[i] == dirName && i+1 < len(parts) {
 			project := parts[i+1]
-			configDir := string(os.PathSeparator) + filepath.Join(parts[1 : i+2]...)
+			configDir := string(os.PathSeparator) + filepath.Join(parts[1:i+2]...)
 			siding := ""
 			if i+2 < len(parts) {
 				siding = parts[i+2]

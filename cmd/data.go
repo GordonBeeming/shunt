@@ -34,6 +34,9 @@ func newDataPromoteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := ensureNoRemovalInProgress(app, "promote data"); err != nil {
+				return err
+			}
 			name, err := resolveDataPromoteSource(cmd.Context(), app, loc, args, func(ctx context.Context, app state.App) (string, error) {
 				return sidingArg(ctx, app, nil)
 			})
@@ -41,7 +44,12 @@ func newDataPromoteCmd() *cobra.Command {
 				return err
 			}
 			if name == state.HostTarget {
-				return fmt.Errorf("%q cannot be promoted as a data source", state.HostTarget)
+				return fmt.Errorf("host is no longer a data source")
+			}
+			if sd, ok := app.Sidings[name]; ok {
+				if err := siding.RequireGuest(sd); err != nil {
+					return err
+				}
 			}
 			if _, exists := app.Sidings[name]; !exists {
 				return fmt.Errorf("no siding %q", name)
@@ -102,7 +110,7 @@ func resolveDataPromoteSource(ctx context.Context, app state.App, loc resolve.Lo
 	if loc.Siding != "" {
 		return loc.Siding, nil
 	}
-	if app.LiveSiding != "" && app.LiveSiding != state.HostTarget {
+	if app.LiveSiding != "" {
 		if _, ok := app.Sidings[app.LiveSiding]; ok {
 			return app.LiveSiding, nil
 		}
@@ -119,6 +127,9 @@ func newDataRollbackCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app, _, err := loadCurrentApp()
 			if err != nil {
+				return err
+			}
+			if err := ensureNoRemovalInProgress(app, "roll back data"); err != nil {
 				return err
 			}
 			if len(app.Volumes) == 0 {

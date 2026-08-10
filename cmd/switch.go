@@ -20,8 +20,8 @@ import (
 
 func newSwitchCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "switch [name|host]",
-		Short: "Point the stable front door at a siding, or `host` to run your local copy",
+		Use:   "switch [name]",
+		Short: "Point the stable front door at a siding",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -29,10 +29,13 @@ func newSwitchCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := ensureNoRemovalInProgress(app, "switch"); err != nil {
+				return err
+			}
 			var name string
 			if len(args) == 1 {
 				name = args[0]
-			} else if name, err = pickSiding(ctx, app, true); err != nil {
+			} else if name, err = pickSiding(ctx, app); err != nil {
 				return err
 			}
 			return switchTo(ctx, &app, name)
@@ -40,24 +43,17 @@ func newSwitchCmd() *cobra.Command {
 	}
 }
 
-// switchTo repoints the front door at a siding or the host, via siding.Switch —
-// which only moves the front door: it steps the front door aside for the host, or
-// bridges + points at a siding (stopping the host app only when switching away
-// from it). It never starts the app. Reports the result.
+// switchTo repoints the front door at an already-materialized siding. It never
+// starts the app; callers use `up` before switching when needed.
 func switchTo(ctx context.Context, app *state.App, target string) error {
-	if target != state.HostTarget {
-		if _, ok := app.Sidings[target]; !ok {
-			return fmt.Errorf("no siding %q (use `host` to run your local copy)", target)
-		}
+	if target == state.HostTarget {
+		return fmt.Errorf("host is no longer a target; choose a siding")
+	}
+	if _, ok := app.Sidings[target]; !ok {
+		return fmt.Errorf("no siding %q", target)
 	}
 	if err := siding.Switch(ctx, app, target); err != nil {
 		return err
-	}
-	if target == state.HostTarget {
-		fmt.Println(tick() + " switched to the host — front door stepped aside so your local app can serve the ports")
-		fmt.Printf("  it isn't started for you: run `%s restart host` (or start it yourself, e.g. just the DB)\n", bin())
-		fmt.Printf("  switch back to a siding any time with `%s switch <name>`\n", bin())
-		return nil
 	}
 	sd := app.Sidings[target]
 	fmt.Printf("%s switched to %q\n", tick(), target)
@@ -69,20 +65,16 @@ func switchTo(ctx context.Context, app *state.App, target string) error {
 
 // pickSiding lets the user choose a siding — arrow-key navigation on a TTY,
 // numbered prompt otherwise. Each entry shows its live/up/idle/stopped status.
-func pickSiding(ctx context.Context, app state.App, includeHost bool) (string, error) {
-	return pickSidingWithReader(ctx, app, includeHost, bufio.NewReader(os.Stdin))
+func pickSiding(ctx context.Context, app state.App) (string, error) {
+	return pickSidingWithReader(ctx, app, bufio.NewReader(os.Stdin))
 }
 
-func pickSidingWithReader(ctx context.Context, app state.App, includeHost bool, in *bufio.Reader) (string, error) {
-	names := make([]string, 0, len(app.Sidings)+1)
+func pickSidingWithReader(ctx context.Context, app state.App, in *bufio.Reader) (string, error) {
+	names := make([]string, 0, len(app.Sidings))
 	for n := range app.Sidings {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	if includeHost {
-		// `host` (run the local copy) is a switch target too — list it first.
-		names = append([]string{state.HostTarget}, names...)
-	}
 	if len(names) == 0 {
 		return "", fmt.Errorf("no sidings yet — `%s new <name>`", bin())
 	}
@@ -97,8 +89,8 @@ func pickSidingWithReader(ctx context.Context, app state.App, includeHost bool, 
 	return pickSidingInteractive(app, names, statuses, fd)
 }
 
-// sidingStatuses resolves the picker's status label for each name, querying each
-// siding's guest state once (the host has no guest). Errors read as unknown.
+// sidingStatuses resolves the picker's status label for each name. Worktree-only,
+// data-only, and parked sidings do not require a container-runtime query.
 func sidingStatuses(ctx context.Context, app state.App, names []string) map[string]string {
 	m := make(map[string]string, len(names))
 	// Each siding's status needs a `container.State` inspect; query them
@@ -106,23 +98,17 @@ func sidingStatuses(ctx context.Context, app state.App, names []string) map[stri
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, n := range names {
-		if n == state.HostTarget {
-			// The host isn't a guest — "-" means "not the live target" (its status
-			// isn't tracked); it's always switchable regardless.
-			if app.LiveSiding == state.HostTarget {
-				m[n] = "live"
-			} else {
-				m[n] = "-"
-			}
-			continue
-		}
 		wg.Add(1)
 		go func(n string) {
 			defer wg.Done()
 			sd := app.Sidings[n]
-			guestState, err := container.State(ctx, sd.Container)
-			if err != nil {
-				guestState = ""
+			guestState := "not-materialized"
+			if sd.MaterializationPhase == state.PhaseGuest || sd.MaterializationPhase == "" {
+				var err error
+				guestState, err = container.State(ctx, sd.Container)
+				if err != nil {
+					guestState = "unavailable"
+				}
 			}
 			st := sidingStatus(app, n, sd, guestState)
 			mu.Lock()

@@ -26,6 +26,7 @@ type cleanupCandidate struct {
 
 func newCleanupCmd() *cobra.Command {
 	var force bool
+	var nextBase string
 	c := &cobra.Command{
 		Use:   "cleanup",
 		Short: "Select and permanently remove one or more sidings",
@@ -36,6 +37,9 @@ func newCleanupCmd() *cobra.Command {
 			app, _, err := loadCurrentApp()
 			if err != nil {
 				return err
+			}
+			if app.Removal != nil {
+				return removeSiding(ctx, &app, app.Removal.Siding, force, "")
 			}
 			if len(app.Sidings) == 0 {
 				fmt.Println("no sidings to clean up")
@@ -58,7 +62,16 @@ func newCleanupCmd() *cobra.Command {
 			if app.LiveSiding != "" && containsName(selected, app.LiveSiding) && !force {
 				return fmt.Errorf("siding %q is live — switch away first, or pass --force", app.LiveSiding)
 			}
+			var safety map[string]*removalSafety
 			if !force {
+				safety = make(map[string]*removalSafety, len(selected))
+				for _, name := range selected {
+					snapshot, err := captureRemovalSafety(ctx, app, name, selected)
+					if err != nil {
+						return err
+					}
+					safety[name] = &snapshot
+				}
 				dirty, err := dirtySelectedSidings(ctx, app, selected)
 				if err != nil {
 					return err
@@ -74,9 +87,26 @@ func newCleanupCmd() *cobra.Command {
 					}
 				}
 			}
+			if err := ensureBaseSelected(ctx, &app); err != nil {
+				return err
+			}
 
+			removedBase := app.BaseSiding
+			successor, err := prepareBaseRemoval(app, selected, nextBase, in)
+			if err != nil {
+				return err
+			}
+			selected = orderBaseLast(selected, removedBase)
 			for _, name := range selected {
-				if err := removeSiding(ctx, &app, name, force); err != nil {
+				next := ""
+				if name == removedBase {
+					next = successor
+				}
+				var expected *removalSafety
+				if safety != nil {
+					expected = safety[name]
+				}
+				if err := removeSiding(ctx, &app, name, force, next, expected); err != nil {
 					return fmt.Errorf("clean up siding %q: %w", name, err)
 				}
 			}
@@ -84,6 +114,7 @@ func newCleanupCmd() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVarP(&force, "force", "f", false, "skip live-siding and uncommitted-change safety checks")
+	c.Flags().StringVar(&nextBase, "next-base", "", "successor source base when the current base is selected")
 	return c
 }
 

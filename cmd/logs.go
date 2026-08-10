@@ -1,11 +1,16 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/gordonbeeming/shunt/internal/container"
+	"github.com/gordonbeeming/shunt/internal/siding"
+	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 )
+
+var readGuestLog = container.Exec
 
 func newLogsCmd() *cobra.Command {
 	var lines int
@@ -25,15 +30,7 @@ func newLogsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			sd, ok := app.Sidings[name]
-			if !ok {
-				return fmt.Errorf("no siding %q — `%s ls`", name, bin())
-			}
-			read := "cat /var/log/apphost.log 2>/dev/null"
-			if lines > 0 {
-				read = fmt.Sprintf("tail -n %d /var/log/apphost.log 2>/dev/null", lines)
-			}
-			out, err := container.Exec(ctx, sd.Container, "sh", "-c", read)
+			out, err := sidingLog(ctx, app.ConfigDir, name, lines)
 			if err != nil {
 				return fmt.Errorf("read log (is the guest running?): %w", err)
 			}
@@ -47,4 +44,24 @@ func newLogsCmd() *cobra.Command {
 	}
 	c.Flags().IntVarP(&lines, "tail", "n", 0, "show only the last N lines (default: all)")
 	return c
+}
+
+func sidingLog(ctx context.Context, configDir, name string, lines int) (string, error) {
+	var output string
+	err := withLatestSiding(ctx, configDir, name, "read logs", func(_ state.App, sd state.Siding) error {
+		if err := siding.RequireGuest(sd); err != nil {
+			return err
+		}
+		read := "cat /var/log/apphost.log 2>/dev/null"
+		if lines > 0 {
+			read = fmt.Sprintf("tail -n %d /var/log/apphost.log 2>/dev/null", lines)
+		}
+		var err error
+		output, err = readGuestLog(ctx, sd.Container, "sh", "-c", read)
+		if err != nil {
+			return fmt.Errorf("read log (is the guest running?): %w", err)
+		}
+		return nil
+	})
+	return output, err
 }

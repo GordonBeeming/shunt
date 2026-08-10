@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230063B2'/%3E%3Cpath d='M17 20h30v8H17zm0 16h30v8H17z' fill='white'/%3E%3C/svg%3E">
 <title>shunt</title>
 <style>
   /* Light by default; follows the OS theme. color-scheme above means the browser
@@ -51,6 +52,10 @@
   .app > h2 { margin: 0; padding: 15px 20px; font-size: 16px; border-bottom: 1px solid var(--ui); display: flex; align-items: center; gap: 10px; }
   .app > h2 .live { font-size: 12px; font-weight: 500; color: var(--text2); }
   .app > h2 .live strong { color: var(--text); }
+  .removal { margin: 14px 20px 0; padding: 11px 13px; border: 1px solid var(--busy); border-radius: 9px; background: color-mix(in srgb, var(--busy) 12%, var(--card)); }
+  .removal strong { display: block; color: var(--text); }
+  .removal span, .removal code { color: var(--text2); font-size: 12px; }
+  .removal code { overflow-wrap: anywhere; }
 
   /* one route per cell: status dot + key on top, full-width url underneath so it
      never wraps mid-word into a cramped column */
@@ -76,9 +81,16 @@
   .siding .nm { font-family: var(--mono); font-size: 13px; font-weight: 600; }
   .badge { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; padding: 2px 8px; border-radius: 999px; }
   .badge.live { background: var(--up); color: #fff; }
-  .siding .guest { font-size: 11px; color: var(--text2); }
+  .badge.base { background: var(--primary); color: var(--on-primary); }
+  .badge.phase { background: var(--ui); color: var(--text); }
+  .guest { font-size: 11px; color: var(--text2); }
+  .siding .runtime { font-size: 11px; color: var(--text2); }
+  .siding .runtime.bad { color: var(--down); }
+  .siding .runtime-detail { font-size: 11px; color: var(--text2); }
   .siding .status { font-size: 12px; color: var(--busy); }
-  .siding .spacer { flex: 1; }
+  .siding .progress { display: grid; gap: 2px; margin: 2px 0 0; color: var(--text2); font: 11px/1.35 var(--mono); }
+  .siding .actions { display: flex; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-left: auto; }
+  .action-fence { color: var(--busy); font-size: 12px; font-weight: 600; }
   button {
     font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
     border: 1px solid var(--primary); color: var(--primary); background: var(--card);
@@ -96,6 +108,16 @@
     background: var(--bg); border-top: 1px solid var(--ui); border-right: 1px solid var(--ui);
     border-top-right-radius: 8px; max-width: 92vw;
   }
+  @media (max-width: 420px) {
+    header { align-items: flex-start; flex-wrap: wrap; padding: 16px; }
+    header .dot-legend { margin-left: 0; width: 100%; }
+    main { padding: 16px; }
+    .routes, .sidings { padding-left: 14px; padding-right: 14px; }
+    .siding { align-items: flex-start; flex-direction: column; }
+    .siding .actions { justify-content: flex-start; margin-left: 0; }
+    footer { max-width: 100%; position: static; border-right: 0; border-top-right-radius: 0; }
+    main { padding-bottom: 16px; }
+  }
 </style>
 </head>
 <body>
@@ -106,16 +128,17 @@
   <span class="dot-legend"><span class="dot up" style="display:inline-block;width:9px;height:9px;border-radius:50%;box-shadow:none"></span> up &nbsp; <span class="dot down" style="display:inline-block;width:9px;height:9px;border-radius:50%;box-shadow:none"></span> down</span>
 </header>
 <main id="apps"><div class="empty">Loading…</div></main>
-<footer>Live status polls every few seconds · switch is an instant Caddy rebind · start builds + runs a siding, stop halts its guest</footer>
+<footer>Lifecycle: worktree → start → guest → park → start again · disk figures belong in <code>shunt space</code>; logical clone totals are not reclaimable</footer>
 
 <script>
 const $ = (s) => document.querySelector(s);
 let firstLoad = true;
+let csrfToken = '';
 
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 async function post(path, body){
-  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json', 'X-Shunt-CSRF': csrfToken}, body: JSON.stringify(body)});
   if(!r.ok){ alert(await r.text()); }
   return r.ok;
 }
@@ -131,12 +154,39 @@ function routeHTML(r){
   return `<div class="route">${dot}<div class="rmeta"><span class="key">${esc(r.key)}</span>${target}</div></div>`;
 }
 
-function sidingHTML(appName, s){
-  const badge = s.live ? '<span class="badge live">live</span>' : '';
-  const status = s.status ? `<span class="status">${esc(s.status)}</span>` : '';
-  const guest = s.guest ? `<span class="guest">${esc(s.guest)}</span>` : '';
-  const running = s.guest === 'running';
-  // Second line: the guest's Aspire dashboard link first, then its IP. The link is
+// JSON preserves the app/siding tuple boundary before URI encoding. Delimiter
+// concatenation is not injective: (a-b,c) and (a,b-c) both became a-b-c.
+function sidingKey(appName, s){ return `siding-${encodeURIComponent(JSON.stringify([String(appName), String(s.name)]))}`; }
+
+function actionHTML(appName, s, removalActive){
+  if(removalActive) return '<span class="action-fence">Removal in progress</span>';
+  const busy = s.status && s.status.indexOf('…') >= 0;
+  const a = esc(JSON.stringify(appName)), n = esc(JSON.stringify(s.name));
+  const guestPhase = s.phase === 'guest';
+  const running = s.runtime === 'running';
+  const startCopy = s.phase === 'worktree' ? 'Materialize' : s.phase === 'parked' ? 'Restore' : 'Start';
+  const canSwitch = guestPhase && running && s.serving && !s.live;
+  const sw = canSwitch ? `<button aria-label="Switch ${esc(s.name)} live" onclick="doSwitch(${a},${n})" ${busy?'disabled':''}>Switch</button>` : '';
+  const start = (!guestPhase || !running || !s.serving)
+    ? `<button class="primary" aria-label="${startCopy} ${esc(s.name)}" onclick="doStart(${a},${n})" ${busy?'disabled':''}>${startCopy}</button>` : '';
+  const stop = guestPhase && running
+    ? `<button aria-label="Stop ${esc(s.name)} guest" onclick="doStop(${a},${n})" ${busy?'disabled':''}>Stop</button>` : '';
+  const park = guestPhase && !s.live
+    ? `<button aria-label="Park ${esc(s.name)}" onclick="doPark(${a},${n})" ${busy?'disabled':''}>Park</button>` : '';
+  return sw + start + stop + park;
+}
+
+function sidingHTML(appName, s, removalActive){
+  const liveBadge = s.live ? '<span class="badge live">live</span>' : '';
+  const baseBadge = s.base ? '<span class="badge base">base</span>' : '';
+  const phaseBadge = `<span class="badge phase" title="persisted siding phase">${esc(s.phase || 'worktree')}</span>`;
+  const status = `<span class="status terminal-status" role="status" aria-live="polite">${esc(s.status || '')}</span>`;
+  const runtimeBad = s.runtime === 'runtime-unavailable' ? ' bad' : '';
+  const runtime = `<span class="runtime${runtimeBad}">runtime: ${esc(s.runtime || 'missing')}${s.runtime === 'running' ? (s.serving ? ' · app serving' : ' · app idle') : ''}</span>`;
+  const runtimeDetail = s.runtimeDetail ? `<span class="runtime-detail">${esc(s.runtimeDetail)}</span>` : '';
+  const progress = `<div class="progress" role="log" aria-live="polite" aria-relevant="additions" data-progress-count="0">${(s.progress || []).map(line => `<span>${esc(line)}</span>`).join('')}</div>`;
+  const running = s.runtime === 'running';
+  // Direct-access line: the guest's Aspire dashboard link first, then its IP. The link is
   // only live when the app is actually running (opens in the browser — Local Network
   // access); otherwise it's shown disabled since you can't reach it.
   let line2 = '';
@@ -148,37 +198,96 @@ function sidingHTML(appName, s){
       : '';
     line2 = `<div class="sline2">${dash}<span class="guest">${esc(s.ip)}</span></div>`;
   }
-  const busy = s.status && s.status.indexOf('…') >= 0;
-  // esc(JSON.stringify(...)) produces a valid, attribute-safe JS string literal:
-  // a name containing ' or " can't break out of the inline handler or inject.
-  const a = esc(JSON.stringify(appName)), n = esc(JSON.stringify(s.name));
-  const sw = s.live ? '' : `<button onclick="doSwitch(${a},${n})" ${busy?'disabled':''}>Switch</button>`;
-  // Start/Stop toggle by state: running → Stop; idle/stopped → Start. "local" (the
-  // host when it isn't live) shows neither — switch to it first so Caddy steps aside.
-  let action = '';
-  if (running) {
-    action = `<button class="primary" onclick="doStop(${a},${n})" ${busy?'disabled':''}>Stop</button>`;
-  } else if (s.guest === 'idle' || s.guest === 'stopped') {
-    action = `<button class="primary" onclick="doStart(${a},${n})" ${busy?'disabled':''}>Start</button>`;
-  }
-  return `<div class="siding">
+  return `<div class="siding" id="${sidingKey(appName, s)}">
     <div class="sinfo">
-      <div class="sline1"><span class="nm">${esc(s.name)}</span> ${badge} ${guest} ${status}</div>
+      <div class="sline1"><span class="nm">${esc(s.name)}</span> ${liveBadge} ${baseBadge} ${phaseBadge} ${status}</div>
+      <div class="sline2">${runtime} ${runtimeDetail}</div>
+      ${progress}
       ${line2}
     </div>
-    <span class="spacer"></span>${sw}${action}</div>`;
+    <div class="actions">${actionHTML(appName, s, removalActive)}</div></div>`;
 }
 
 function appHTML(a){
   const rts = a.routes || [], sds = a.sidings || [];   // server may send null for empty
   const live = a.liveSiding ? `live: <strong>${esc(a.liveSiding)}</strong>` : 'nothing live';
   const routes = rts.length ? rts.map(routeHTML).join('') : '<span class="guest">no routes</span>';
-  const sidings = sds.length ? sds.map(s => sidingHTML(a.name, s)).join('') : '<span class="guest">no sidings — `shunt new`</span>';
+  const removal = a.removal
+    ? `<div class="removal" role="status"><strong>Removal in progress</strong><span>Siding ${esc(a.removal.siding)} · stage ${esc(a.removal.stage)} · started ${esc(a.removal.age)} ago</span><br><code>${esc(a.removal.resume)}</code></div>`
+    : '';
+  const sidings = sds.length ? sds.map(s => sidingHTML(a.name, s, !!a.removal)).join('') : '<span class="guest">no sidings — `shunt new`</span>';
   return `<section class="app">
     <h2>${esc(a.name)} <span class="live">${live}</span></h2>
+    ${removal}
     <div class="routes">${routes}</div>
     <div class="sidings"><div class="lbl">Sidings</div>${sidings}</div>
   </section>`;
+}
+
+function reconcileProgress(progress, lines){
+  if(!progress) return;
+  const existing = [...progress.querySelectorAll('span')].map(entry => entry.textContent);
+  const next = lines || [];
+  // Action progress is a bounded trailing window. Keep matching entries and only
+  // append genuine additions, so assistive technology sees one update at a time.
+  let retained = 0;
+  for(let count = Math.min(existing.length, next.length); count > 0; count--) {
+    if(existing.slice(existing.length - count).every((line, index) => line === next[index])) { retained = count; break; }
+  }
+  while(progress.children.length > retained) progress.firstElementChild.remove();
+  for(const line of next.slice(retained)) {
+    const entry = document.createElement('span'); entry.textContent = line; progress.append(entry);
+  }
+}
+
+function appNode(a){
+  const template = document.createElement('template');
+  template.innerHTML = appHTML(a);
+  const node = template.content.firstElementChild;
+  node.dataset.app = a.name;
+  return node;
+}
+
+function renderApps(apps){
+  const root = $('#apps');
+  if(!apps || !apps.length) {
+    root.innerHTML = '<div class="empty">No apps registered yet — run <code>shunt app add</code> in a repo.</div>';
+    return;
+  }
+  root.querySelector('.empty')?.remove();
+  const wanted = new Set(apps.map(app => app.name));
+  root.querySelectorAll('.app[data-app]').forEach(node => { if(!wanted.has(node.dataset.app)) node.remove(); });
+  for(const app of apps) {
+    const currentApp = root.querySelector(`.app[data-app="${CSS.escape(app.name)}"]`);
+    const nextApp = appNode(app);
+    if(!currentApp) {
+      root.append(nextApp);
+      continue;
+    }
+    for(const siding of app.sidings || []) {
+      const id = sidingKey(app.name, siding);
+      // Scope lookup to this app as well as using an injective tuple ID. This keeps
+      // progress/status identity attached to the right siding even for hostile or
+      // formerly-colliding names.
+      const currentSiding = currentApp.querySelector(`#${CSS.escape(id)}`);
+      const nextSiding = nextApp.querySelector(`#${CSS.escape(id)}`);
+      if(currentSiding && nextSiding) {
+        const progress = currentSiding.querySelector('[role="log"]');
+        if(progress) {
+          reconcileProgress(progress, siding.progress);
+          nextSiding.querySelector('[role="log"]')?.replaceWith(progress);
+        }
+        const status = currentSiding.querySelector('.terminal-status');
+        if(status) {
+          status.textContent = siding.status || '';
+          nextSiding.querySelector('.terminal-status')?.replaceWith(status);
+        }
+      }
+    }
+    currentApp.replaceWith(nextApp);
+    // Re-appending each reconciled app makes DOM order follow the latest response.
+    root.append(nextApp);
+  }
 }
 
 async function doSwitch(app, sd){
@@ -189,8 +298,12 @@ async function doStart(app, sd){
   if(await post('/api/start', {project:app, siding:sd})) refresh();
 }
 async function doStop(app, sd){
-  if(!confirm(`Stop "${sd}"?\n\nThis stops the app${sd==='host'?'':' + its guest'} — it can interrupt anyone using it.`)) return;
+  if(!confirm(`Stop "${sd}"?\n\nThis stops the app + its guest — it can interrupt anyone using it. Code, data, and the guest remain.`)) return;
   if(await post('/api/stop', {project:app, siding:sd})) refresh();
+}
+async function doPark(app, sd){
+  if(!confirm(`Park "${sd}"?\n\nThis removes only its recreatable Apple guest. The worktree, branch, data, and output stay in place, and Start creates the guest again.`)) return;
+  if(await post('/api/park', {project:app, siding:sd})) refresh();
 }
 
 function applyChannel(ch){
@@ -215,9 +328,8 @@ async function refresh(){
   firstLoad = false;
   try {                                              // a render bug is NOT "unreachable"
     applyChannel(st.channel);
-    $('#apps').innerHTML = st.apps && st.apps.length
-      ? st.apps.map(appHTML).join('')
-      : '<div class="empty">No apps registered yet — run <code>shunt app add</code> in a repo.</div>';
+    csrfToken = st.csrfToken || '';
+    renderApps(st.apps);
   } catch(e){
     $('#apps').innerHTML = '<div class="empty">render error: ' + esc(e.message) + '</div>';
   }

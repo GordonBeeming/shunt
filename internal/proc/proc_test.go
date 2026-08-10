@@ -4,11 +4,25 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+type boundedCountingWriter struct {
+	total    int64
+	maxWrite int
+}
+
+func (w *boundedCountingWriter) Write(data []byte) (int, error) {
+	w.total += int64(len(data))
+	if len(data) > w.maxWrite {
+		w.maxWrite = len(data)
+	}
+	return len(data), nil
+}
 
 func TestAugmentPath(t *testing.T) {
 	exists := func(d string) bool { return d == "/usr/local/bin" || d == "/opt/homebrew/bin" }
@@ -85,5 +99,43 @@ func TestRunToFileLimitedStopsOversizedOutput(t *testing.T) {
 	}
 	if info.Size() > 4 {
 		t.Fatalf("limited output size = %d", info.Size())
+	}
+}
+
+func TestRunStreamingDoesNotRetainLargeOutput(t *testing.T) {
+	if os.Getenv("SHUNT_PROC_STREAM_HELPER") == "1" {
+		chunk := make([]byte, 32*1024)
+		for written := 0; written < 16*1024*1024; written += len(chunk) {
+			if _, err := os.Stdout.Write(chunk); err != nil {
+				os.Exit(2)
+			}
+		}
+		os.Exit(0)
+	}
+
+	w := &boundedCountingWriter{}
+	cmd := os.Args[0]
+	t.Setenv("SHUNT_PROC_STREAM_HELPER", "1")
+	result, err := RunStreaming(context.Background(), w, io.Discard, cmd, "-test.run=TestRunStreamingDoesNotRetainLargeOutput")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("exit code = %d", result.ExitCode)
+	}
+	if w.total != 16*1024*1024 {
+		t.Fatalf("streamed bytes = %d", w.total)
+	}
+	if w.maxWrite > 64*1024 {
+		t.Fatalf("largest write = %d; output appears to be buffered", w.maxWrite)
+	}
+}
+
+func TestRunStreamingHonorsCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := RunStreaming(ctx, io.Discard, io.Discard, "sh", "-c", "printf unreachable")
+	if err == nil {
+		t.Fatal("RunStreaming() unexpectedly succeeded")
 	}
 }
