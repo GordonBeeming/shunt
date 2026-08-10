@@ -1,18 +1,20 @@
 // Package state holds shunt's persisted model: a thin global registry mapping
 // projects to their config dirs, and the per-project runtime state (the app and
-// its sidings) stored project-locally in <repos>/.shunt[-channel]/<project>/state.json.
+// its sidings) stored project-locally in <repos>/.shunt[-channel]/<project>/state-v2.json.
 package state
 
 import (
 	"encoding/json"
 	"path"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
 const (
 	// RegistryVersion / StateVersion let us migrate on-disk formats later.
 	RegistryVersion = 1
-	StateVersion    = 1
+	StateVersion    = 2
 
 	// KindHTTP / KindLayer4 are the two front-door route kinds.
 	KindHTTP   = "http"
@@ -22,12 +24,51 @@ const (
 	// live. A refused connection here is an honest "nothing live yet" signal.
 	PlaceholderDial = "127.0.0.1:1"
 
-	// HostTarget is the reserved switch target meaning "the local app running
-	// natively on the host, from the main repo" — an alternative to any siding.
-	// App.LiveSiding holds this value when the host is live; a siding can't be
-	// named this.
+	// HostTarget is retained only to recognize and migrate legacy state. It remains
+	// reserved so an old live-target value can never be confused with a siding.
 	HostTarget = "host"
 )
+
+// MaterializationPhase records how far a siding has grown beyond its Git
+// worktree. The empty value is reserved for legacy state and is projected on
+// load without rewriting the state file.
+type MaterializationPhase string
+
+const (
+	PhaseWorktree MaterializationPhase = "worktree"
+	PhaseData     MaterializationPhase = "data"
+	PhaseGuest    MaterializationPhase = "guest"
+	PhaseParked   MaterializationPhase = "parked"
+)
+
+// RemovalStage is a durable checkpoint in the project-exclusive siding
+// removal workflow. Commands can resume from the last published stage after a
+// process crash without repeating a baseline promotion.
+type RemovalStage string
+
+const (
+	RemovalStarted            RemovalStage = "started"
+	RemovalBasePinned         RemovalStage = "base-pinned"
+	RemovalBaselinePromoted   RemovalStage = "baseline-promoted"
+	RemovalGuestRemoved       RemovalStage = "guest-removed"
+	RemovalWorktreeRemoved    RemovalStage = "worktree-removed"
+	RemovalFilesRemoved       RemovalStage = "files-removed"
+	RemovalOperationForgotten RemovalStage = "operation-forgotten"
+)
+
+// RemovalOperation journals the one project-exclusive destructive operation
+// that may be resumed. GenerationID is filled once the data baseline reports a
+// committed generation for ID.
+type RemovalOperation struct {
+	ID           string       `json:"id"`
+	Siding       string       `json:"siding"`
+	Stage        RemovalStage `json:"stage"`
+	GenerationID string       `json:"generationId,omitempty"`
+	StartedAt    string       `json:"startedAt"`
+	Force        bool         `json:"force,omitempty"`
+	Safety       string       `json:"safetyFingerprint,omitempty"`
+	Removing     []string     `json:"removing,omitempty"`
+}
 
 // Registry is the global index (~/.shunt[-channel]/registry.json): just enough
 // for the single Caddy server and cross-project `shunt ls` to find each
@@ -54,21 +95,27 @@ func (r Registry) FindProject(name string) (canonical, dir string, ok bool) {
 }
 
 // App is the per-project runtime state, derived from the committed in-repo
-// .shunt.app.json contract and persisted to <configDir>/state.json.
+// .shunt.app.json contract and persisted to <configDir>/state-v2.json.
 type App struct {
-	Name        string            `json:"name"`
-	RepoOrigin  string            `json:"repoOrigin"`
-	RepoPath    string            `json:"repoPath"`          // the original repo on disk
-	Runner      string            `json:"runner"`            // aspire | dotnet | node | custom
-	Start       string            `json:"start,omitempty"`   // start command (non-aspire)
-	Stop        string            `json:"stop,omitempty"`    // optional clean-stop command; force-kill is the fallback
-	Workdir     string            `json:"workdir,omitempty"` // dir to run Start/Stop in (non-aspire)
-	AppHostPath string            `json:"appHostPath"`       // aspire: rel path to the AppHost project
-	ConfigDir   string            `json:"configDir"`         // <repos>/.shunt[-ch]/<project>
-	FrontDoor   []Route           `json:"frontDoor"`
-	DataVolumes []DataVolume      `json:"dataVolumes"`
-	Env         map[string]string `json:"env"`    // extra guest env (Aspire parameters, secrets)
-	Mounts      []MountSpec       `json:"mounts"` // explicit extra host->guest mounts
+	Version    int    `json:"version"`
+	Name       string `json:"name"`
+	RepoOrigin string `json:"repoOrigin"`
+	RepoPath   string `json:"repoPath"` // legacy checkout reference; never an execution target
+	// ControlRepoPath is Shunt's independent bare repository. It owns managed
+	// worktrees and preserves the pinned source seed when no siding remains.
+	ControlRepoPath string            `json:"controlRepoPath,omitempty"`
+	BaseSiding      string            `json:"baseSiding,omitempty"`
+	BaseCommit      string            `json:"baseCommit,omitempty"`
+	Runner          string            `json:"runner"`            // aspire | dotnet | node | custom
+	Start           string            `json:"start,omitempty"`   // start command (non-aspire)
+	Stop            string            `json:"stop,omitempty"`    // optional clean-stop command; force-kill is the fallback
+	Workdir         string            `json:"workdir,omitempty"` // dir to run Start/Stop in (non-aspire)
+	AppHostPath     string            `json:"appHostPath"`       // aspire: rel path to the AppHost project
+	ConfigDir       string            `json:"configDir"`         // <repos>/.shunt[-ch]/<project>
+	FrontDoor       []Route           `json:"frontDoor"`
+	DataVolumes     []DataVolume      `json:"dataVolumes"`
+	Env             map[string]string `json:"env"`    // extra guest env (Aspire parameters, secrets)
+	Mounts          []MountSpec       `json:"mounts"` // explicit extra host->guest mounts
 	// Registry dependency images kept in shunt's daemon-free host cache and
 	// loaded into sidings so guests never pull from the network (see `shunt warm`).
 	PrebakeImages []string `json:"prebakeImages,omitempty"`
@@ -93,6 +140,7 @@ type App struct {
 	DisableCache bool              `json:"disableCache,omitempty"`
 	Sidings      map[string]Siding `json:"sidings"`
 	LiveSiding   string            `json:"liveSiding"` // "" = nothing live
+	Removal      *RemovalOperation `json:"removal,omitempty"`
 }
 
 // PrebakeBuild declares one local image build that feeds shunt's shared,
@@ -167,14 +215,18 @@ func guestPathFor(p string) string {
 
 // Siding is one isolated experiment of an app.
 type Siding struct {
-	Name      string `json:"name"`
-	Branch    string `json:"branch"`
-	Container string `json:"container"` // channel-prefixed guest name
-	CreatedAt string `json:"createdAt"` // RFC3339, stamped by the caller
-	RSPort    int    `json:"rsPort"`    // pinned Aspire resource-service port in the guest
-	RSKey     string `json:"rsKey"`     // resource-service API key shunt set on launch
-	LastIP    string `json:"lastIp"`    // cached guest IP, refreshed on switch
-	Stopped   bool   `json:"stopped"`   // kill keeps the clone/volume but stops the guest
+	Name   string `json:"name"`
+	Branch string `json:"branch"`
+	// WorktreeRepoPath records the repository that owns this linked worktree.
+	// Legacy sidings project to App.RepoPath; managed sidings use ControlRepoPath.
+	WorktreeRepoPath     string               `json:"worktreeRepoPath,omitempty"`
+	MaterializationPhase MaterializationPhase `json:"materializationPhase,omitempty"`
+	Container            string               `json:"container"` // channel-prefixed guest name
+	CreatedAt            string               `json:"createdAt"` // RFC3339, stamped by the caller
+	RSPort               int                  `json:"rsPort"`    // pinned Aspire resource-service port in the guest
+	RSKey                string               `json:"rsKey"`     // resource-service API key shunt set on launch
+	LastIP               string               `json:"lastIp"`    // cached guest IP, refreshed on switch
+	Stopped              bool                 `json:"stopped"`   // kill keeps the clone/volume but stops the guest
 	// Bridges maps each front-door route key to the guest-external port shunt's
 	// in-guest socat exposes (Aspire binds the real endpoint to loopback).
 	Bridges map[string]int `json:"bridges"`
@@ -183,4 +235,89 @@ type Siding struct {
 	// to the app-level set — so a siding that adds/drops a route applies it on
 	// `up`/`switch` without an `app add` in the root repo. Set by `up`/`switch`.
 	FrontDoor []Route `json:"frontDoor,omitempty"`
+}
+
+// EnsureV2 applies the deterministic state-v2 projection and marks the app for
+// v2 publication. It returns whether any in-memory field changed. It performs
+// no filesystem or Git work.
+func EnsureV2(app *App) bool {
+	if app == nil {
+		return false
+	}
+	changed := projectCompatibility(app)
+	if app.Version < StateVersion {
+		app.Version = StateVersion
+		changed = true
+	}
+	return changed
+}
+
+// NeedsBaseSelection reports the only migration decision state cannot infer:
+// multiple existing sidings with no designated source base.
+func NeedsBaseSelection(app App) bool {
+	if len(app.Sidings) == 0 {
+		return false
+	}
+	if app.BaseSiding == "" {
+		return len(app.Sidings) > 1
+	}
+	_, exists := app.Sidings[app.BaseSiding]
+	return !exists
+}
+
+// WorktreeOwner returns the repository that owns a siding's linked worktree.
+// The original repository is the compatibility owner for legacy state.
+func WorktreeOwner(app App, siding Siding) string {
+	if siding.WorktreeRepoPath != "" {
+		return siding.WorktreeRepoPath
+	}
+	return app.RepoPath
+}
+
+// projectCompatibility supplies safe read-time defaults without changing the
+// persisted version. LoadApp calls it only on the returned in-memory value.
+func projectCompatibility(app *App) bool {
+	changed := false
+	legacy := app.Version < StateVersion
+	if app.ControlRepoPath == "" && app.ConfigDir != "" {
+		app.ControlRepoPath = filepath.Join(app.ConfigDir, ".control.git")
+		changed = true
+	}
+	if app.Sidings == nil {
+		app.Sidings = map[string]Siding{}
+		changed = true
+	}
+	if app.BaseSiding == "" && len(app.Sidings) == 1 {
+		for name := range app.Sidings {
+			app.BaseSiding = name
+		}
+		changed = true
+	}
+	// Stable ordering is not required for the map update itself, but makes this
+	// projection deterministic if callers observe copied values while debugging.
+	names := make([]string, 0, len(app.Sidings))
+	for name := range app.Sidings {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		siding := app.Sidings[name]
+		if siding.WorktreeRepoPath == "" {
+			siding.WorktreeRepoPath = app.RepoPath
+			if !legacy && app.ControlRepoPath != "" {
+				siding.WorktreeRepoPath = app.ControlRepoPath
+			}
+			changed = true
+		}
+		if siding.MaterializationPhase == "" {
+			if legacy {
+				siding.MaterializationPhase = PhaseGuest
+			} else {
+				siding.MaterializationPhase = PhaseWorktree
+			}
+			changed = true
+		}
+		app.Sidings[name] = siding
+	}
+	return changed
 }

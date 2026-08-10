@@ -6,6 +6,7 @@ package caddy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,22 @@ import (
 type Admin struct {
 	base string
 	http *http.Client
+}
+
+type ResponseError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Body       string
+}
+
+func (e *ResponseError) Error() string {
+	return fmt.Sprintf("%s %s: caddy admin returned %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+func IsNotFound(err error) bool {
+	var response *ResponseError
+	return errors.As(err, &response) && response.StatusCode == http.StatusNotFound
 }
 
 // NewAdmin returns an admin client pointed at the current channel's admin port.
@@ -41,6 +58,10 @@ func (a *Admin) Load(ctx context.Context, configJSON []byte) error {
 // GetConfig returns the full live config (GET /config/).
 func (a *Admin) GetConfig(ctx context.Context) ([]byte, error) {
 	return a.read(ctx, http.MethodGet, "/config/", nil)
+}
+
+func (a *Admin) Get(ctx context.Context, path string) ([]byte, error) {
+	return a.read(ctx, http.MethodGet, path, nil)
 }
 
 // GetID returns the config object tagged with the given @id (GET /id/<id>).
@@ -72,6 +93,14 @@ func (a *Admin) Delete(ctx context.Context, path string) error {
 	return a.do(ctx, http.MethodDelete, path, nil)
 }
 
+func (a *Admin) DeleteIfExists(ctx context.Context, path string) error {
+	err := a.Delete(ctx, path)
+	if IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
 func (a *Admin) do(ctx context.Context, method, path string, body []byte) error {
 	_, err := a.read(ctx, method, path, body)
 	return err
@@ -96,7 +125,7 @@ func (a *Admin) read(ctx context.Context, method, path string, body []byte) ([]b
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s %s: caddy admin returned %d: %s", method, path, resp.StatusCode, bytes.TrimSpace(data))
+		return nil, &ResponseError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: string(bytes.TrimSpace(data))}
 	}
 	return data, nil
 }

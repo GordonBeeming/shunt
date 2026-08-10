@@ -14,10 +14,25 @@ import (
 
 const operationLockName = ".shunt-operation.lock"
 
+// EnsureNoRemovalInProgress prevents lifecycle work from racing a resumable
+// removal after it has published any destructive checkpoint. Callers load state
+// after acquiring their project and siding locks before invoking it.
+func EnsureNoRemovalInProgress(app state.App, operation string) error {
+	if app.Removal == nil {
+		return nil
+	}
+	return fmt.Errorf("%s is blocked while siding %q removal is at stage %q", operation, app.Removal.Siding, app.Removal.Stage)
+}
+
+func isCommittedStatePublication(err error) bool {
+	var committed *state.CommittedDurabilityError
+	return errors.As(err, &committed)
+}
+
 // Lock order is project, siding, then state. Siding lifecycle work holds a
 // shared project lock, so different sidings can run together while app config,
 // routing, and data-baseline changes take the project lock exclusively. The
-// state lock is only held while reloading, merging, and writing state.json.
+// state lock is only held while reloading, merging, and writing state-v2.json.
 
 // WithProjectOperation serializes routing, app configuration, and data-baseline
 // changes for one project.

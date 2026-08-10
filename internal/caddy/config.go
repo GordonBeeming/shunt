@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/proc"
@@ -206,6 +207,91 @@ func EnsureFrontDoor(ctx context.Context, a *Admin, app state.App) error {
 		}
 	}
 	return nil
+}
+
+type RouteSnapshot struct {
+	Entries []RouteSnapshotEntry
+}
+
+type RouteSnapshotEntry struct {
+	Path   string
+	Body   json.RawMessage
+	Exists bool
+}
+
+func SnapshotRoutes(ctx context.Context, a *Admin, appName string, routes []state.Route) (RouteSnapshot, error) {
+	raw, err := a.GetConfig(ctx)
+	if err != nil {
+		return RouteSnapshot{}, fmt.Errorf("read Caddy config before app registration: %w", err)
+	}
+	var configDoc struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]json.RawMessage `json:"servers"`
+			} `json:"http"`
+			Layer4 struct {
+				Servers map[string]json.RawMessage `json:"servers"`
+			} `json:"layer4"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(raw, &configDoc); err != nil {
+		return RouteSnapshot{}, fmt.Errorf("decode Caddy config before app registration: %w", err)
+	}
+	byPath := make(map[string]RouteSnapshotEntry, len(routes))
+	for _, route := range routes {
+		path, _, err := ServerForRoute(appName, route, false)
+		if err != nil {
+			return RouteSnapshot{}, err
+		}
+		if _, seen := byPath[path]; seen {
+			continue
+		}
+		var body json.RawMessage
+		switch route.Kind {
+		case state.KindHTTP:
+			body = configDoc.Apps.HTTP.Servers[ServerName(appName, route.Key)]
+		case state.KindLayer4:
+			body = configDoc.Apps.Layer4.Servers[ServerName(appName, route.Key)]
+		}
+		byPath[path] = RouteSnapshotEntry{Path: path, Body: append(json.RawMessage(nil), body...), Exists: len(body) > 0}
+	}
+	paths := make([]string, 0, len(byPath))
+	for path := range byPath {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	snapshot := RouteSnapshot{Entries: make([]RouteSnapshotEntry, 0, len(paths))}
+	for _, path := range paths {
+		snapshot.Entries = append(snapshot.Entries, byPath[path])
+	}
+	return snapshot, nil
+}
+
+func (snapshot RouteSnapshot) Contains(path string) bool {
+	for _, entry := range snapshot.Entries {
+		if entry.Path == path {
+			return entry.Exists
+		}
+	}
+	return false
+}
+
+func RestoreRoutes(ctx context.Context, a *Admin, snapshot RouteSnapshot) error {
+	var restoreErrs []error
+	for _, entry := range snapshot.Entries {
+		if err := a.DeleteIfExists(ctx, entry.Path); err != nil {
+			restoreErrs = append(restoreErrs, fmt.Errorf("clear affected Caddy route %s: %w", entry.Path, err))
+		}
+	}
+	for _, entry := range snapshot.Entries {
+		if !entry.Exists {
+			continue
+		}
+		if err := a.Put(ctx, entry.Path, entry.Body); err != nil {
+			restoreErrs = append(restoreErrs, fmt.Errorf("restore affected Caddy route %s: %w", entry.Path, err))
+		}
+	}
+	return errors.Join(restoreErrs...)
 }
 
 // RemoveFrontDoor deletes every one of the app's front-door Caddy servers,

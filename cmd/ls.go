@@ -14,25 +14,31 @@ import (
 )
 
 type lsSiding struct {
-	Name      string `json:"name"`
-	Live      bool   `json:"live"`
-	Status    string `json:"status"` // live / up / idle / stopped (see sidingStatus)
-	Guest     string `json:"guest"`
-	IP        string `json:"ip,omitempty"`
-	Dashboard string `json:"dashboard,omitempty"`
-	Src       string `json:"src,omitempty"`
+	Name          string `json:"name"`
+	Live          bool   `json:"live"`
+	Status        string `json:"status"` // Deprecated compatibility: live / up / idle / stopped.
+	Guest         string `json:"guest"`  // Deprecated compatibility: running / stopped.
+	Phase         string `json:"phase"`
+	Runtime       string `json:"runtime"`
+	RuntimeDetail string `json:"runtimeDetail,omitempty"`
+	IP            string `json:"ip,omitempty"`
+	Dashboard     string `json:"dashboard,omitempty"`
+	Src           string `json:"src,omitempty"`
 }
 
 type lsApp struct {
-	Name    string     `json:"name"`
-	Sidings []lsSiding `json:"sidings"`
+	SchemaVersion int        `json:"schemaVersion"`
+	Name          string     `json:"name"`
+	Sidings       []lsSiding `json:"sidings"`
 }
+
+const lsSchemaVersion = 2
 
 func newLsCmd() *cobra.Command {
 	var all, asJSON bool
 	c := &cobra.Command{
 		Use:   "ls",
-		Short: "List sidings for the current project (use -a for every project on the host)",
+		Short: "List sidings for the current project (use -a for every registered project)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			reg, err := state.LoadRegistry()
@@ -70,25 +76,17 @@ func newLsCmd() *cobra.Command {
 			}
 
 			apps := make([]lsApp, 0, len(names))
+			var runtimeObservation *container.RuntimeObservation
 			for _, n := range names {
 				app, err := state.LoadApp(reg.Projects[n])
 				if err != nil {
-					apps = append(apps, lsApp{Name: n})
+					apps = append(apps, lsApp{SchemaVersion: lsSchemaVersion, Name: n})
 					continue
 				}
-				la := lsApp{Name: app.Name, Sidings: []lsSiding{}}
-				// The host (your local copy) is a switch target too — list it first.
-				hostLive := app.LiveSiding == state.HostTarget
-				hostStatus := "-"
-				if hostLive {
-					hostStatus = "live"
+				la := lsApp{SchemaVersion: lsSchemaVersion, Name: app.Name, Sidings: []lsSiding{}}
+				if app.LiveSiding == state.HostTarget {
+					app.LiveSiding = ""
 				}
-				la.Sidings = append(la.Sidings, lsSiding{
-					Name:   state.HostTarget,
-					Live:   hostLive,
-					Status: hostStatus,
-					Guest:  "local",
-				})
 				sidingNames := make([]string, 0, len(app.Sidings))
 				for sn := range app.Sidings {
 					sidingNames = append(sidingNames, sn)
@@ -96,22 +94,35 @@ func newLsCmd() *cobra.Command {
 				sort.Strings(sidingNames)
 				for _, sn := range sidingNames {
 					s := app.Sidings[sn]
-					guestState, err := container.State(ctx, s.Container)
-					if err != nil {
-						guestState = "-"
+					phase := effectiveLsPhase(s)
+					system := container.RuntimeObservation{State: container.RuntimeRunning}
+					guest := container.GuestObservation{State: container.GuestAbsent}
+					if phase == state.PhaseGuest {
+						if runtimeObservation == nil {
+							observed := container.ObserveSystem(ctx)
+							runtimeObservation = &observed
+						}
+						system = *runtimeObservation
+						if system.State == container.RuntimeRunning {
+							guest = container.ObserveGuest(ctx, s.Container)
+						}
 					}
+					runtime, runtimeDetail, guestState := classifyLsRuntime(phase, system, guest)
 					src, _, err := siding.Paths(app, sn)
 					if err != nil {
 						return err
 					}
 					la.Sidings = append(la.Sidings, lsSiding{
-						Name:      sn,
-						Live:      app.LiveSiding == sn,
-						Status:    sidingStatus(app, sn, s, guestState),
-						Guest:     guestState,
-						IP:        s.LastIP,
-						Dashboard: siding.DashboardURL(app, s),
-						Src:       src,
+						Name:          sn,
+						Live:          app.LiveSiding == sn,
+						Status:        compatibilityLsStatus(app, sn, s, guestState),
+						Guest:         guestState,
+						Phase:         string(phase),
+						Runtime:       runtime,
+						RuntimeDetail: runtimeDetail,
+						IP:            s.LastIP,
+						Dashboard:     siding.DashboardURL(app, s),
+						Src:           src,
 					})
 				}
 				apps = append(apps, la)
@@ -138,7 +149,49 @@ func newLsCmd() *cobra.Command {
 			return w.Flush()
 		},
 	}
-	c.Flags().BoolVarP(&all, "all", "a", false, "list sidings for every project on the host, not just the current one")
+	c.Flags().BoolVarP(&all, "all", "a", false, "list sidings for every registered project, not just the current one")
 	c.Flags().BoolVar(&asJSON, "json", false, "machine-readable output")
 	return c
+}
+
+func classifyLsRuntime(phase state.MaterializationPhase, system container.RuntimeObservation, guest container.GuestObservation) (runtime, detail, legacyGuest string) {
+	if phase != state.PhaseGuest {
+		return "missing", "no guest is materialized for this phase", "stopped"
+	}
+	switch system.State {
+	case container.RuntimeStopped:
+		return "stopped", system.Detail, "stopped"
+	case container.RuntimeUnavailable:
+		return "runtime-unavailable", system.Detail, "stopped"
+	}
+	switch guest.State {
+	case container.GuestRunning:
+		return "running", "", "running"
+	case container.GuestStopped:
+		return "stopped", "", "stopped"
+	case container.GuestAbsent:
+		return "missing", "guest is not materialized", "stopped"
+	default:
+		return "runtime-unavailable", "guest inspection unavailable", "stopped"
+	}
+}
+
+func effectiveLsPhase(s state.Siding) state.MaterializationPhase {
+	if s.MaterializationPhase == "" {
+		return state.PhaseGuest
+	}
+	return s.MaterializationPhase
+}
+
+func compatibilityLsStatus(app state.App, name string, sd state.Siding, guest string) string {
+	if app.LiveSiding == name {
+		return "live"
+	}
+	if sd.Stopped {
+		return "stopped"
+	}
+	if guest == "running" && len(sd.Bridges) > 0 {
+		return "up"
+	}
+	return "idle"
 }

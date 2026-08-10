@@ -48,6 +48,109 @@ func TestPromotePublishesImmutableGenerationAndMetadata(t *testing.T) {
 	}
 }
 
+func TestPromoteOperationRetryReturnsOriginalGeneration(t *testing.T) {
+	m, source := testManager(t, "db")
+	writeVolume(t, source, "db", "first")
+	first, err := m.PromoteOperation(context.Background(), "remove-123", "last", source)
+	if err != nil || !first.Committed || first.GenerationID == "" {
+		t.Fatalf("first PromoteOperation() = %#v, %v", first, err)
+	}
+	writeVolume(t, source, "db", "changed")
+	retry, err := m.PromoteOperation(context.Background(), "remove-123", "last", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.GenerationID != first.GenerationID || retry.OperationID != "remove-123" {
+		t.Fatalf("retry = %#v, first = %#v", retry, first)
+	}
+	state := readState(t, m)
+	if state.Current != first.GenerationID || state.Operations["remove-123"] != first.GenerationID {
+		t.Fatalf("state = %#v", state)
+	}
+	assertVolume(t, m.generationRoot(first.GenerationID), "db", "first")
+}
+
+func TestPromoteOperationRetryAfterUnconfirmedDurabilityDoesNotRepublish(t *testing.T) {
+	m, source := testManager(t, "db")
+	writeVolume(t, source, "db", "first")
+	originalSyncDir := m.syncDir
+	m.syncDir = func(path string) error {
+		if path == m.ConfigDir {
+			return errors.New("injected directory sync failure")
+		}
+		return originalSyncDir(path)
+	}
+	first, err := m.PromoteOperation(context.Background(), "remove-durable", "last", source)
+	var durability *CommittedDurabilityError
+	if !first.Committed || first.GenerationID == "" || !errors.As(err, &durability) {
+		t.Fatalf("first PromoteOperation() = %#v, %v", first, err)
+	}
+	m.syncDir = originalSyncDir
+	writeVolume(t, source, "db", "changed")
+	retry, err := m.PromoteOperation(context.Background(), "remove-durable", "last", source)
+	if err != nil || retry.GenerationID != first.GenerationID {
+		t.Fatalf("retry PromoteOperation() = %#v, %v", retry, err)
+	}
+	assertVolume(t, m.generationRoot(first.GenerationID), "db", "first")
+}
+
+func TestForgetOperationReleasesUnreferencedGeneration(t *testing.T) {
+	m, source := testManager(t, "db")
+	writeVolume(t, source, "db", "operation")
+	operation, err := m.PromoteOperation(context.Background(), "remove-old", "last", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"next", "current"} {
+		writeVolume(t, source, "db", value)
+		if _, err := m.Promote(context.Background(), value, source); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(m.generationRoot(operation.GenerationID)); err != nil {
+		t.Fatalf("operation generation was not retained: %v", err)
+	}
+	result, err := m.ForgetOperation(context.Background(), "remove-old")
+	if err != nil || !result.Committed {
+		t.Fatalf("ForgetOperation() = %#v, %v", result, err)
+	}
+	if _, err := os.Stat(m.generationRoot(operation.GenerationID)); !os.IsNotExist(err) {
+		t.Fatalf("forgotten operation generation remains: %v", err)
+	}
+}
+
+func TestForgetOperationRetryAfterUnconfirmedDurabilityDoesNotRepublish(t *testing.T) {
+	m, source := testManager(t, "db")
+	writeVolume(t, source, "db", "protected")
+	operation, err := m.PromoteOperation(context.Background(), "remove-durable", "last", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSyncDir := m.syncDir
+	m.syncDir = func(path string) error {
+		if path == m.ConfigDir {
+			return errors.New("injected state directory sync failure")
+		}
+		return originalSyncDir(path)
+	}
+	first, err := m.ForgetOperation(context.Background(), "remove-durable")
+	var durability *CommittedDurabilityError
+	if !first.Committed || first.GenerationID != operation.GenerationID || !errors.As(err, &durability) {
+		t.Fatalf("first ForgetOperation() = %#v, %v", first, err)
+	}
+	if _, exists := readState(t, m).Operations["remove-durable"]; exists {
+		t.Fatal("committed operation remains in the visible manifest")
+	}
+	m.syncDir = originalSyncDir
+	retry, err := m.ForgetOperation(context.Background(), "remove-durable")
+	if err != nil || !retry.Committed || retry.OperationID != "remove-durable" {
+		t.Fatalf("retry ForgetOperation() = %#v, %v", retry, err)
+	}
+	if got := generationEntries(t, m); !reflect.DeepEqual(got, []string{operation.GenerationID}) {
+		t.Fatalf("generations after retry = %v, want current generation", got)
+	}
+}
+
 func TestPromoteDurabilityFailureBeforeInstallDoesNotCommit(t *testing.T) {
 	m, source := testManager(t, "db")
 	writeVolume(t, source, "db", "one")
@@ -233,6 +336,90 @@ func TestResetClonesInitializedEmptyGeneration(t *testing.T) {
 	}
 }
 
+func TestVersionOneManifestMigratesThroughResetAndPromotion(t *testing.T) {
+	m, source := testManager(t, "db")
+	legacyGeneration := generationPrefix + "legacy"
+	writeVolume(t, m.generationRoot(legacyGeneration), "db", "legacy")
+	if err := writeMetadata(m.generationRoot(legacyGeneration), Metadata{SourceSiding: "legacy", Timestamp: time.Now().UTC(), Volumes: []string{"db"}}); err != nil {
+		t.Fatal(err)
+	}
+	legacyState := struct {
+		Version int    `json:"version"`
+		Current string `json:"current"`
+	}{Version: 1, Current: legacyGeneration}
+	contents, err := json.MarshalIndent(legacyState, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(m.statePath(), append(contents, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	initialized, err := m.Initialized(context.Background())
+	if err != nil || !initialized {
+		t.Fatalf("Initialized() = %t, %v", initialized, err)
+	}
+	destination := filepath.Join(m.ConfigDir, "migrated", "vol")
+	result, err := m.ResetVolumeRoot(context.Background(), destination)
+	if err != nil || !result.Committed {
+		t.Fatalf("ResetVolumeRoot() = %#v, %v", result, err)
+	}
+	assertVolume(t, destination, "db", "legacy")
+
+	writeVolume(t, source, "db", "current")
+	result, err = m.PromoteOperation(context.Background(), "remove-migrated", "migrated", source)
+	if err != nil || !result.Committed {
+		t.Fatalf("PromoteOperation() = %#v, %v", result, err)
+	}
+	migrated := readState(t, m)
+	if migrated.Version != stateVersion || migrated.Previous != legacyGeneration || migrated.Operations["remove-migrated"] != migrated.Current {
+		t.Fatalf("migrated state = %#v", migrated)
+	}
+	assertVolume(t, m.generationRoot(migrated.Previous), "db", "legacy")
+	assertVolume(t, m.generationRoot(migrated.Current), "db", "current")
+}
+
+func TestVersionTwoManifestRejectsMalformedOperationMaps(t *testing.T) {
+	tests := []struct {
+		name       string
+		operations map[string]string
+		want       string
+	}{
+		{name: "empty operation ID", operations: map[string]string{"": generationPrefix + "current"}, want: "operation ID cannot be empty"},
+		{name: "unsafe operation ID", operations: map[string]string{"../remove": generationPrefix + "current"}, want: "unsafe operation identifier"},
+		{name: "empty generation", operations: map[string]string{"remove-one": ""}, want: "invalid generation for operation"},
+		{name: "unsafe generation", operations: map[string]string{"remove-one": "../generation"}, want: "invalid generation for operation"},
+		{name: "missing generation", operations: map[string]string{"remove-one": generationPrefix + "missing"}, want: "operation \"remove-one\" baseline generation"},
+		{name: "metadata operation mismatch", operations: map[string]string{"remove-one": generationPrefix + "current"}, want: "records operation"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m, _ := testManager(t, "db")
+			current := generationPrefix + "current"
+			writeVolume(t, m.generationRoot(current), "db", "current")
+			if err := writeMetadata(m.generationRoot(current), Metadata{SourceSiding: "fixture", Timestamp: time.Now().UTC(), Volumes: []string{"db"}}); err != nil {
+				t.Fatal(err)
+			}
+			manifest := stateManifest{Version: stateVersion, Current: current, Operations: test.operations}
+			contents, err := json.MarshalIndent(manifest, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(m.statePath(), append(contents, '\n'), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			before := snapshotBytes(t, m.ConfigDir)
+			if _, err := m.Initialized(context.Background()); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Initialized() error = %v, want %q", err, test.want)
+			}
+			if after := snapshotBytes(t, m.ConfigDir); !reflect.DeepEqual(after, before) {
+				t.Fatalf("malformed manifest was mutated:\nbefore=%v\nafter=%v", before, after)
+			}
+		})
+	}
+}
+
 func TestPromoteCaptureFailurePreservesCurrent(t *testing.T) {
 	m, source := testManager(t, "db", "cache")
 	writeVolume(t, source, "db", "stable")
@@ -253,7 +440,7 @@ func TestPromoteCaptureFailurePreservesCurrent(t *testing.T) {
 	if err == nil || result.Committed {
 		t.Fatalf("Promote() = %#v, %v", result, err)
 	}
-	if got := readState(t, m); got != stable {
+	if got := readState(t, m); !reflect.DeepEqual(got, stable) {
 		t.Fatalf("state changed = %#v, want %#v", got, stable)
 	}
 	assertVolume(t, m.generationRoot(stable.Current), "db", "stable")

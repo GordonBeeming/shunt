@@ -15,7 +15,7 @@ var sidingNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 // branch suffix, and container-name component.
 func ValidateName(name string) error {
 	if name == state.HostTarget {
-		return fmt.Errorf("%q is reserved for the host switch target", name)
+		return fmt.Errorf("%q is reserved for legacy state migration", name)
 	}
 	if !sidingNamePattern.MatchString(name) {
 		return fmt.Errorf("invalid siding name %q: use letters, numbers, dots, underscores, or hyphens, starting with a letter or number", name)

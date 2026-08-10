@@ -17,8 +17,9 @@ func TestStopPersistsForcedGuestState(t *testing.T) {
 	app := state.App{
 		ConfigDir:  configDir,
 		LiveSiding: "alpha",
+		Volumes:    []string{"db"},
 		Sidings: map[string]state.Siding{
-			"alpha": {Name: "alpha", Container: "guest", LastIP: "10.0.0.1", Bridges: map[string]int{"web": 5000}},
+			"alpha": {Name: "alpha", Container: "guest", MaterializationPhase: state.PhaseGuest, LastIP: "10.0.0.1", Bridges: map[string]int{"web": 5000}},
 		},
 	}
 	if err := state.SaveApp(app); err != nil {
@@ -28,14 +29,14 @@ func TestStopPersistsForcedGuestState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Forced || !result.WasLive || !result.Siding.Stopped || result.Siding.LastIP != "" || result.Siding.Bridges != nil {
+	if !result.Forced || !result.WasLive || !result.Siding.Stopped || result.Siding.MaterializationPhase != state.PhaseData || result.Siding.LastIP != "" || result.Siding.Bridges != nil {
 		t.Fatalf("Stop() result = %#v", result)
 	}
 	loaded, err := state.LoadApp(configDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !loaded.Sidings["alpha"].Stopped || loaded.Sidings["alpha"].LastIP != "" {
+	if !loaded.Sidings["alpha"].Stopped || loaded.Sidings["alpha"].MaterializationPhase != state.PhaseData || loaded.Sidings["alpha"].LastIP != "" {
 		t.Fatalf("saved stop state = %#v", loaded.Sidings["alpha"])
 	}
 }

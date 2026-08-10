@@ -66,20 +66,16 @@ func newActiveCmd() *cobra.Command {
 			res.Active = true
 			res.ConfigDir = app.ConfigDir
 			res.RepoPath = app.RepoPath
-			// The host (local copy) is a switch target too.
-			res.Sidings = append(res.Sidings, activeSiding{
-				Name: state.HostTarget,
-				Live: app.LiveSiding == state.HostTarget,
-				Src:  app.RepoPath,
-			})
 			for name, s := range app.Sidings {
 				src, _, err := siding.Paths(app, name)
 				if err != nil {
 					return err
 				}
 				guestUp := false
-				if st, err := container.State(ctx, s.Container); err == nil {
-					guestUp = st == "running"
+				if s.MaterializationPhase == state.PhaseGuest || s.MaterializationPhase == "" {
+					if st, err := container.State(ctx, s.Container); err == nil {
+						guestUp = st == "running"
+					}
 				}
 				// Reliable across runners: the log marker is Aspire-only (and even
 				// some Aspire apps never emit it), so reuse the shared helper.

@@ -45,6 +45,38 @@ func TestParseCleanupSelection(t *testing.T) {
 	}
 }
 
+func TestOrderBaseLast(t *testing.T) {
+	got := orderBaseLast([]string{"base", "alpha", "beta"}, "base")
+	want := []string{"alpha", "beta", "base"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("orderBaseLast() = %v, want %v", got, want)
+	}
+}
+
+func TestValidateFinalVolumeSet(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vol")
+	worktree := state.Siding{Name: "one", MaterializationPhase: state.PhaseWorktree}
+	if promote, err := validateFinalVolumeSet(worktree, root, []string{"db"}); err != nil || promote {
+		t.Fatalf("absent worktree data = %v, %v", promote, err)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateFinalVolumeSet(worktree, root, []string{"db"}); err == nil {
+		t.Fatal("worktree-only siding accepted unexpected data root")
+	}
+	if err := os.MkdirAll(filepath.Join(root, "db"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := state.Siding{Name: "one", MaterializationPhase: state.PhaseData}
+	if promote, err := validateFinalVolumeSet(data, root, []string{"db"}); err != nil || !promote {
+		t.Fatalf("complete data phase = %v, %v", promote, err)
+	}
+	if _, err := validateFinalVolumeSet(data, root, []string{"db", "cache"}); err == nil {
+		t.Fatal("partial data phase accepted")
+	}
+}
+
 func TestPickCleanupByNumberShowsDirtyStateAndSelectsSeveral(t *testing.T) {
 	candidates := []cleanupCandidate{
 		{Name: "alpha", Status: "idle"},

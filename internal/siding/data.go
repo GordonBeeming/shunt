@@ -227,9 +227,15 @@ func PromoteData(ctx context.Context, app state.App, name string, progress io.Wr
 		if err != nil {
 			return err
 		}
+		if err := EnsureNoRemovalInProgress(current, "promote data"); err != nil {
+			return err
+		}
 		sd, ok := current.Sidings[name]
 		if !ok {
 			return fmt.Errorf("no siding %q", name)
+		}
+		if err := RequireGuest(sd); err != nil {
+			return err
 		}
 		manager, err := databaseline.New(current.ConfigDir, current.Volumes)
 		if err != nil {
@@ -255,6 +261,9 @@ func RollbackData(ctx context.Context, app state.App) (databaseline.Result, erro
 	err := WithProjectOperation(ctx, app.ConfigDir, func() error {
 		current, err := state.LoadApp(app.ConfigDir)
 		if err != nil {
+			return err
+		}
+		if err := EnsureNoRemovalInProgress(current, "roll back data"); err != nil {
 			return err
 		}
 		manager, err := databaseline.New(current.ConfigDir, current.Volumes)

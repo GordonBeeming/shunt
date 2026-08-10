@@ -32,9 +32,15 @@ func Stop(ctx context.Context, app state.App, name string) (StopResult, error) {
 		if err != nil {
 			return err
 		}
+		if err := EnsureNoRemovalInProgress(current, "stop"); err != nil {
+			return err
+		}
 		sd, ok := current.Sidings[name]
 		if !ok {
 			return fmt.Errorf("no siding %q", name)
+		}
+		if err := RequireGuest(sd); err != nil {
+			return err
 		}
 		result.WasLive = current.LiveSiding == name
 		result.Forced, err = stopOrForce(ctx, sd.Container)
@@ -47,6 +53,9 @@ func Stop(ctx context.Context, app state.App, name string) (StopResult, error) {
 		// metadata that can only describe the stopped guest.
 		sd.Bridges = nil
 		sd.LastIP = ""
+		if result.Forced {
+			sd.MaterializationPhase = state.PhaseData
+		}
 		result.Siding = sd
 		if _, err := mergeStoppedState(ctx, current.ConfigDir, sd, false); err != nil {
 			return fmt.Errorf("guest stopped, but siding state could not be saved: %w", err)

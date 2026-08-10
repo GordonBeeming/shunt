@@ -37,6 +37,9 @@ func newSyncCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := ensureNoRemovalInProgress(app, "sync"); err != nil {
+				return err
+			}
 			names, err := syncTargets(ctx, app, loc, args, all)
 			if err != nil {
 				return err
@@ -54,7 +57,7 @@ func newSyncCmd() *cobra.Command {
 				wg.Add(1)
 				go func(i int, name string) {
 					defer wg.Done()
-					outcomes[i] = syncSiding(ctx, app, name, from, rebase)
+					outcomes[i] = syncSiding(ctx, app.ConfigDir, name, from, rebase)
 				}(i, name)
 			}
 			wg.Wait()
@@ -137,7 +140,7 @@ func syncTargets(ctx context.Context, app state.App, loc resolve.Location, args 
 	}
 	if name == "" {
 		var err error
-		if name, err = pickSiding(ctx, app, false); err != nil {
+		if name, err = pickSiding(ctx, app); err != nil {
 			return nil, err
 		}
 	}
@@ -172,11 +175,26 @@ type syncOutcome struct {
 // non-destructive — a rebase rewrites the siding's (often already-pushed) commits.
 // Conflicts are reported, not auto-resolved, so the caller can hand off to
 // `shunt git` in the worktree.
-func syncSiding(ctx context.Context, app state.App, name, fromOverride string, rebase bool) syncOutcome {
-	src, _, err := siding.Paths(app, name)
+func syncSiding(ctx context.Context, configDir, name, fromOverride string, rebase bool) syncOutcome {
+	out := syncOutcome{name: name}
+	err := withLatestSiding(ctx, configDir, name, "sync", func(app state.App, _ state.Siding) error {
+		src, _, err := siding.Paths(app, name)
+		if err != nil {
+			return err
+		}
+		out = syncSidingLocked(ctx, app, name, src, fromOverride, rebase)
+		return out.err
+	})
 	if err != nil {
-		return syncOutcome{name: name, kind: syncError, err: err}
+		if out.kind == syncConflict {
+			return out
+		}
+		out.kind, out.err = syncError, err
 	}
+	return out
+}
+
+func syncSidingLocked(ctx context.Context, app state.App, name, src, fromOverride string, rebase bool) syncOutcome {
 	base := defaultBranch(ctx, src, fromOverride)
 	target := "origin/" + base
 	out := syncOutcome{name: name, src: src, base: base}

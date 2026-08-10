@@ -11,6 +11,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/resolve"
+	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/gordonbeeming/shunt/internal/ui"
 )
@@ -27,6 +28,9 @@ func loadCurrentApp() (state.App, resolve.Location, error) {
 			return state.App{}, loc, fmt.Errorf("no shunt app registered for %q — run `"+bin()+" app add` in the repo", loc.Project)
 		}
 		return state.App{}, loc, err
+	}
+	if app.LiveSiding == state.HostTarget {
+		app.LiveSiding = ""
 	}
 	return app, loc, nil
 }
@@ -85,9 +89,17 @@ func printFrontDoor(app state.App, sd state.Siding) {
 // guestState is the raw container.State string ("running", "stopped", …), or "" when unknown.
 func sidingStatus(app state.App, name string, sd state.Siding, guestState string) string {
 	switch {
+	case sd.MaterializationPhase == state.PhaseWorktree:
+		return "worktree"
+	case sd.MaterializationPhase == state.PhaseData:
+		return "data"
+	case sd.MaterializationPhase == state.PhaseParked:
+		return "parked"
 	case app.LiveSiding == name:
 		return "live"
-	case sd.Stopped:
+	case guestState == "unavailable":
+		return "unavailable"
+	case guestState == "stopped" || sd.Stopped:
 		return "stopped"
 	case guestState == "running" && len(sd.Bridges) > 0:
 		return "up"
@@ -120,5 +132,27 @@ func sidingArgWithReader(ctx context.Context, app state.App, args []string, in *
 	if len(args) > 0 {
 		return args[0], nil
 	}
-	return pickSidingWithReader(ctx, app, false, in) // guest ops (up/restart/kill/logs) — host isn't a target
+	return pickSidingWithReader(ctx, app, in)
+}
+
+// withLatestSiding reloads the target after its lock is held, so a removal
+// journal published after target selection still blocks the command.
+func withLatestSiding(ctx context.Context, configDir, name, operation string, run func(state.App, state.Siding) error) error {
+	if run == nil {
+		return errors.New("siding operation is required")
+	}
+	return siding.WithSidingOperation(ctx, configDir, name, func() error {
+		app, err := state.LoadApp(configDir)
+		if err != nil {
+			return err
+		}
+		if err := siding.EnsureNoRemovalInProgress(app, operation); err != nil {
+			return err
+		}
+		sd, ok := app.Sidings[name]
+		if !ok {
+			return fmt.Errorf("no siding %q", name)
+		}
+		return run(app, sd)
+	})
 }

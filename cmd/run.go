@@ -1,15 +1,19 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/proc"
+	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
+
+var runGuestCommand = proc.RunPassthrough
 
 // isSiding reports whether name is one of the app's sidings (so `run` can tell a
 // leading siding name from the first word of a command).
@@ -46,6 +50,9 @@ func newRunCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := ensureNoRemovalInProgress(app, "run"); err != nil {
+				return err
+			}
 			// Resolve the siding the way the cwd implies: if you're inside a siding's
 			// worktree, that's the one (every arg is the command); otherwise a leading
 			// arg that names a siding wins; otherwise fall back to the live siding.
@@ -60,40 +67,38 @@ func newRunCmd() *cobra.Command {
 			case app.LiveSiding != "" && app.LiveSiding != state.HostTarget:
 				name = app.LiveSiding
 			default:
-				if name, err = pickSiding(ctx, app, false); err != nil { // run needs a guest, not the host
+				if name, err = pickSiding(ctx, app); err != nil {
 					return err
 				}
 			}
-			sd, ok := app.Sidings[name]
-			if !ok {
-				return fmt.Errorf("no siding %q — `%s ls`", name, bin())
-			}
-			if !explicit && loc.Siding == "" {
-				fmt.Fprintf(os.Stderr, "• in siding %q\n", name) // say where it ran, since it wasn't named
-			}
-			wd := "/workspace"
-			if app.Workdir != "" {
-				wd = "/workspace/" + app.Workdir
-			}
-			// Pass the workdir + command as positional params to sh so each argument
-			// keeps its exact boundaries/quoting (flattening with strings.Join would
-			// mangle spaces, quotes, and flags). `exec -i` passes stdin through.
-			// Allocate a pseudo-TTY when stdin is a real terminal, so interactive
-			// guest commands work — a shell's line editing, and CLIs that show a
-			// selection prompt (e.g. `aspire stop` with several AppHosts) which
-			// otherwise fail with "the current terminal isn't interactive".
-			execArgs := []string{"exec", "-i"}
-			if term.IsTerminal(int(os.Stdin.Fd())) {
-				execArgs = append(execArgs, "-t")
-			}
-			execArgs = append(execArgs, sd.Container, "sh", "-c")
-			if len(rest) > 0 {
-				execArgs = append(execArgs, `cd "$1" && shift && exec "$@"`, "sh", wd)
-				execArgs = append(execArgs, rest...)
-			} else {
-				execArgs = append(execArgs, `cd "$1" && exec "${SHELL:-bash}"`, "sh", wd) // bare run → interactive shell
-			}
-			return proc.RunPassthrough(ctx, container.Bin, execArgs...)
+			return runInSiding(ctx, app.ConfigDir, name, rest, !explicit && loc.Siding == "")
 		},
 	}
+}
+
+func runInSiding(ctx context.Context, configDir, name string, command []string, announce bool) error {
+	return withLatestSiding(ctx, configDir, name, "run", func(app state.App, sd state.Siding) error {
+		if err := siding.RequireGuest(sd); err != nil {
+			return err
+		}
+		if announce {
+			fmt.Fprintf(os.Stderr, "• in siding %q\n", name)
+		}
+		wd := "/workspace"
+		if app.Workdir != "" {
+			wd = "/workspace/" + app.Workdir
+		}
+		execArgs := []string{"exec", "-i"}
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			execArgs = append(execArgs, "-t")
+		}
+		execArgs = append(execArgs, sd.Container, "sh", "-c")
+		if len(command) > 0 {
+			execArgs = append(execArgs, `cd "$1" && shift && exec "$@"`, "sh", wd)
+			execArgs = append(execArgs, command...)
+		} else {
+			execArgs = append(execArgs, `cd "$1" && exec "${SHELL:-bash}"`, "sh", wd)
+		}
+		return runGuestCommand(ctx, container.Bin, execArgs...)
+	})
 }

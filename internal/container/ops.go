@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -86,9 +87,103 @@ type inspectDoc struct {
 	} `json:"status"`
 }
 
+// GuestObservationState is the typed result of inspecting one named guest.
+// Callers must only treat GuestAbsent as proof that raw host data is safe to
+// use without an in-guest lifecycle.
+type GuestObservationState string
+
+const (
+	GuestRunning     GuestObservationState = "running"
+	GuestStopped     GuestObservationState = "stopped"
+	GuestAbsent      GuestObservationState = "absent"
+	GuestUnavailable GuestObservationState = "unavailable"
+)
+
+type GuestObservation struct {
+	State GuestObservationState
+}
+
+var (
+	observeGuestInspect       = inspect
+	postconditionObserveGuest = ObserveGuest
+	postconditionAttempts     = 20
+	postconditionPoll         = 50 * time.Millisecond
+)
+
+func waitGuestPostcondition(ctx context.Context, name, operation string, accepted func(GuestObservationState) bool) error {
+	var last GuestObservationState
+	for attempt := 0; attempt < postconditionAttempts; attempt++ {
+		last = postconditionObserveGuest(ctx, name).State
+		if accepted(last) {
+			return nil
+		}
+		if attempt+1 < postconditionAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(postconditionPoll):
+			}
+		}
+	}
+	return fmt.Errorf("container %s %s did not reach its exact postcondition (state=%s)", operation, name, last)
+}
+
+// ObserveGuest distinguishes a proven absent guest from an unavailable or
+// ambiguous runtime probe. Error-text interpretation remains contained at the
+// container boundary and is never exposed as a caller policy decision.
+func ObserveGuest(ctx context.Context, name string) GuestObservation {
+	doc, err := observeGuestInspect(ctx, name)
+	if err != nil {
+		var absent *guestNotFoundError
+		if errors.As(err, &absent) && absent.name == name {
+			return GuestObservation{State: GuestAbsent}
+		}
+		return GuestObservation{State: GuestUnavailable}
+	}
+	if strings.EqualFold(doc.Status.State, "running") {
+		return GuestObservation{State: GuestRunning}
+	}
+	if strings.EqualFold(doc.Status.State, "stopped") {
+		return GuestObservation{State: GuestStopped}
+	}
+	return GuestObservation{State: GuestUnavailable}
+}
+
+type guestNotFoundError struct {
+	name string
+	err  error
+}
+
+func (e *guestNotFoundError) Error() string { return fmt.Sprintf("container %s not found", e.name) }
+func (e *guestNotFoundError) Unwrap() error { return e.err }
+
+func inspectErrorNamesAbsentGuest(err error, name string) bool {
+	if err == nil || strings.TrimSpace(name) == "" {
+		return false
+	}
+	message, target := strings.ToLower(err.Error()), strings.ToLower(name)
+	patterns := []string{
+		"container " + target + " not found",
+		"container \"" + target + "\" not found",
+		"no such container: " + target,
+		"no such container " + target,
+		"container " + target + " does not exist",
+		"container \"" + target + "\" does not exist",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(message, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 func inspect(ctx context.Context, name string) (inspectDoc, error) {
 	res, err := proc.Run(ctx, Bin, "inspect", name)
 	if err != nil {
+		if inspectErrorNamesAbsentGuest(err, name) {
+			return inspectDoc{}, &guestNotFoundError{name: name, err: err}
+		}
 		return inspectDoc{}, fmt.Errorf("container inspect %s: %w", name, err)
 	}
 	var docs []inspectDoc
@@ -96,7 +191,7 @@ func inspect(ctx context.Context, name string) (inspectDoc, error) {
 		return inspectDoc{}, fmt.Errorf("parse inspect %s: %w", name, err)
 	}
 	if len(docs) == 0 {
-		return inspectDoc{}, fmt.Errorf("container %s not found", name)
+		return inspectDoc{}, &guestNotFoundError{name: name}
 	}
 	return docs[0], nil
 }
@@ -244,31 +339,30 @@ func Bridge(ctx context.Context, name, bindIP string, extPort, intPort int) erro
 	return fmt.Errorf("bridge port %d->127.0.0.1:%d never came up", extPort, intPort)
 }
 
-// isAbsentErr reports whether a `container` CLI error just means the guest isn't
-// there / isn't running — which Stop and Remove treat as success (the desired end
-// state already holds), so Recreate doesn't fail on a first-time guest.
-func isAbsentErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "not found") ||
-		strings.Contains(s, "no such") ||
-		strings.Contains(s, "not running") ||
-		strings.Contains(s, "not started") ||
-		strings.Contains(s, "does not exist")
-}
-
-// Stop stops a running guest (ignores "not running" / absent).
+// Stop stops a running guest. Mutation errors are accepted only when an exact
+// typed observation proves the named guest is already stopped or absent.
 func Stop(ctx context.Context, name string) error {
-	if _, err := proc.Run(ctx, Bin, "stop", name); err != nil {
-		if isAbsentErr(err) {
+	result, err := proc.Run(ctx, Bin, "stop", name)
+	if err != nil {
+		observation := ObserveGuest(ctx, name)
+		if observation.State == GuestStopped || observation.State == GuestAbsent {
 			return nil
 		}
-		return fmt.Errorf("container stop %s: %w", name, err)
+		return &stopCommandError{name: name, diagnostic: result.Stderr, err: err}
 	}
-	return nil
+	return waitGuestPostcondition(ctx, name, "stop", func(state GuestObservationState) bool {
+		return state == GuestStopped || state == GuestAbsent
+	})
 }
+
+type stopCommandError struct {
+	name       string
+	diagnostic string
+	err        error
+}
+
+func (e *stopCommandError) Error() string { return fmt.Sprintf("container stop %s: %v", e.name, e.err) }
+func (e *stopCommandError) Unwrap() error { return e.err }
 
 // StopOrForce stops a running guest gracefully, but escapes the one failure a
 // graceful stop can't clear: the guest's cgroup.kill wedging with errno 95, where
@@ -289,14 +383,18 @@ func StopOrForce(ctx context.Context, name string) (forced bool, err error) {
 	// Stop wraps its error as `container stop <name>: …`, so a bare match would also
 	// scan the container name and misfire the force-remove for any siding whose name
 	// contains "cgroup". cgroup.kill is the wedge's actual signature.
-	if !strings.Contains(strings.ToLower(serr.Error()), "cgroup.kill") {
+	var stopErr *stopCommandError
+	if !errors.As(serr, &stopErr) || !strings.Contains(strings.ToLower(stopErr.diagnostic), "cgroup.kill") {
 		return false, serr
 	}
 	if _, rerr := proc.Run(ctx, Bin, "rm", "-f", name); rerr != nil {
-		if isAbsentErr(rerr) {
+		if ObserveGuest(ctx, name).State == GuestAbsent {
 			return true, nil
 		}
 		return false, fmt.Errorf("stop %q wedged on cgroup.kill and force-remove failed: %w", name, rerr)
+	}
+	if err := waitGuestPostcondition(ctx, name, "force-remove", func(state GuestObservationState) bool { return state == GuestAbsent }); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -314,12 +412,14 @@ func Start(ctx context.Context, name string) error {
 // Remove tears down a guest. It stops first because `container rm` won't remove
 // a running guest reliably, then removes (ignoring "not found").
 func Remove(ctx context.Context, name string) error {
-	_, _ = proc.Run(ctx, Bin, "stop", name)
+	if err := Stop(ctx, name); err != nil {
+		return err
+	}
 	if _, err := proc.Run(ctx, Bin, "rm", "-f", name); err != nil {
-		if isAbsentErr(err) {
+		if ObserveGuest(ctx, name).State == GuestAbsent {
 			return nil
 		}
 		return fmt.Errorf("container rm %s: %w", name, err)
 	}
-	return nil
+	return waitGuestPostcondition(ctx, name, "remove", func(state GuestObservationState) bool { return state == GuestAbsent })
 }

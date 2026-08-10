@@ -22,7 +22,7 @@ import (
 const (
 	metadataName        = ".shunt-baseline.json"
 	stateName           = ".shunt-baseline-state.json"
-	stateVersion        = 1
+	stateVersion        = 2
 	generationsName     = ".shunt-baseline-generations"
 	generationLocks     = ".shunt-baseline-generation-locks"
 	generationPrefix    = "generation-"
@@ -34,6 +34,7 @@ const (
 // Metadata records the coherent volume set that was promoted.
 type Metadata struct {
 	SourceSiding string    `json:"sourceSiding"`
+	OperationID  string    `json:"operationId,omitempty"`
 	Timestamp    time.Time `json:"timestamp"`
 	Volumes      []string  `json:"volumes"`
 }
@@ -42,6 +43,8 @@ type Metadata struct {
 // follow-up cleanup could not finish.
 type Result struct {
 	Committed     bool
+	OperationID   string
+	GenerationID  string
 	RecoveryPaths []string
 	Restore       RestoreResult
 }
@@ -129,9 +132,10 @@ type Lifecycle interface {
 type VolumeCapture func(context.Context, string, string) error
 
 type stateManifest struct {
-	Version  int    `json:"version"`
-	Current  string `json:"current"`
-	Previous string `json:"previous,omitempty"`
+	Version    int               `json:"version"`
+	Current    string            `json:"current"`
+	Previous   string            `json:"previous,omitempty"`
+	Operations map[string]string `json:"operations,omitempty"`
 }
 
 type generationLease struct {
@@ -191,6 +195,13 @@ func New(configDir string, volumes []string) (*Manager, error) {
 
 // Promote atomically publishes a clone of every configured volume from source.
 func (m *Manager) Promote(ctx context.Context, sourceSiding, sourceRoot string) (Result, error) {
+	return m.PromoteOperation(ctx, "", sourceSiding, sourceRoot)
+}
+
+// PromoteOperation is Promote with a durable idempotency key. Once operationID
+// is published, every retry returns the original generation without cloning or
+// publishing another baseline generation.
+func (m *Manager) PromoteOperation(ctx context.Context, operationID, sourceSiding, sourceRoot string) (Result, error) {
 	if err := m.requireVolumes(); err != nil {
 		return Result{}, err
 	}
@@ -200,6 +211,9 @@ func (m *Manager) Promote(ctx context.Context, sourceSiding, sourceRoot string) 
 	if err := m.ensureWithinConfig(sourceRoot); err != nil {
 		return Result{}, fmt.Errorf("source volume root: %w", err)
 	}
+	if err := validateOperationID(operationID); err != nil {
+		return Result{}, err
+	}
 
 	var cleanup []string
 	result, operationErr := m.withLock(ctx, func() (Result, error) {
@@ -208,7 +222,10 @@ func (m *Manager) Promote(ctx context.Context, sourceSiding, sourceRoot string) 
 		if err != nil {
 			return Result{}, err
 		}
-		result, leftovers, err := m.publishGeneration(ctx, state, sourceSiding, func(stage string) error {
+		if result, ok := m.committedOperation(state, operationID); ok {
+			return result, nil
+		}
+		result, leftovers, err := m.publishGeneration(ctx, state, operationID, sourceSiding, func(stage string) error {
 			return m.cloneSet(ctx, sourceRoot, stage)
 		})
 		cleanup = append(cleanup, leftovers...)
@@ -240,7 +257,7 @@ func (m *Manager) Seed(ctx context.Context, source string, capture VolumeCapture
 		if state != nil {
 			return Result{}, nil
 		}
-		result, leftovers, err := m.publishGeneration(ctx, nil, source, func(stage string) error {
+		result, leftovers, err := m.publishGeneration(ctx, nil, "", source, func(stage string) error {
 			for _, volume := range m.Volumes {
 				if err := capture(ctx, volume, filepath.Join(stage, volume)); err != nil {
 					return fmt.Errorf("capture seed volume %q: %w", volume, err)
@@ -290,6 +307,13 @@ func (m *Manager) Initialized(ctx context.Context) (bool, error) {
 // serialized. Restore and retired-generation cleanup run after releasing the
 // canonical mutation lock.
 func (m *Manager) PromoteWithLifecycle(ctx context.Context, sourceSiding string, lifecycle Lifecycle) (Result, error) {
+	return m.PromoteWithLifecycleOperation(ctx, "", sourceSiding, lifecycle)
+}
+
+// PromoteWithLifecycleOperation is PromoteWithLifecycle with the same durable
+// idempotency contract as PromoteOperation. A committed retry skips quiescence
+// and restore because no new capture occurs.
+func (m *Manager) PromoteWithLifecycleOperation(ctx context.Context, operationID, sourceSiding string, lifecycle Lifecycle) (Result, error) {
 	if err := m.requireVolumes(); err != nil {
 		return Result{}, err
 	}
@@ -299,6 +323,9 @@ func (m *Manager) PromoteWithLifecycle(ctx context.Context, sourceSiding string,
 	if lifecycle == nil {
 		return Result{}, errors.New("data lifecycle is required")
 	}
+	if err := validateOperationID(operationID); err != nil {
+		return Result{}, err
+	}
 
 	var cleanup []string
 	lifecycleStarted := false
@@ -307,6 +334,9 @@ func (m *Manager) PromoteWithLifecycle(ctx context.Context, sourceSiding string,
 		cleanup = append(cleanup, recovery...)
 		if err != nil {
 			return Result{}, err
+		}
+		if result, ok := m.committedOperation(state, operationID); ok {
+			return result, nil
 		}
 		lifecycleStarted = true
 		if err := lifecycle.Quiesce(ctx); err != nil {
@@ -318,7 +348,7 @@ func (m *Manager) PromoteWithLifecycle(ctx context.Context, sourceSiding string,
 		if err := lifecycle.Sync(ctx); err != nil {
 			return Result{}, err
 		}
-		result, leftovers, err := m.publishGeneration(ctx, state, sourceSiding, func(stage string) error {
+		result, leftovers, err := m.publishGeneration(ctx, state, operationID, sourceSiding, func(stage string) error {
 			for _, volume := range m.Volumes {
 				if err := lifecycle.SnapshotHostVolume(ctx, volume, filepath.Join(stage, volume)); err != nil {
 					return fmt.Errorf("snapshot host volume %q: %w", volume, err)
@@ -367,7 +397,7 @@ func (m *Manager) RollbackContext(ctx context.Context) (Result, error) {
 		if state.Previous == "" {
 			return Result{}, errors.New("no previous data baseline generation is available")
 		}
-		next := stateManifest{Version: stateVersion, Current: state.Previous, Previous: state.Current}
+		next := stateManifest{Version: stateVersion, Current: state.Previous, Previous: state.Current, Operations: cloneOperations(state.Operations)}
 		leftovers, committed, err := m.publishState(next)
 		cleanup = append(cleanup, leftovers...)
 		if err != nil {
@@ -394,6 +424,50 @@ func (m *Manager) Cleanup(ctx context.Context) (Result, error) {
 		return Result{Committed: true}, nil
 	})
 	return m.finishOperation("cleanup", result, operationErr, cleanup)
+}
+
+// ForgetOperation removes a completed idempotency record. The referenced
+// generation remains protected when it is current, previous, or still named by
+// another operation; otherwise it becomes eligible for deterministic cleanup.
+func (m *Manager) ForgetOperation(ctx context.Context, operationID string) (Result, error) {
+	if err := m.requireVolumes(); err != nil {
+		return Result{}, err
+	}
+	if operationID == "" {
+		return Result{}, errors.New("operation ID is required")
+	}
+	if err := validateOperationID(operationID); err != nil {
+		return Result{}, err
+	}
+	var cleanup []string
+	result, operationErr := m.withLock(ctx, func() (Result, error) {
+		state, recovery, err := m.loadState()
+		cleanup = append(cleanup, recovery...)
+		if err != nil {
+			return Result{}, err
+		}
+		if state == nil {
+			return Result{}, errors.New("data baseline is not initialized")
+		}
+		generationID, ok := state.Operations[operationID]
+		if !ok {
+			return Result{Committed: true, OperationID: operationID}, nil
+		}
+		next := *state
+		next.Version = stateVersion
+		next.Operations = cloneOperations(state.Operations)
+		delete(next.Operations, operationID)
+		leftovers, committed, err := m.publishState(next)
+		cleanup = append(cleanup, leftovers...)
+		if err != nil {
+			return Result{Committed: committed, OperationID: operationID, GenerationID: generationID}, fmt.Errorf("publish baseline operation completion: %w", err)
+		}
+		if !manifestReferencesGeneration(next, generationID) {
+			cleanup = append(cleanup, m.generationRoot(generationID))
+		}
+		return Result{Committed: true, OperationID: operationID, GenerationID: generationID}, nil
+	})
+	return m.finishOperation("forget operation", result, operationErr, cleanup)
 }
 
 // ResetVolumeRoot replaces a siding's entire volume root with a leased clone
@@ -439,7 +513,7 @@ func (m *Manager) ResetVolumeRoot(ctx context.Context, destinationRoot string) (
 	return m.finishOperation("reset", result, cloneErr, cleanup)
 }
 
-func (m *Manager) publishGeneration(ctx context.Context, state *stateManifest, source string, capture func(string) error) (Result, []string, error) {
+func (m *Manager) publishGeneration(ctx context.Context, state *stateManifest, operationID, source string, capture func(string) error) (Result, []string, error) {
 	if err := os.MkdirAll(m.generationsRoot(), 0o700); err != nil {
 		return Result{}, nil, fmt.Errorf("create baseline generations directory: %w", err)
 	}
@@ -454,7 +528,7 @@ func (m *Manager) publishGeneration(ctx context.Context, state *stateManifest, s
 	if err := ctx.Err(); err != nil {
 		return Result{}, leftovers, err
 	}
-	metadata := Metadata{SourceSiding: source, Timestamp: m.clock().UTC(), Volumes: append([]string(nil), m.Volumes...)}
+	metadata := Metadata{SourceSiding: source, OperationID: operationID, Timestamp: m.clock().UTC(), Volumes: append([]string(nil), m.Volumes...)}
 	if err := m.write(stage, metadata); err != nil {
 		return Result{}, leftovers, err
 	}
@@ -479,25 +553,43 @@ func (m *Manager) publishGeneration(ctx context.Context, state *stateManifest, s
 	next := stateManifest{Version: stateVersion, Current: generationID}
 	if state != nil {
 		next.Previous = state.Current
+		next.Operations = cloneOperations(state.Operations)
+	}
+	if operationID != "" {
+		if next.Operations == nil {
+			next.Operations = map[string]string{}
+		}
+		next.Operations[operationID] = generationID
 	}
 	stateLeftovers, committed, err := m.publishState(next)
 	leftovers = append(leftovers, stateLeftovers...)
 	if err != nil {
 		if committed {
 			leftovers = stateLeftovers
-			if state != nil && state.Previous != "" {
+			if state != nil && state.Previous != "" && !manifestReferencesGeneration(next, state.Previous) {
 				leftovers = append(leftovers, m.generationRoot(state.Previous))
 			}
 		}
-		return Result{Committed: committed}, leftovers, fmt.Errorf("publish baseline state: %w", err)
+		return Result{Committed: committed, OperationID: operationID, GenerationID: generationID}, leftovers, fmt.Errorf("publish baseline state: %w", err)
 	}
 
 	// The generation is now referenced by the atomically published manifest.
 	leftovers = stateLeftovers
-	if state != nil && state.Previous != "" {
+	if state != nil && state.Previous != "" && !manifestReferencesGeneration(next, state.Previous) {
 		leftovers = append(leftovers, m.generationRoot(state.Previous))
 	}
-	return Result{Committed: true}, leftovers, nil
+	return Result{Committed: true, OperationID: operationID, GenerationID: generationID}, leftovers, nil
+}
+
+func (m *Manager) committedOperation(state *stateManifest, operationID string) (Result, bool) {
+	if state == nil || operationID == "" {
+		return Result{}, false
+	}
+	generationID, ok := state.Operations[operationID]
+	if !ok {
+		return Result{}, false
+	}
+	return Result{Committed: true, OperationID: operationID, GenerationID: generationID}, true
 }
 
 func (m *Manager) publishState(state stateManifest) ([]string, bool, error) {
@@ -642,8 +734,8 @@ func (m *Manager) loadState() (*stateManifest, []string, error) {
 	if err := requireJSONEOF(decoder); err != nil {
 		return nil, nil, fmt.Errorf("parse baseline state: %w", err)
 	}
-	if state.Version != stateVersion {
-		return nil, nil, fmt.Errorf("unsupported baseline state version %d; expected %d and no migration is available", state.Version, stateVersion)
+	if state.Version != 1 && state.Version != stateVersion {
+		return nil, nil, fmt.Errorf("unsupported baseline state version %d; expected 1 or %d", state.Version, stateVersion)
 	}
 	if err := validateGenerationID(state.Current); err != nil {
 		return nil, nil, fmt.Errorf("invalid current generation: %w", err)
@@ -654,6 +746,17 @@ func (m *Manager) loadState() (*stateManifest, []string, error) {
 		}
 		if state.Previous == state.Current {
 			return nil, nil, errors.New("baseline current and previous generations must differ")
+		}
+	}
+	for operationID, generationID := range state.Operations {
+		if err := validateOperationID(operationID); err != nil {
+			return nil, nil, fmt.Errorf("invalid baseline operation: %w", err)
+		}
+		if operationID == "" {
+			return nil, nil, errors.New("baseline operation ID cannot be empty")
+		}
+		if err := validateGenerationID(generationID); err != nil {
+			return nil, nil, fmt.Errorf("invalid generation for operation %q: %w", operationID, err)
 		}
 	}
 
@@ -672,6 +775,19 @@ func (m *Manager) loadState() (*stateManifest, []string, error) {
 			return nil, nil, fmt.Errorf("previous baseline generation %q: %w", state.Previous, err)
 		}
 	}
+	for operationID, generationID := range state.Operations {
+		generationRoot := m.generationRoot(generationID)
+		if err := validateRoot(generationRoot, m.Volumes); err != nil {
+			return nil, nil, fmt.Errorf("operation %q baseline generation %q: %w", operationID, generationID, err)
+		}
+		metadata, err := readMetadata(generationRoot)
+		if err != nil {
+			return nil, nil, fmt.Errorf("operation %q baseline generation %q: %w", operationID, generationID, err)
+		}
+		if metadata.OperationID != operationID {
+			return nil, nil, fmt.Errorf("operation %q baseline generation %q records operation %q", operationID, generationID, metadata.OperationID)
+		}
+	}
 
 	entries, err := os.ReadDir(m.generationsRoot())
 	if err != nil {
@@ -680,6 +796,9 @@ func (m *Manager) loadState() (*stateManifest, []string, error) {
 	referenced := map[string]struct{}{state.Current: {}}
 	if state.Previous != "" {
 		referenced[state.Previous] = struct{}{}
+	}
+	for _, generationID := range state.Operations {
+		referenced[generationID] = struct{}{}
 	}
 	recovery := append([]string(nil), temps...)
 	for _, entry := range entries {
@@ -902,6 +1021,45 @@ func validateGenerationID(id string) error {
 	return nil
 }
 
+func validateOperationID(id string) error {
+	if id == "" {
+		return nil
+	}
+	if strings.TrimSpace(id) != id || len(id) > 256 {
+		return fmt.Errorf("unsafe operation identifier %q", id)
+	}
+	for _, char := range id {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || strings.ContainsRune("._:-", char) {
+			continue
+		}
+		return fmt.Errorf("unsafe operation identifier %q", id)
+	}
+	return nil
+}
+
+func cloneOperations(operations map[string]string) map[string]string {
+	if len(operations) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(operations))
+	for operationID, generationID := range operations {
+		cloned[operationID] = generationID
+	}
+	return cloned
+}
+
+func manifestReferencesGeneration(state stateManifest, generationID string) bool {
+	if state.Current == generationID || state.Previous == generationID {
+		return true
+	}
+	for _, operationGeneration := range state.Operations {
+		if operationGeneration == generationID {
+			return true
+		}
+	}
+	return false
+}
+
 func validateNames(volumes []string) error {
 	seen := make(map[string]struct{}, len(volumes))
 	for _, volume := range volumes {
@@ -960,34 +1118,42 @@ func validateRoot(root string, volumes []string) error {
 		return errors.New("generation root is incomplete")
 	}
 
-	metadataPath := filepath.Join(root, metadataName)
-	metadataInfo, err := os.Lstat(metadataPath)
+	metadata, err := readMetadata(root)
 	if err != nil {
-		return fmt.Errorf("inspect metadata: %w", err)
-	}
-	if !metadataInfo.Mode().IsRegular() {
-		return errors.New("metadata is not a regular file")
-	}
-	contents, err := os.ReadFile(metadataPath)
-	if err != nil {
-		return fmt.Errorf("read metadata: %w", err)
-	}
-	var metadata Metadata
-	decoder := json.NewDecoder(bytes.NewReader(contents))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&metadata); err != nil {
-		return fmt.Errorf("parse metadata: %w", err)
-	}
-	if err := requireJSONEOF(decoder); err != nil {
-		return fmt.Errorf("parse metadata: %w", err)
-	}
-	if metadata.SourceSiding == "" || metadata.Timestamp.IsZero() {
-		return errors.New("metadata source and timestamp are required")
+		return err
 	}
 	if !sameNames(metadata.Volumes, volumes) {
 		return fmt.Errorf("metadata volumes %q do not match configured volumes %q", metadata.Volumes, volumes)
 	}
 	return nil
+}
+
+func readMetadata(root string) (Metadata, error) {
+	metadataPath := filepath.Join(root, metadataName)
+	metadataInfo, err := os.Lstat(metadataPath)
+	if err != nil {
+		return Metadata{}, fmt.Errorf("inspect metadata: %w", err)
+	}
+	if !metadataInfo.Mode().IsRegular() {
+		return Metadata{}, errors.New("metadata is not a regular file")
+	}
+	contents, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return Metadata{}, fmt.Errorf("read metadata: %w", err)
+	}
+	var metadata Metadata
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&metadata); err != nil {
+		return Metadata{}, fmt.Errorf("parse metadata: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return Metadata{}, fmt.Errorf("parse metadata: %w", err)
+	}
+	if metadata.SourceSiding == "" || metadata.Timestamp.IsZero() {
+		return Metadata{}, errors.New("metadata source and timestamp are required")
+	}
+	return metadata, nil
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {

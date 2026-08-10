@@ -106,6 +106,29 @@ func RunInDir(ctx context.Context, dir, name string, args ...string) (Result, er
 	return res, nil
 }
 
+// RunStreaming executes name with stdout and stderr sent directly to the
+// supplied writers. It is intended for output that may be too large to retain
+// in memory, such as a binary git diff.
+func RunStreaming(ctx context.Context, stdout, stderr io.Writer, name string, args ...string) (Result, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
+	err := cmd.Run()
+	res := Result{}
+	if cmd.ProcessState != nil {
+		res.ExitCode = cmd.ProcessState.ExitCode()
+	}
+	if err != nil {
+		var exitErr *exec.ExitError
+		if ok := asExitError(err, &exitErr); ok {
+			return res, fmt.Errorf("%s exited %d", name, res.ExitCode)
+		}
+		return res, fmt.Errorf("run %s: %w", name, err)
+	}
+	return res, nil
+}
+
 // RunPassthrough runs a command with stdio wired straight to the user's
 // terminal — for long/interactive operations (image builds, dotnet run) where
 // streaming output matters more than capturing it.

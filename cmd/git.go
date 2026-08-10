@@ -1,12 +1,16 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/siding"
+	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 )
+
+var runSidingGitCommand = proc.RunPassthrough
 
 // newGitCmd is a full git pass-through in a siding's worktree. A siding's source
 // is a git worktree on the host; git doesn't resolve inside the guest (the
@@ -33,34 +37,33 @@ func newGitCmd() *cobra.Command {
 			if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 				return cmd.Help()
 			}
-			src, err := resolveSidingWorktree()
+			app, loc, err := loadCurrentApp()
 			if err != nil {
 				return err
 			}
-			full := append([]string{"-C", src}, args...)
-			return proc.RunPassthrough(cmd.Context(), "git", full...)
+			if err := ensureNoRemovalInProgress(app, "git"); err != nil {
+				return err
+			}
+			name := loc.Siding
+			if name == "" {
+				name = app.LiveSiding
+			}
+			if name == "" {
+				return fmt.Errorf("which siding? cd into one, or make one live (`%s ls`)", bin())
+			}
+			return runSidingGit(cmd.Context(), app.ConfigDir, name, args)
 		},
 	}
 	return c
 }
 
-// resolveSidingWorktree returns the host worktree path of the siding to act on:
-// the one cwd is inside, else the app's live siding.
-func resolveSidingWorktree() (string, error) {
-	app, loc, err := loadCurrentApp()
-	if err != nil {
-		return "", err
-	}
-	name := loc.Siding
-	if name == "" {
-		name = app.LiveSiding
-	}
-	if name == "" {
-		return "", fmt.Errorf("which siding? cd into one, or make one live (`%s ls`)", bin())
-	}
-	if _, ok := app.Sidings[name]; !ok {
-		return "", fmt.Errorf("no siding %q in %q", name, app.Name)
-	}
-	src, _, err := siding.Paths(app, name)
-	return src, err
+func runSidingGit(ctx context.Context, configDir, name string, args []string) error {
+	return withLatestSiding(ctx, configDir, name, "git", func(app state.App, _ state.Siding) error {
+		src, _, err := siding.Paths(app, name)
+		if err != nil {
+			return err
+		}
+		full := append([]string{"-C", src}, args...)
+		return runSidingGitCommand(ctx, "git", full...)
+	})
 }
