@@ -73,12 +73,13 @@ func TestUpPersistsDataPhaseAndRetriesGuestMaterialization(t *testing.T) {
 	if err := state.SaveApp(app); err != nil {
 		t.Fatal(err)
 	}
-	originalEnsure, originalRemove, originalRun, originalExec := ensureBaseImage, removeGuest, runGuest, execGuest
+	originalEnsure, originalRuntime, originalRemove, originalRun, originalExec := ensureBaseImage, ensureGuestRuntime, removeGuest, runGuest, execGuest
 	originalUpEnsure, originalUpRoutes, originalUpProbe := upEnsureGuestLive, upResolveFrontDoor, upProbeAppRunning
 	originalUpPrepare, originalUpStop, originalUpStart := upPrepareGuest, upStopApp, upStartApp
 	originalUpWait, originalUpClear, originalUpIP := upWaitReady, upClearAppLog, upGuestIP
 	t.Cleanup(func() {
 		ensureBaseImage = originalEnsure
+		ensureGuestRuntime = originalRuntime
 		removeGuest = originalRemove
 		runGuest = originalRun
 		execGuest = originalExec
@@ -93,6 +94,7 @@ func TestUpPersistsDataPhaseAndRetriesGuestMaterialization(t *testing.T) {
 		upGuestIP = originalUpIP
 	})
 	ensureBaseImage = func(context.Context, bool) error { return nil }
+	ensureGuestRuntime = func(context.Context) error { return nil }
 	removeGuest = func(context.Context, string) error { return nil }
 	execGuest = func(context.Context, string, ...string) (string, error) { return "", nil }
 	attempts := 0
