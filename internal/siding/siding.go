@@ -67,6 +67,7 @@ var (
 	startLifecycleApp        = StartApp
 	waitLifecycleReady       = WaitReady
 	upMaterialize            = materialize
+	ensureGuestRuntime       = container.EnsureSystemStarted
 	upEnsureGuestLive        = EnsureGuestLive
 	upResolveFrontDoor       = resolveSidingFrontDoor
 	upProbeAppRunning        = ProbeAppRunning
@@ -282,6 +283,9 @@ func restoreLiveRoute(ctx context.Context, configDir, name string) error {
 
 func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progress io.Writer) (state.Siding, error) {
 	var err error
+	if err := ensureGuestRuntime(ctx); err != nil {
+		return sd, fmt.Errorf("start container runtime: %w", err)
+	}
 	sd, err = upMaterialize(ctx, app, sd, progress)
 	if err != nil {
 		return sd, err
