@@ -1559,6 +1559,9 @@ func switchLocked(ctx context.Context, app *state.App, target string) error {
 		return fmt.Errorf("host is no longer a switch target; create or choose a siding")
 	}
 	if app.LiveSiding == state.HostTarget {
+		if err := caddy.RemoveFrontDoor(ctx, caddy.NewAdmin(), *app); err != nil {
+			return fmt.Errorf("remove legacy host routes: %w", err)
+		}
 		app.LiveSiding = ""
 	}
 	admin := caddy.NewAdmin()

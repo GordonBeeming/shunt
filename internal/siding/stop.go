@@ -54,11 +54,7 @@ func Stop(ctx context.Context, app state.App, name string) (StopResult, error) {
 		sd.Bridges = nil
 		sd.LastIP = ""
 		if result.Forced {
-			if len(current.Volumes) > 0 {
-				sd.MaterializationPhase = state.PhaseData
-			} else {
-				sd.MaterializationPhase = state.PhaseWorktree
-			}
+			sd.MaterializationPhase = state.PhaseData
 		}
 		result.Siding = sd
 		if _, err := mergeStoppedState(ctx, current.ConfigDir, sd, false); err != nil {
