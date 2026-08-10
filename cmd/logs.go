@@ -32,7 +32,7 @@ func newLogsCmd() *cobra.Command {
 			}
 			out, err := sidingLog(ctx, app.ConfigDir, name, lines)
 			if err != nil {
-				return fmt.Errorf("read log (is the guest running?): %w", err)
+				return err
 			}
 			if out == "" {
 				fmt.Printf("(no app log yet — has `%s up %s` run?)\n", bin(), name)

@@ -75,9 +75,10 @@ type TrimResult struct {
 }
 
 type directoryIdentity struct {
-	device uint64
-	inode  uint64
-	valid  bool
+	device   uint64
+	inode    uint64
+	modified int64
+	valid    bool
 }
 
 type discoveredCandidate struct {
@@ -496,7 +497,7 @@ func identifyDirectory(info os.FileInfo) (directoryIdentity, error) {
 	if !ok {
 		return directoryIdentity{}, fmt.Errorf("unexpected file identity %T", info.Sys())
 	}
-	return directoryIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino), valid: true}, nil
+	return directoryIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino), modified: info.ModTime().UnixNano(), valid: true}, nil
 }
 
 func quarantineCandidate(candidate TrimCandidate) (string, error) {

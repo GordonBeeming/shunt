@@ -100,7 +100,7 @@ func setBaseSiding(ctx context.Context, app *state.App, name string) (bool, erro
 		if err != nil {
 			return err
 		}
-		branch, err := gitText(ctx, src, "symbolic-ref", "--quiet", "--short", "HEAD")
+		branch, err := currentWorktreeBranch(ctx, src)
 		if err != nil {
 			return fmt.Errorf("siding %q must be on its recorded branch %q: %w", name, sd.Branch, err)
 		}
@@ -169,7 +169,7 @@ func validateCleanBase(ctx context.Context, app *state.App) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	branch, err := gitText(ctx, src, "symbolic-ref", "--quiet", "--short", "HEAD")
+	branch, err := currentWorktreeBranch(ctx, src)
 	if err != nil || branch != sd.Branch {
 		return "", fmt.Errorf("source base %q is not on its recorded branch %q", app.BaseSiding, sd.Branch)
 	}
@@ -194,6 +194,14 @@ func validateCleanBase(ctx context.Context, app *state.App) (string, error) {
 	}
 	app.BaseCommit = pinned
 	return pinned, nil
+}
+
+func currentWorktreeBranch(ctx context.Context, src string) (string, error) {
+	ref, err := gitText(ctx, src, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(ref, "refs/heads/"), nil
 }
 
 func ensureControlRepository(ctx context.Context, app *state.App, source, seed string) error {
