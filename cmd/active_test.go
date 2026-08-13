@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gordonbeeming/shunt/internal/config"
@@ -186,5 +188,73 @@ func TestActiveJSONKeepsLegacyActiveFalseForWorktreeOnlyState(t *testing.T) {
 	}
 	if legacy.Active {
 		t.Fatalf("legacy active-only consumer sees worktree-only state as registered: %s", payload)
+	}
+}
+
+func TestActiveCommandExitStatusCompatibility(t *testing.T) {
+	repo, configDir, _ := newShellOnlyCommandRepo(t)
+	withWorkingDirectory(t, repo)
+	cmd := newNewCmd()
+	cmd.SetArgs([]string{"shell"})
+	if err := cmd.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(cwd, mode string) (int, string) {
+		t.Helper()
+		helper := exec.Command(os.Args[0], "-test.run=^TestActiveCommandExitStatusHelper$")
+		helper.Dir = cwd
+		helper.Env = append(os.Environ(), "SHUNT_ACTIVE_EXIT_HELPER="+mode)
+		output, err := helper.CombinedOutput()
+		if err == nil {
+			return 0, string(output)
+		}
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok {
+			t.Fatalf("run active helper: %v\n%s", err, output)
+		}
+		return exitErr.ExitCode(), string(output)
+	}
+
+	if code, output := run(repo, "plain"); code != 1 || !strings.Contains(output, "worktree-only shunt project") {
+		t.Fatalf("plain shell-only active = exit %d, want 1 with discovered details:\n%s", code, output)
+	}
+	if code, output := run(repo, "json"); code != 0 || !strings.Contains(output, `"managed": true`) || !strings.Contains(output, `"active": false`) {
+		t.Fatalf("JSON shell-only active = exit %d, want 0 with managed=true active=false:\n%s", code, output)
+	}
+
+	if err := state.SaveRegistry(state.Registry{Projects: map[string]string{filepath.Base(repo): configDir}}); err != nil {
+		t.Fatal(err)
+	}
+	if code, output := run(repo, "plain"); code != 0 || !strings.Contains(output, "is a shunt app") {
+		t.Fatalf("plain registered active = exit %d, want 0:\n%s", code, output)
+	}
+	if code, output := run(repo, "json"); code != 0 || !strings.Contains(output, `"managed": true`) || !strings.Contains(output, `"active": true`) || !strings.Contains(output, `"registered": true`) {
+		t.Fatalf("JSON registered active = exit %d, want 0 with all state flags true:\n%s", code, output)
+	}
+
+	unmanaged := filepath.Join(filepath.Dir(repo), "unmanaged")
+	if err := os.Mkdir(unmanaged, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if code, output := run(unmanaged, "plain"); code != 1 || !strings.Contains(output, "has no Shunt state") {
+		t.Fatalf("plain unmanaged active = exit %d, want 1:\n%s", code, output)
+	}
+	if code, output := run(unmanaged, "json"); code != 0 || !strings.Contains(output, `"managed": false`) || !strings.Contains(output, `"active": false`) || !strings.Contains(output, `"registered": false`) {
+		t.Fatalf("JSON unmanaged active = exit %d, want 0 with all state flags false:\n%s", code, output)
+	}
+}
+
+func TestActiveCommandExitStatusHelper(t *testing.T) {
+	mode := os.Getenv("SHUNT_ACTIVE_EXIT_HELPER")
+	if mode == "" {
+		return
+	}
+	cmd := newActiveCmd()
+	if mode == "json" {
+		cmd.SetArgs([]string{"--json"})
+	}
+	if err := cmd.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

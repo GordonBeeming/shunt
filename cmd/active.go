@@ -45,7 +45,8 @@ func newActiveCmd() *cobra.Command {
 		Short: "Report whether the current directory is a shunt-managed project, and its sidings",
 		Long: "Resolves the project from the current Git repository or siding. If Shunt state exists, " +
 			"reports its registration status, sidings, and where to edit each one's code. Designed for scripts/skills: " +
-			"`shunt active --json`. Exits non-zero when the directory has no Shunt state.",
+			"`shunt active --json`. Plain mode exits non-zero unless the project is registered; JSON mode exits successfully " +
+			"with managed/active/registered flags whenever discovery succeeds.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cwd, err := os.Getwd()
 			if err != nil {
@@ -79,6 +80,13 @@ func newActiveCmd() *cobra.Command {
 				if s.Dashboard != "" {
 					fmt.Printf("              dashboard: %s\n", s.Dashboard)
 				}
+			}
+			// Preserve the original command-level contract for existing shell
+			// consumers: plain `active` succeeds only for a registered app. The
+			// worktree-only details above are still useful to an interactive user;
+			// new machine consumers use --json and branch on managed/registered.
+			if !res.Registered {
+				os.Exit(1)
 			}
 			return nil
 		},

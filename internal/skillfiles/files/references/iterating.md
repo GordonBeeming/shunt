@@ -105,6 +105,7 @@ Shunt does not clone that store per siding. Mount `~/.microsoft/usersecrets` rea
 - `registered`, `appRunning`, and `live` all `true` → it's already serving; nothing to do
 
 `active` retains its compatibility meaning of a registered app. New consumers should use `managed` to distinguish no state from worktree-only state, and `registered` before recommending guest commands.
+Use `--json` for that decision: it exits successfully whenever discovery succeeds. Plain `active` retains its legacy exit-status contract and exits non-zero for worktree-only as well as unmanaged directories, even though it prints the discovered worktree details.
 
 `scripts/status.sh` wraps this and prints the recommended next command.
 
