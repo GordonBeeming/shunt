@@ -149,6 +149,41 @@ func TestActiveDoesNotUseRegisteredProjectWithSameBasename(t *testing.T) {
 	}
 }
 
+func TestActiveReportsInvalidStateInsteadOfCallingProjectUnmanaged(t *testing.T) {
+	for _, registered := range []bool{false, true} {
+		name := "worktree-only"
+		if registered {
+			name = "registered"
+		}
+		t.Run(name, func(t *testing.T) {
+			repo, configDir, _ := newShellOnlyCommandRepo(t)
+			withWorkingDirectory(t, repo)
+			cmd := newNewCmd()
+			cmd.SetArgs([]string{"shell"})
+			if err := cmd.ExecuteContext(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if registered {
+				if err := state.SaveRegistry(state.Registry{Projects: map[string]string{filepath.Base(repo): configDir}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			statePath := filepath.Join(configDir, "state-v2.json")
+			if err := os.WriteFile(statePath, []byte(`{"version":999}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := activeResultForDir(context.Background(), repo)
+			if err == nil {
+				t.Fatalf("active result = %#v, want invalid state error", got)
+			}
+			if !strings.Contains(err.Error(), statePath) || !strings.Contains(err.Error(), "unsupported") {
+				t.Fatalf("invalid state error = %q, want path and unsupported-version detail", err)
+			}
+		})
+	}
+}
+
 func TestActiveJSONKeepsLegacyActiveFalseForWorktreeOnlyState(t *testing.T) {
 	repo, _, _ := newShellOnlyCommandRepo(t)
 	withWorkingDirectory(t, repo)

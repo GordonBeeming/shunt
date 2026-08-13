@@ -1,8 +1,8 @@
 module github.com/gordonbeeming/shunt
 
-go 1.25.12
+go 1.25.13
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	github.com/distribution/reference v0.6.0

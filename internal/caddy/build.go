@@ -182,6 +182,20 @@ var systemBuildOperations = buildOperations{
 	},
 	build: func(ctx context.Context, xcaddyPath string, environment []string, args ...string) error {
 		cmd := exec.CommandContext(ctx, xcaddyPath, args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error {
+			if cmd.Process == nil {
+				return os.ErrProcessDone
+			}
+			if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+				if errors.Is(err, syscall.ESRCH) {
+					return os.ErrProcessDone
+				}
+				return err
+			}
+			return nil
+		}
+		cmd.WaitDelay = 5 * time.Second
 		cmd.Env = environment
 		output, err := xcaddyOutputPath(args)
 		if err != nil {
@@ -192,6 +206,9 @@ var systemBuildOperations = buildOperations{
 		cmd.Stderr = os.Stderr
 		cmd.Stdin = os.Stdin
 		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("run %s: %w", xcaddyPath, ctx.Err())
+			}
 			return fmt.Errorf("run %s: %w", xcaddyPath, err)
 		}
 		return nil
@@ -559,14 +576,14 @@ func parseGoToolchainIdentity(output string) (goToolchainIdentity, error) {
 	if majorErr != nil || minorErr != nil || patchErr != nil || fields[0] != fmt.Sprintf("go%d.%d.%d", major, minor, patch) {
 		return goToolchainIdentity{}, unsupportedGoToolchainError(output)
 	}
-	if major != 1 || !((minor == 25 && patch >= 12) || (minor == 26 && patch >= 5)) {
+	if major != 1 || !((minor == 25 && patch >= 13) || (minor == 26 && patch >= 6)) {
 		return goToolchainIdentity{}, unsupportedGoToolchainError(output)
 	}
 	return goToolchainIdentity{Version: fields[0]}, nil
 }
 
 func unsupportedGoToolchainError(output string) error {
-	return fmt.Errorf("unsupported Go toolchain identity %q; upgrade to Go 1.25.12+ or Go 1.26.5+ on %s/%s (newer minor and major lines require review)", strings.TrimSpace(output), buildGOOS, buildGOARCH)
+	return fmt.Errorf("unsupported Go toolchain identity %q; upgrade to Go 1.25.13+ or Go 1.26.6+ on %s/%s (newer minor and major lines require review)", strings.TrimSpace(output), buildGOOS, buildGOARCH)
 }
 
 func verifyCaddyBuildSettings(settings []debug.BuildSetting) error {

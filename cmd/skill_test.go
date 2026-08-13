@@ -74,6 +74,39 @@ printf '%s\n' '{"active":true,"project":"sample","sidings":[]}'
 	}
 }
 
+func TestRenderedStatusScriptPropagatesActiveDiscoveryFailure(t *testing.T) {
+	identity := config.Identity{Channel: "dev", BinaryName: "shunt-dev", ProjectDirName: ".shunt-dev"}
+	dest := t.TempDir()
+	if err := writeSkill(dest, identity); err != nil {
+		t.Fatal(err)
+	}
+	fakeBinary := filepath.Join(t.TempDir(), "shunt-dev")
+	fake := `#!/bin/sh
+echo 'load Shunt state: unsupported state version' >&2
+exit 23
+`
+	if err := os.WriteFile(fakeBinary, []byte(fake), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", filepath.Join(dest, "scripts", "status.sh"))
+	cmd.Env = append(os.Environ(), "SHUNT_BIN="+fakeBinary)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("status script succeeded after active discovery failure:\n%s", out)
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 23 {
+		t.Fatalf("status script error = %v, want active exit 23:\n%s", err, out)
+	}
+	text := string(out)
+	if !strings.Contains(text, "unsupported state version") {
+		t.Fatalf("status script hid active diagnostic:\n%s", text)
+	}
+	if strings.Contains(text, "No Shunt state here") {
+		t.Fatalf("status script misreported discovery failure as unmanaged:\n%s", text)
+	}
+}
+
 func TestWriteSkillRendersCompleteTreeForEachChannel(t *testing.T) {
 	channels := []config.Identity{
 		{Channel: "release", BinaryName: "shunt", ProjectDirName: ".shunt"},

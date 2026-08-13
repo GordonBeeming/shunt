@@ -9,14 +9,16 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime/debug"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/gordonbeeming/shunt/internal/state"
 )
 
-var testGoToolchain = goToolchainIdentity{Version: "go1.26.5"}
+var testGoToolchain = goToolchainIdentity{Version: "go1.26.6"}
 
 func TestXcaddyBuildArgsPinEveryModule(t *testing.T) {
 	bin := "/tmp/shunt"
@@ -193,7 +195,7 @@ func TestBuildRebuildsWhenGoToolchainChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newToolchain := goToolchainIdentity{Version: "go1.26.6"}
+	newToolchain := goToolchainIdentity{Version: "go1.26.7"}
 	calls := &buildCallCounts{}
 	operations := successfulBuildOperations(t, binPath, calls)
 	operations.goVersion = func(_ context.Context, path string) (string, error) {
@@ -381,18 +383,18 @@ func TestResolveGoToolchainRequiresAbsoluteValidatedIdentity(t *testing.T) {
 		want       goToolchainIdentity
 		errorMatch string
 	}{
-		{name: "Go 1.25 minimum", path: "/toolchains/go", version: "go1.25.12\ndarwin\narm64\n", want: goToolchainIdentity{Version: "go1.25.12"}},
-		{name: "Go 1.26 minimum", path: "/toolchains/go", version: "go1.26.5\ndarwin\narm64\n", want: testGoToolchain},
-		{name: "relative path", path: "bin/go", version: "go1.26.5\ndarwin\narm64\n", errorMatch: "not absolute"},
-		{name: "Go 1.25 too old", path: "/toolchains/go", version: "go1.25.11\ndarwin\narm64\n", errorMatch: "upgrade to Go 1.25.12+ or Go 1.26.5+"},
-		{name: "Go 1.26 too old", path: "/toolchains/go", version: "go1.26.4\ndarwin\narm64\n", errorMatch: "upgrade to Go 1.25.12+ or Go 1.26.5+"},
-		{name: "prerelease", path: "/toolchains/go", version: "go1.26.5rc1\ndarwin\narm64\n", errorMatch: "unsupported Go toolchain identity"},
+		{name: "Go 1.25 minimum", path: "/toolchains/go", version: "go1.25.13\ndarwin\narm64\n", want: goToolchainIdentity{Version: "go1.25.13"}},
+		{name: "Go 1.26 minimum", path: "/toolchains/go", version: "go1.26.6\ndarwin\narm64\n", want: testGoToolchain},
+		{name: "relative path", path: "bin/go", version: "go1.26.6\ndarwin\narm64\n", errorMatch: "not absolute"},
+		{name: "Go 1.25 too old", path: "/toolchains/go", version: "go1.25.12\ndarwin\narm64\n", errorMatch: "upgrade to Go 1.25.13+ or Go 1.26.6+"},
+		{name: "Go 1.26 too old", path: "/toolchains/go", version: "go1.26.5\ndarwin\narm64\n", errorMatch: "upgrade to Go 1.25.13+ or Go 1.26.6+"},
+		{name: "prerelease", path: "/toolchains/go", version: "go1.26.6rc1\ndarwin\narm64\n", errorMatch: "unsupported Go toolchain identity"},
 		{name: "future minor", path: "/toolchains/go", version: "go1.27.0\ndarwin\narm64\n", errorMatch: "newer minor and major lines require review"},
 		{name: "future major", path: "/toolchains/go", version: "go2.0.0\ndarwin\narm64\n", errorMatch: "newer minor and major lines require review"},
-		{name: "noncanonical", path: "/toolchains/go", version: "go1.026.5\ndarwin\narm64\n", errorMatch: "unsupported Go toolchain identity"},
-		{name: "wrong target", path: "/toolchains/go", version: "go1.26.5\nlinux\narm64\n", errorMatch: "unsupported Go toolchain identity"},
+		{name: "noncanonical", path: "/toolchains/go", version: "go1.026.6\ndarwin\narm64\n", errorMatch: "unsupported Go toolchain identity"},
+		{name: "wrong target", path: "/toolchains/go", version: "go1.26.6\nlinux\narm64\n", errorMatch: "unsupported Go toolchain identity"},
 		{name: "development toolchain", path: "/toolchains/go", version: "devel go1.27-deadbeef\ndarwin\narm64\n", errorMatch: "unsupported Go toolchain identity"},
-		{name: "trailing text", path: "/toolchains/go", version: "go1.26.5\ndarwin\narm64\nunexpected\n", errorMatch: "unsupported Go toolchain identity"},
+		{name: "trailing text", path: "/toolchains/go", version: "go1.26.6\ndarwin\narm64\nunexpected\n", errorMatch: "unsupported Go toolchain identity"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			versionPath := ""
@@ -614,6 +616,83 @@ func TestBuildCleansWorkspaceAfterFailure(t *testing.T) {
 	if _, err := os.Stat(workspace); !os.IsNotExist(err) {
 		t.Fatalf("build workspace remained after failure: %v", err)
 	}
+}
+
+func TestBuildCleansWorkspaceAfterCancellation(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "caddy", "shunt")
+	workspaceReady := make(chan string, 1)
+	operations := withTestGo(buildOperations{
+		findXCaddy: func() (string, error) { return "/test/xcaddy", nil },
+		xcaddyVersion: func(context.Context, string) (string, error) {
+			return xcaddyVersion + " " + xcaddyVersionSum + "\n", nil
+		},
+		build: func(ctx context.Context, _ string, _ []string, args ...string) error {
+			workspaceReady <- filepath.Dir(outputPathFromBuildArgs(t, args))
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := build(ctx, false, binPath, operations)
+		result <- err
+	}()
+	workspace := <-workspaceReady
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled build error = %v, want context cancellation", err)
+	}
+	if _, err := os.Stat(workspace); !os.IsNotExist(err) {
+		t.Fatalf("cancelled build workspace remained: %v", err)
+	}
+}
+
+func TestSystemXCaddyBuildCancellationTerminatesProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	childPIDPath := filepath.Join(dir, "child.pid")
+	xcaddyPath := filepath.Join(dir, "xcaddy")
+	script := "#!/bin/sh\nsleep 600 &\necho $! > " + childPIDPath + "\nwait\n"
+	if err := os.WriteFile(xcaddyPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(dir, "workspace", "caddy")
+	if err := os.MkdirAll(filepath.Dir(output), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- systemBuildOperations.build(ctx, xcaddyPath, os.Environ(), xcaddyBuildArgs(output)...)
+	}()
+	var childPID int
+	deadline := time.Now().Add(5 * time.Second)
+	for childPID == 0 && time.Now().Before(deadline) {
+		data, err := os.ReadFile(childPIDPath)
+		if err == nil {
+			childPID, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		}
+		if childPID == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if childPID == 0 {
+		cancel()
+		t.Fatal("fake xcaddy child did not start")
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled xcaddy error = %v, want context cancellation", err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		err := syscall.Kill(childPID, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("xcaddy child PID %d survived cancellation", childPID)
 }
 
 func TestRealBuildUsesReviewedToolchainAndFreshCaches(t *testing.T) {

@@ -6,6 +6,16 @@
 # we start there and add the Docker engine for Aspire's in-guest container deps.
 FROM golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS shunt-tools
 
+# Security releases can precede their Docker Library image. Replace the stage's
+# toolchain with the authenticated official arm64 archive so the admission
+# binaries meet the same reviewed patch floor as host Caddy.
+RUN curl -fsSLo /tmp/go.tgz https://go.dev/dl/go1.26.6.linux-arm64.tar.gz \
+ && echo 'd0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e  /tmp/go.tgz' | sha256sum -c - \
+ && rm -rf /usr/local/go \
+ && tar -C /usr/local -xzf /tmp/go.tgz \
+ && rm /tmp/go.tgz \
+ && go version | grep -Fx 'go version go1.26.6 linux/arm64'
+
 WORKDIR /src
 COPY docker-api-admission.mod ./go.mod
 COPY docker-api-admission.sum ./go.sum

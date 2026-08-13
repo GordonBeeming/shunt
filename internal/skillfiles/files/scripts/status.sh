@@ -4,7 +4,7 @@
 set -euo pipefail
 BIN="${SHUNT_BIN:-{{shunt-command}}}"
 
-json="$("$BIN" active --json 2>/dev/null || true)"
+json="$("$BIN" active --json)"
 if [ -z "$json" ]; then
   echo "No Shunt state here. Create a siding with: $BIN new <name>"
   exit 0

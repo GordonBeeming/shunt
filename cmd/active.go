@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -120,7 +121,10 @@ func activeResultForDir(ctx context.Context, cwd string) (activeResult, error) {
 		app, err = state.LoadApp(loc.ConfigDir)
 	}
 	if err != nil {
-		return res, nil
+		if !registered && errors.Is(err, state.ErrNotFound) {
+			return res, nil
+		}
+		return activeResult{}, fmt.Errorf("load Shunt state for %s: %w", loc.ConfigDir, err)
 	}
 
 	res.Managed = true
