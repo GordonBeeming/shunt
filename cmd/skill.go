@@ -30,6 +30,19 @@ Before %s init, install Apple container, a reviewed Go patch release, xcaddy, an
 Ensure Go's bin directory is on PATH. The Aspire CLI is required only for .NET Aspire apps.
 `
 
+const nightlyPrerequisitesTemplate = `
+## Nightly host prerequisites
+
+Before %s init, install Apple's container runtime and the .NET SDK on PATH. Homebrew's go@1.25 formula is keg-only, so select the canonical Go binary, install xcaddy with it, and export both its bin directory and its GOPATH bin directory before initialising:
+
+    GO_BIN="$(brew --prefix go@1.25)/bin/go"
+    GOPATH_BIN="$("$GO_BIN" env GOPATH)/bin"
+    "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+    export PATH="$(brew --prefix go@1.25)/bin:$GOPATH_BIN:$PATH"
+
+The nightly package gate accepts canonical darwin/arm64 Go 1.25.13 or a later patch on the 1.25 line. Docker runs inside each guest; Docker Desktop and OrbStack are not prerequisites. The Aspire CLI is required only for .NET Aspire apps.
+`
+
 const standardOnboardingTemplate = `
 This skill targets the **%s** channel.
 
@@ -237,6 +250,7 @@ func renderSkill(source string, identity config.Identity) string {
 func channelOnboarding(identity config.Identity) string {
 	prerequisites := universalPrerequisites(identity.BinaryName)
 	if identity.Channel == "nightly" {
+		prerequisites = nightlyPrerequisites(identity.BinaryName)
 		return fmt.Sprintf(nightlyOnboardingTemplate, prerequisites, identity.BinaryName, skillName, identity.BinaryName, identity.BinaryName, identity.BinaryName)
 	}
 
@@ -245,6 +259,10 @@ func channelOnboarding(identity config.Identity) string {
 
 func universalPrerequisites(binary string) string {
 	return fmt.Sprintf(universalPrerequisitesTemplate, binary)
+}
+
+func nightlyPrerequisites(binary string) string {
+	return fmt.Sprintf(nightlyPrerequisitesTemplate, binary)
 }
 
 func nightlyMigration(identity config.Identity) string {

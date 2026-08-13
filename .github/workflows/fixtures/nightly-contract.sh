@@ -9,11 +9,20 @@ root=$(CDPATH='' cd -- "$(dirname -- "$0")/../../.." && pwd)
 workflow="$root/.github/workflows/nightly.yml"
 workflows_dir="$root/.github/workflows"
 consumer="$root/packaging/nightly/consumer.sh"
+formula="$root/packaging/homebrew/shunt-nightly.rb.tmpl"
 
 require() {
   local text="$1" explanation="$2"
   grep -Fq -- "$text" "$workflow" || {
     printf 'missing nightly workflow contract: %s\n' "$explanation" >&2
+    exit 1
+  }
+}
+
+require_file() {
+  local file="$1" text="$2" explanation="$3"
+  grep -Fqx -- "$text" "$file" || {
+    printf 'missing nightly packaging contract: %s\n' "$explanation" >&2
     exit 1
   }
 }
@@ -96,6 +105,10 @@ require 'previous_tag: ${{ steps.select.outputs.previous_tag }}' 'prior formula 
 require 'previous_sha256: ${{ steps.select.outputs.previous_sha256 }}' 'prior formula checksum gate output'
 require 'go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11' 'pinned actionlint CLI installation'
 require 'bash packaging/homebrew/consumer-fixtures.sh' 'hosted consumer-contract fixture coverage'
+require_file "$formula" '  depends_on "go@1.25"' 'nightly formula uses the canonical versioned Go dependency'
+require_file "$consumer" 'homebrew_go_formula=go@1.25' 'nightly consumer validates the formula dependency itself installs'
+require_file "$consumer" 'formula_name=shunt-nightly' 'nightly consumer uses the formula identifier'
+require_file "$formula" 'class ShuntNightly < Formula' 'nightly formula class matches its package'
 require '(cd "$payload" && printf '\''%s  %s\n'\'' "$SHA256" shunt-nightly_darwin_arm64.tar.gz | shasum -a 256 -c -)' 'artifact digest verification from the downloaded payload directory'
 require_consumer_health 'PREVIOUS_VERSION: ${{ needs.gate.outputs.previous_version }}' 'prior formula version reaches consumer health'
 require_consumer_health 'PREVIOUS_TAG: ${{ needs.gate.outputs.previous_tag }}' 'prior formula tag reaches consumer health'

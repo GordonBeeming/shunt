@@ -4,6 +4,7 @@ set -euo pipefail
 
 tap=gordonbeeming/tap
 formula_name=shunt-nightly
+homebrew_go_formula=go@1.25
 asset=shunt-nightly_darwin_arm64.tar.gz
 
 usage() {
@@ -111,6 +112,7 @@ assert_candidate_formula() {
   grep -Fqx "  version \"$version\"" "$candidate_formula"
   grep -Fqx "  sha256 \"$sha256\"" "$candidate_formula"
   grep -Fqx "  url \"https://github.com/GordonBeeming/shunt/releases/download/$tag/$asset\"" "$candidate_formula"
+  grep -Fqx "  depends_on \"$homebrew_go_formula\"" "$candidate_formula"
 }
 
 anonymous_release_probe() {
@@ -145,9 +147,9 @@ assert_absent() {
 }
 
 assert_supported_homebrew_go() {
-  local go_prefix go_bin identity minor patch
-  go_prefix=$(brew --prefix go) || {
-    echo "Homebrew Go is required on the macOS consumer runner" >&2
+  local go_prefix go_bin identity patch
+  go_prefix=$(brew --prefix "$homebrew_go_formula") || {
+    echo "Homebrew $homebrew_go_formula is required on the macOS consumer runner" >&2
     return 1
   }
   go_bin="$go_prefix/bin/go"
@@ -159,26 +161,15 @@ assert_supported_homebrew_go() {
     echo "could not read the Homebrew Go toolchain identity: $go_bin" >&2
     return 1
   }
-  if [[ ! "$identity" =~ ^go\ version\ go1\.(25|26)\.(0|[1-9][0-9]*)\ darwin/arm64$ ]]; then
-    printf 'unsupported Homebrew Go toolchain identity %q; need Go 1.25.13+ or 1.26.6+ on darwin/arm64\n' "$identity" >&2
+  if [[ ! "$identity" =~ ^go\ version\ go1\.25\.(0|[1-9][0-9]*)\ darwin/arm64$ ]]; then
+    printf 'unsupported Homebrew Go toolchain identity %q; need canonical Go 1.25.13 or a later patch on the 1.25 line on darwin/arm64\n' "$identity" >&2
     return 1
   fi
-  minor=${BASH_REMATCH[1]}
-  patch=${BASH_REMATCH[2]}
-  case "$minor" in
-    25)
-      if ((patch < 13)); then
-        printf 'unsupported Homebrew Go toolchain identity %q; need Go 1.25.13+ or 1.26.6+ on darwin/arm64\n' "$identity" >&2
-        return 1
-      fi
-      ;;
-    26)
-      if ((patch < 6)); then
-        printf 'unsupported Homebrew Go toolchain identity %q; need Go 1.25.13+ or 1.26.6+ on darwin/arm64\n' "$identity" >&2
-        return 1
-      fi
-      ;;
-  esac
+  patch=${BASH_REMATCH[1]}
+  if ((patch < 13)); then
+    printf 'unsupported Homebrew Go toolchain identity %q; need canonical Go 1.25.13 or a later patch on the 1.25 line on darwin/arm64\n' "$identity" >&2
+    return 1
+  fi
 }
 
 uninstall_existing() {

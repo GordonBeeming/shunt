@@ -12,6 +12,11 @@ sha256=$(printf payload | shasum -a 256 | awk '{print $1}')
 previous_tag=nightly-41
 previous_sha256=$(printf previous-payload | shasum -a 256 | awk '{print $1}')
 
+grep -Fqx 'class ShuntNightly < Formula' "$root/packaging/homebrew/shunt-nightly.rb.tmpl"
+grep -Fqx '  depends_on "go@1.25"' "$root/packaging/homebrew/shunt-nightly.rb.tmpl"
+grep -Fqx 'formula_name=shunt-nightly' "$root/packaging/nightly/consumer.sh"
+grep -Fqx 'homebrew_go_formula=go@1.25' "$root/packaging/nightly/consumer.sh"
+
 expect_failure() {
   if "$@"; then
     echo "fixture unexpectedly succeeded: $*" >&2
@@ -39,8 +44,7 @@ GO
   chmod +x "$state/go/bin/go"
   cat > "$state/bin/go" <<'GO'
 #!/usr/bin/env bash
-echo 'PATH Go must not be used by the consumer gate' >&2
-exit 1
+echo 'go version go1.27.0 darwin/arm64'
 GO
   chmod +x "$state/bin/go"
   cat > "$state/bin/brew" <<'BREW'
@@ -70,7 +74,7 @@ BIN
 }
 case "${1:-}" in
   --prefix)
-    if [[ "${2:-}" == go ]]; then echo "$state/go"
+    if [[ "${2:-}" == go@1.25 ]]; then echo "$state/go"
     elif [[ $# -eq 1 ]]; then echo "$state"
     else echo "$state/cellar"
     fi
@@ -129,7 +133,7 @@ run_consumer() {
   local state=$1
   shift
   PATH="$state/bin:$PATH" MOCK_BREW_STATE="$state" MOCK_TARGET_VERSION="$version" \
-    MOCK_GO_VERSION="${MOCK_GO_VERSION:-go version go1.26.6 darwin/arm64}" SHUNT_NIGHTLY_CURL=curl \
+    MOCK_GO_VERSION="${MOCK_GO_VERSION:-go version go1.25.13 darwin/arm64}" SHUNT_NIGHTLY_CURL=curl \
     "$root/packaging/nightly/consumer.sh" "$@"
 }
 
@@ -137,20 +141,14 @@ first=$(make_mock_tools first)
 run_consumer "$first" tap "$version" "$tag" "$sha256"
 grep -Fxq "brew install gordonbeeming/tap/shunt-nightly" "$first/calls"
 grep -Fq 'curl --fail' "$first/calls"
-grep -Fxq 'brew --prefix go' "$first/calls"
+grep -Fxq 'brew --prefix go@1.25' "$first/calls"
 grep -Fxq 'go version' "$first/calls"
 
 accepted_125=$(make_mock_tools accepted-125)
 MOCK_GO_VERSION='go version go1.25.13 darwin/arm64' run_consumer "$accepted_125" candidate "$version" "$tag" "$sha256"
 
-accepted_126_boundary=$(make_mock_tools accepted-126-boundary)
-MOCK_GO_VERSION='go version go1.26.6 darwin/arm64' run_consumer "$accepted_126_boundary" candidate "$version" "$tag" "$sha256"
-
-accepted_126_patch=$(make_mock_tools accepted-126-patch)
-MOCK_GO_VERSION='go version go1.26.99 darwin/arm64' run_consumer "$accepted_126_patch" candidate "$version" "$tag" "$sha256"
-
 stale_tap=$(make_mock_tools stale-tap "$previous")
-if MOCK_GO_VERSION='go version go1.26.5 darwin/arm64' run_consumer "$stale_tap" tap "$version" "$tag" "$sha256" "$previous" "$previous_tag" "$previous_sha256"; then
+if MOCK_GO_VERSION='go version go1.25.12 darwin/arm64' run_consumer "$stale_tap" tap "$version" "$tag" "$sha256" "$previous" "$previous_tag" "$previous_sha256"; then
   echo 'stale Go named-tap fixture unexpectedly succeeded' >&2
   exit 1
 fi
@@ -164,13 +162,14 @@ unsupported_go=''
 rejected_index=0
 for unsupported_go in \
   'go version go1.25.12 darwin/arm64' \
-  'go version go1.26.5 darwin/arm64' \
-  'go version go1.26.6rc1 darwin/arm64' \
-  'go version go1.026.6 darwin/arm64' \
+  'go version go1.25.13rc1 darwin/arm64' \
+  'go version go1.025.13 darwin/arm64' \
+  'go version go1.25.013 darwin/arm64' \
+  'go version go1.26.6 darwin/arm64' \
   'go version go1.27.0 darwin/arm64' \
   'go version go2.0.0 darwin/arm64' \
   'devel go1.27-deadbeef darwin/arm64' \
-  'go version go1.26.6 linux/arm64'; do
+  'go version go1.25.13 linux/arm64'; do
   rejected_index=$((rejected_index + 1))
   rejected=$(make_mock_tools "rejected-$rejected_index")
   if MOCK_GO_VERSION="$unsupported_go" run_consumer "$rejected" candidate "$version" "$tag" "$sha256"; then
@@ -244,7 +243,7 @@ install_line=$(grep -n -m1 -E '^brew install .*/shunt-nightly\.rb$' "$candidate/
 
 candidate_digest_failure=$(make_mock_tools candidate-digest-failure)
 if PATH="$candidate_digest_failure/bin:$PATH" MOCK_BREW_STATE="$candidate_digest_failure" MOCK_TARGET_VERSION="$version" \
-  MOCK_CURL_PAYLOAD=wrong-payload MOCK_GO_VERSION='go version go1.26.6 darwin/arm64' SHUNT_NIGHTLY_CURL=curl \
+  MOCK_CURL_PAYLOAD=wrong-payload MOCK_GO_VERSION='go version go1.25.13 darwin/arm64' SHUNT_NIGHTLY_CURL=curl \
   "$root/packaging/nightly/consumer.sh" candidate "$version" "$tag" "$sha256"; then
   echo 'candidate archive digest mismatch fixture unexpectedly succeeded' >&2
   exit 1
@@ -267,7 +266,7 @@ run_consumer "$candidate_rerun" candidate "$version" "$tag" "$sha256"
 
 candidate_test_failure=$(make_mock_tools candidate-test-failure)
 if PATH="$candidate_test_failure/bin:$PATH" MOCK_BREW_STATE="$candidate_test_failure" MOCK_TARGET_VERSION="$version" \
-  MOCK_BREW_TEST_FAIL=true MOCK_GO_VERSION='go version go1.26.6 darwin/arm64' SHUNT_NIGHTLY_CURL=curl \
+  MOCK_BREW_TEST_FAIL=true MOCK_GO_VERSION='go version go1.25.13 darwin/arm64' SHUNT_NIGHTLY_CURL=curl \
   "$root/packaging/nightly/consumer.sh" candidate "$version" "$tag" "$sha256"; then
   echo 'candidate Homebrew test failure fixture unexpectedly succeeded' >&2
   exit 1

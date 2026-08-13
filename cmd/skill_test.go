@@ -139,7 +139,11 @@ func TestEveryChannelUsesOneSharedSkillAndUniversalPrerequisites(t *testing.T) {
 	for _, identity := range channels {
 		t.Run(identity.Channel, func(t *testing.T) {
 			text := channelOnboarding(identity)
-			if !strings.Contains(text, universalPrerequisitesHeading) {
+			heading := universalPrerequisitesHeading
+			if identity.Channel == "nightly" {
+				heading = "## Nightly host prerequisites"
+			}
+			if !strings.Contains(text, heading) {
 				t.Errorf("%s onboarding omits universal prerequisites", identity.Channel)
 			}
 			if !strings.Contains(text, identity.BinaryName+" init") {
@@ -211,6 +215,19 @@ func assertRenderedSkillTree(t *testing.T, dest string, identity config.Identity
 	if identity.Channel == "nightly" && !strings.Contains(string(skill), "macOS 26 or newer on Apple silicon") {
 		t.Error("nightly skill does not include its supported host guidance")
 	}
+	if identity.Channel == "nightly" {
+		for _, phrase := range []string{
+			"## Nightly host prerequisites",
+			`GO_BIN="$(brew --prefix go@1.25)/bin/go"`,
+			`"$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6`,
+			`export PATH="$(brew --prefix go@1.25)/bin:$GOPATH_BIN:$PATH"`,
+			"Go 1.25.13 or a later patch on the 1.25 line",
+		} {
+			if !strings.Contains(string(skill), phrase) {
+				t.Errorf("nightly skill omits %q", phrase)
+			}
+		}
+	}
 
 	commands, err := os.ReadFile(filepath.Join(dest, "references", "commands.md"))
 	if err != nil {
@@ -233,9 +250,13 @@ func assertRenderedSkillTree(t *testing.T, dest string, identity config.Identity
 
 func assertPrerequisitesBeforeOnboardingCommands(t *testing.T, text string, identity config.Identity, file string) {
 	t.Helper()
-	headingIndex := strings.Index(text, universalPrerequisitesHeading)
+	heading := universalPrerequisitesHeading
+	if identity.Channel == "nightly" {
+		heading = "## Nightly host prerequisites"
+	}
+	headingIndex := strings.Index(text, heading)
 	if headingIndex < 0 {
-		t.Errorf("%s omits universal prerequisites for %s", file, identity.Channel)
+		t.Errorf("%s omits prerequisites for %s", file, identity.Channel)
 		return
 	}
 	for _, command := range []string{

@@ -13,7 +13,7 @@ class ShuntNightly < Formula
   depends_on arch: :arm64
   depends_on "container"
   depends_on "dotnet"
-  depends_on "go"
+  depends_on "go@1.25"
   depends_on macos: :tahoe
 
   def install
@@ -25,14 +25,16 @@ class ShuntNightly < Formula
       `shunt-nightly init` starts Apple's installed container runtime and uses
       the .NET SDK, even for non-.NET projects.
 
-      `shunt-nightly init` requires xcaddy. Install it with:
-        go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+      `shunt-nightly init` requires xcaddy. Homebrew's go@1.25 formula is
+      keg-only, so select it explicitly and put both its bin directory and its
+      GOPATH bin directory on PATH before installing xcaddy and running init:
+        GO_BIN="$(brew --prefix go@1.25)/bin/go"
+        GOPATH_BIN="$("$GO_BIN" env GOPATH)/bin"
+        "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+        export PATH="$(brew --prefix go@1.25)/bin:$GOPATH_BIN:$PATH"
 
-      Use Go 1.25.13+ on the 1.25 line or Go 1.26.6+ on the 1.26 line.
-      Newer Go minor lines are rejected until reviewed.
-
-      Ensure Go's bin directory is on PATH:
-        export PATH="$(go env GOPATH)/bin:$PATH"
+      This package gate accepts canonical darwin/arm64 Go 1.25.13 or a later
+      patch on the 1.25 line. Newer Go minor lines are rejected until reviewed.
     EOS
   end
 

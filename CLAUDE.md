@@ -22,7 +22,16 @@ go build -ldflags "-X github.com/gordonbeeming/shunt/internal/config.Channel=nig
 shunt-nightly skill install --all
 ```
 
-The nightly build is distributed through Homebrew for macOS 26 or newer on Apple silicon. Its first `init` needs Go 1.25.13+ on the 1.25 line or Go 1.26.6+ on the 1.26 line, `xcaddy`, and the .NET SDK on `PATH`; newer Go minor lines are rejected until reviewed. Apple `container` provides the host runtime. The Aspire CLI remains conditional on an Aspire app. A project moving from dev to nightly must be registered again and start with a new siding and data baseline. Do not copy `.shunt-dev` state or migrate a dev siding.
+The nightly build is distributed through Homebrew for macOS 26 or newer on Apple silicon. Homebrew's `go@1.25` formula is keg-only. Before the first `init`, select its binary, install `xcaddy` with it, and export both its bin directory and its GOPATH bin directory:
+
+```bash
+GO_BIN="$(brew --prefix go@1.25)/bin/go"
+GOPATH_BIN="$("$GO_BIN" env GOPATH)/bin"
+"$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+export PATH="$(brew --prefix go@1.25)/bin:$GOPATH_BIN:$PATH"
+```
+
+The nightly package gate accepts canonical darwin/arm64 Go 1.25.13 or a later patch on the 1.25 line. Apple `container` provides the host runtime. The Aspire CLI remains conditional on an Aspire app. A project moving from dev to nightly must be registered again and start with a new siding and data baseline. Do not copy `.shunt-dev` state or migrate a dev siding.
 
 Nightly publication uses a fine-grained `IMMUTABLE_RELEASES_READ_TOKEN` with repository Administration(read) only for the pre-mutation settings check. Store its source in 1Password and expose it only as the same-named Actions secret; release writes continue to use the job-scoped `GITHUB_TOKEN`.
 
