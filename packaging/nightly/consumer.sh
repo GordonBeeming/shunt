@@ -162,12 +162,12 @@ assert_supported_homebrew_go() {
     return 1
   }
   if [[ ! "$identity" =~ ^go\ version\ go1\.25\.(0|[1-9][0-9]*)\ darwin/arm64$ ]]; then
-    printf 'unsupported Homebrew Go toolchain identity %q; need canonical Go 1.25.13 or a later patch on the 1.25 line on darwin/arm64\n' "$identity" >&2
+    printf 'unsupported Homebrew Go toolchain identity "%s"; need canonical Go 1.25.13 or a later patch on the 1.25 line on darwin/arm64\n' "$identity" >&2
     return 1
   fi
   patch=${BASH_REMATCH[1]}
   if ((patch < 13)); then
-    printf 'unsupported Homebrew Go toolchain identity %q; need canonical Go 1.25.13 or a later patch on the 1.25 line on darwin/arm64\n' "$identity" >&2
+    printf 'unsupported Homebrew Go toolchain identity "%s"; need canonical Go 1.25.13 or a later patch on the 1.25 line on darwin/arm64\n' "$identity" >&2
     return 1
   fi
 }

@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -153,6 +154,31 @@ func TestEveryChannelUsesOneSharedSkillAndUniversalPrerequisites(t *testing.T) {
 	}
 }
 
+func TestNightlyOnboardingOperationalTokensStayInSync(t *testing.T) {
+	root := repositoryRoot(t)
+	surfaces := []string{
+		filepath.Join(root, "README.md"),
+		filepath.Join(root, "CLAUDE.md"),
+		filepath.Join(root, "cmd", "skill.go"),
+		filepath.Join(root, "packaging", "homebrew", "shunt-nightly.rb.tmpl"),
+	}
+	for _, surface := range surfaces {
+		content, err := os.ReadFile(surface)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(content)
+		for _, token := range nightlyOperationalTokens {
+			if !strings.Contains(text, token) {
+				t.Errorf("%s omits nightly onboarding token %q", surface, token)
+			}
+		}
+		if strings.Contains(text, "GOPATH_BIN") {
+			t.Errorf("%s retains the ambient GOPATH bin variable", surface)
+		}
+	}
+}
+
 func assertRenderedSkillTree(t *testing.T, dest string, identity config.Identity) {
 	t.Helper()
 	err := fs.WalkDir(skillfiles.FS, "files", func(source string, entry fs.DirEntry, err error) error {
@@ -216,16 +242,13 @@ func assertRenderedSkillTree(t *testing.T, dest string, identity config.Identity
 		t.Error("nightly skill does not include its supported host guidance")
 	}
 	if identity.Channel == "nightly" {
-		for _, phrase := range []string{
-			"## Nightly host prerequisites",
-			`GO_BIN="$(brew --prefix go@1.25)/bin/go"`,
-			`"$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6`,
-			`export PATH="$(brew --prefix go@1.25)/bin:$GOPATH_BIN:$PATH"`,
-			"Go 1.25.13 or a later patch on the 1.25 line",
-		} {
+		for _, phrase := range append([]string{"## Nightly host prerequisites"}, nightlyOperationalTokens...) {
 			if !strings.Contains(string(skill), phrase) {
 				t.Errorf("nightly skill omits %q", phrase)
 			}
+		}
+		if !strings.Contains(string(skill), "Go 1.25.13 or a later patch on the 1.25 line") {
+			t.Error("nightly skill omits the supported Go patch policy")
 		}
 	}
 
@@ -278,9 +301,28 @@ func assertPrerequisitesBeforeOnboardingCommands(t *testing.T, text string, iden
 var nightlyOnlyGuidance = []string{
 	"macOS 26 or newer on Apple silicon",
 	"brew ",
+	"go@1.25",
+	"XCADDY_BIN=",
+	`GOBIN="$XCADDY_BIN"`,
 	"gordonbeeming/tap/shunt-nightly",
 	"Nightly keeps its own ports",
 	"Do not copy `.shunt-dev`",
+}
+
+var nightlyOperationalTokens = []string{
+	`GO_BIN="$(brew --prefix go@1.25)/bin/go"`,
+	`XCADDY_BIN="$("$GO_BIN" env GOPATH | cut -d: -f1)/bin"`,
+	`GOBIN="$XCADDY_BIN" "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6`,
+	`export PATH="$(brew --prefix go@1.25)/bin:$XCADDY_BIN:$PATH"`,
+}
+
+func repositoryRoot(t *testing.T) string {
+	t.Helper()
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Dir(filepath.Dir(filename))
 }
 
 var markdownLink = regexp.MustCompile(`\]\(([^)#]+)`) // local Markdown link target without its fragment

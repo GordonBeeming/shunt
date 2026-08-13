@@ -109,6 +109,25 @@ require_file "$formula" '  depends_on "go@1.25"' 'nightly formula uses the canon
 require_file "$consumer" 'homebrew_go_formula=go@1.25' 'nightly consumer validates the formula dependency itself installs'
 require_file "$consumer" 'formula_name=shunt-nightly' 'nightly consumer uses the formula identifier'
 require_file "$formula" 'class ShuntNightly < Formula' 'nightly formula class matches its package'
+
+onboarding_tokens=(
+  'GO_BIN="$(brew --prefix go@1.25)/bin/go"'
+  'XCADDY_BIN="$("$GO_BIN" env GOPATH | cut -d: -f1)/bin"'
+  'GOBIN="$XCADDY_BIN" "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6'
+  'export PATH="$(brew --prefix go@1.25)/bin:$XCADDY_BIN:$PATH"'
+)
+for surface in "$root/README.md" "$root/CLAUDE.md" "$root/cmd/skill.go" "$formula"; do
+  for token in "${onboarding_tokens[@]}"; do
+    grep -Fq -- "$token" "$surface" || {
+      printf 'missing shared nightly onboarding token in %s: %s\n' "$surface" "$token" >&2
+      exit 1
+    }
+  done
+  if grep -Fq -- 'GOPATH_BIN' "$surface"; then
+    printf 'ambient GOPATH bin variable remains in %s\n' "$surface" >&2
+    exit 1
+  fi
+done
 require '(cd "$payload" && printf '\''%s  %s\n'\'' "$SHA256" shunt-nightly_darwin_arm64.tar.gz | shasum -a 256 -c -)' 'artifact digest verification from the downloaded payload directory'
 require_consumer_health 'PREVIOUS_VERSION: ${{ needs.gate.outputs.previous_version }}' 'prior formula version reaches consumer health'
 require_consumer_health 'PREVIOUS_TAG: ${{ needs.gate.outputs.previous_tag }}' 'prior formula tag reaches consumer health'

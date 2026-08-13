@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Hermetic coverage for consumer first-install, upgrade, and anonymous probes.
+# shellcheck disable=SC2016 # Literal onboarding tokens intentionally contain shell expansions.
 set -euo pipefail
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -16,6 +17,29 @@ grep -Fqx 'class ShuntNightly < Formula' "$root/packaging/homebrew/shunt-nightly
 grep -Fqx '  depends_on "go@1.25"' "$root/packaging/homebrew/shunt-nightly.rb.tmpl"
 grep -Fqx 'formula_name=shunt-nightly' "$root/packaging/nightly/consumer.sh"
 grep -Fqx 'homebrew_go_formula=go@1.25' "$root/packaging/nightly/consumer.sh"
+
+nightly_onboarding_tokens=(
+  'GO_BIN="$(brew --prefix go@1.25)/bin/go"'
+  'XCADDY_BIN="$("$GO_BIN" env GOPATH | cut -d: -f1)/bin"'
+  'GOBIN="$XCADDY_BIN" "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6'
+  'export PATH="$(brew --prefix go@1.25)/bin:$XCADDY_BIN:$PATH"'
+)
+for surface in \
+  "$root/README.md" \
+  "$root/CLAUDE.md" \
+  "$root/cmd/skill.go" \
+  "$root/packaging/homebrew/shunt-nightly.rb.tmpl"; do
+  for token in "${nightly_onboarding_tokens[@]}"; do
+    grep -Fq -- "$token" "$surface" || {
+      echo "$surface omits nightly onboarding token: $token" >&2
+      exit 1
+    }
+  done
+  if grep -Fq -- 'GOPATH_BIN' "$surface"; then
+    echo "$surface retains the ambient GOPATH bin variable" >&2
+    exit 1
+  fi
+done
 
 expect_failure() {
   if "$@"; then
@@ -137,6 +161,57 @@ run_consumer() {
     "$root/packaging/nightly/consumer.sh" "$@"
 }
 
+hostile_gopath="$tmp/hostile-gopath"
+ambient_gobin="$tmp/ambient-gobin"
+mkdir -p "$hostile_gopath/first/bin" "$hostile_gopath/second/bin" "$ambient_gobin" "$tmp/hostile-tools/bin"
+cat > "$tmp/hostile-tools/brew" <<'BREW'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == --prefix && "${2:-}" == go@1.25 ]] || exit 2
+printf '%s\n' "${MOCK_GO_PREFIX:?}"
+BREW
+cat > "$tmp/hostile-tools/bin/go" <<'GO'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  env)
+    [[ "${2:-}" == GOPATH ]] || exit 2
+    printf '%s\n' "${MOCK_GOPATH:?}"
+    ;;
+  install)
+    [[ "${GOBIN:-}" == "${MOCK_GOPATH%%:*}/bin" ]] || {
+      echo "xcaddy was not installed in the first GOPATH entry: ${GOBIN:-<unset>}" >&2
+      exit 1
+    }
+    mkdir -p "$GOBIN"
+    : > "$GOBIN/xcaddy"
+    ;;
+  *) exit 2 ;;
+esac
+GO
+chmod +x "$tmp/hostile-tools/brew" "$tmp/hostile-tools/bin/go"
+hostile_result=$(
+  PATH="$tmp/hostile-tools:$PATH" \
+  GOBIN="$ambient_gobin" \
+  GOPATH="$hostile_gopath/first:$hostile_gopath/second" \
+  MOCK_GO_PREFIX="$tmp/hostile-tools" \
+  MOCK_GOPATH="$hostile_gopath/first:$hostile_gopath/second" \
+  bash -c '
+    set -euo pipefail
+    GO_BIN="$(brew --prefix go@1.25)/bin/go"
+    XCADDY_BIN="$("$GO_BIN" env GOPATH | cut -d: -f1)/bin"
+    GOBIN="$XCADDY_BIN" "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+    export PATH="$(brew --prefix go@1.25)/bin:$XCADDY_BIN:$PATH"
+    printf "%s\n%s\n%s\n" "$GOBIN" "$PATH" "$(command -v xcaddy)"
+  '
+)
+grep -Fq "$tmp/hostile-tools/bin:$hostile_gopath/first/bin:" <<<"$hostile_result"
+grep -Fqx "$hostile_gopath/first/bin/xcaddy" <<<"$hostile_result"
+[[ ! -e "$hostile_gopath/second/bin/xcaddy" && ! -e "$ambient_gobin/xcaddy" ]] || {
+  echo 'hostile GOBIN/multi-GOPATH fixture wrote xcaddy to the wrong destination' >&2
+  exit 1
+}
+
 first=$(make_mock_tools first)
 run_consumer "$first" tap "$version" "$tag" "$sha256"
 grep -Fxq "brew install gordonbeeming/tap/shunt-nightly" "$first/calls"
@@ -147,11 +222,21 @@ grep -Fxq 'go version' "$first/calls"
 accepted_125=$(make_mock_tools accepted-125)
 MOCK_GO_VERSION='go version go1.25.13 darwin/arm64' run_consumer "$accepted_125" candidate "$version" "$tag" "$sha256"
 
+accepted_later=$(make_mock_tools accepted-later)
+MOCK_GO_VERSION='go version go1.25.99 darwin/arm64' run_consumer "$accepted_later" candidate "$version" "$tag" "$sha256"
+grep -Fxq 'brew uninstall --force shunt-nightly' "$accepted_later/calls"
+[[ -z "$(cat "$accepted_later/version")" ]] || {
+  echo 'later Homebrew Go acceptance fixture left a receipt behind' >&2
+  exit 1
+}
+
 stale_tap=$(make_mock_tools stale-tap "$previous")
-if MOCK_GO_VERSION='go version go1.25.12 darwin/arm64' run_consumer "$stale_tap" tap "$version" "$tag" "$sha256" "$previous" "$previous_tag" "$previous_sha256"; then
+stale_log="$tmp/stale-go.log"
+if MOCK_GO_VERSION='go version go1.25.12 darwin/arm64' run_consumer "$stale_tap" tap "$version" "$tag" "$sha256" "$previous" "$previous_tag" "$previous_sha256" 2>"$stale_log"; then
   echo 'stale Go named-tap fixture unexpectedly succeeded' >&2
   exit 1
 fi
+grep -Fq 'identity "go version go1.25.12 darwin/arm64"' "$stale_log"
 grep -Fxq "brew upgrade gordonbeeming/tap/shunt-nightly" "$stale_tap/calls"
 if grep -Eq '^shunt-nightly (version|skill) ' "$stale_tap/calls"; then
   echo 'stale Go named-tap fixture reached Shunt consumer checks' >&2

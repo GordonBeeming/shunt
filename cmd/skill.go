@@ -33,12 +33,12 @@ Ensure Go's bin directory is on PATH. The Aspire CLI is required only for .NET A
 const nightlyPrerequisitesTemplate = `
 ## Nightly host prerequisites
 
-Before %s init, install Apple's container runtime and the .NET SDK on PATH. Homebrew's go@1.25 formula is keg-only, so select the canonical Go binary, install xcaddy with it, and export both its bin directory and its GOPATH bin directory before initialising:
+Before %s init, install Apple's container runtime and the .NET SDK on PATH. Homebrew's go@1.25 formula is keg-only, so select the canonical Go binary, install xcaddy with it, and export both its bin directory and the selected xcaddy bin directory before initialising:
 
     GO_BIN="$(brew --prefix go@1.25)/bin/go"
-    GOPATH_BIN="$("$GO_BIN" env GOPATH)/bin"
-    "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
-    export PATH="$(brew --prefix go@1.25)/bin:$GOPATH_BIN:$PATH"
+    XCADDY_BIN="$("$GO_BIN" env GOPATH | cut -d: -f1)/bin"
+    GOBIN="$XCADDY_BIN" "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+    export PATH="$(brew --prefix go@1.25)/bin:$XCADDY_BIN:$PATH"
 
 The nightly package gate accepts canonical darwin/arm64 Go 1.25.13 or a later patch on the 1.25 line. Docker runs inside each guest; Docker Desktop and OrbStack are not prerequisites. The Aspire CLI is required only for .NET Aspire apps.
 `

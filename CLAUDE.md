@@ -22,13 +22,13 @@ go build -ldflags "-X github.com/gordonbeeming/shunt/internal/config.Channel=nig
 shunt-nightly skill install --all
 ```
 
-The nightly build is distributed through Homebrew for macOS 26 or newer on Apple silicon. Homebrew's `go@1.25` formula is keg-only. Before the first `init`, select its binary, install `xcaddy` with it, and export both its bin directory and its GOPATH bin directory:
+The nightly build is distributed through Homebrew for macOS 26 or newer on Apple silicon. Homebrew's `go@1.25` formula is keg-only. Before the first `init`, select its binary, install `xcaddy` with it, and export both its bin directory and the selected xcaddy bin directory:
 
 ```bash
 GO_BIN="$(brew --prefix go@1.25)/bin/go"
-GOPATH_BIN="$("$GO_BIN" env GOPATH)/bin"
-"$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
-export PATH="$(brew --prefix go@1.25)/bin:$GOPATH_BIN:$PATH"
+XCADDY_BIN="$("$GO_BIN" env GOPATH | cut -d: -f1)/bin"
+GOBIN="$XCADDY_BIN" "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+export PATH="$(brew --prefix go@1.25)/bin:$XCADDY_BIN:$PATH"
 ```
 
 The nightly package gate accepts canonical darwin/arm64 Go 1.25.13 or a later patch on the 1.25 line. Apple `container` provides the host runtime. The Aspire CLI remains conditional on an Aspire app. A project moving from dev to nightly must be registered again and start with a new siding and data baseline. Do not copy `.shunt-dev` state or migrate a dev siding.

@@ -30,13 +30,13 @@ brew install gordonbeeming/tap/shunt-nightly
 
 Later, upgrade with `brew update && brew upgrade gordonbeeming/tap/shunt-nightly`.
 
-The first `init` needs the .NET SDK and `xcaddy`. Homebrew's `go@1.25` formula is keg-only, so select its binary and put both it and its GOPATH bin directory on your `PATH` before running `init`:
+The first `init` needs the .NET SDK and `xcaddy`. Homebrew's `go@1.25` formula is keg-only, so select its binary and put both it and the selected xcaddy bin directory on your `PATH` before running `init`:
 
 ```bash
 GO_BIN="$(brew --prefix go@1.25)/bin/go"
-GOPATH_BIN="$("$GO_BIN" env GOPATH)/bin"
-"$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
-export PATH="$(brew --prefix go@1.25)/bin:$GOPATH_BIN:$PATH"
+XCADDY_BIN="$("$GO_BIN" env GOPATH | cut -d: -f1)/bin"
+GOBIN="$XCADDY_BIN" "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+export PATH="$(brew --prefix go@1.25)/bin:$XCADDY_BIN:$PATH"
 ```
 
 The nightly package gate accepts canonical darwin/arm64 Go 1.25.13 or a later patch on the 1.25 line. Shunt uses `xcaddy` to build its Caddy binary; Apple `container` is the host runtime, and Docker runs inside each guest. The Aspire CLI is required only for .NET Aspire apps.
