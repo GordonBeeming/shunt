@@ -1,13 +1,19 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 )
+
+var runSidingUp = func(ctx context.Context, app state.App, sd state.Siding, bridge bool, progress io.Writer) (state.Siding, error) {
+	return siding.Up(ctx, app, sd, bridge, progress)
+}
 
 func newUpCmd() *cobra.Command {
 	var doSwitch bool
@@ -22,6 +28,9 @@ func newUpCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if app.Runner == "" {
+				return fmt.Errorf("this project currently has worktree-only Shunt state; add a .shunt.app.json contract, then run `%s app add` before `%s up`", bin(), bin())
+			}
 			name, err := sidingArg(ctx, app, args)
 			if err != nil {
 				return err
@@ -32,7 +41,7 @@ func newUpCmd() *cobra.Command {
 			}
 			// The whole guest-liveness + app-start (+ bridge, unless --no-bridge) flow
 			// lives in siding.Up so the dashboard's Start button shares it exactly.
-			sd, err = siding.Up(ctx, app, sd, !noBridge, os.Stdout)
+			sd, err = runSidingUp(ctx, app, sd, !noBridge, os.Stdout)
 			if err != nil {
 				b := bin()
 				// reapply recreates just the guest from saved settings (keeps the worktree,

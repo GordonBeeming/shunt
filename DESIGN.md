@@ -92,7 +92,9 @@ The runner is a seam: it decides the start command, the guest env, and how shunt
 
 ## Channels
 
-A build-time `Channel` (`release` / `beta` / `dev`) drives everything channel-scoped: the binary name, the global dir, the Caddy admin and dashboard ports, the LaunchAgent labels, the container-name prefix, and a front-door port offset. So the three install and run side by side without fighting over one proxy or one port.
+A build-time `Channel` (`release` / `beta` / `nightly` / `dev`) drives everything channel-scoped: the binary name, the global dir, the Caddy admin and dashboard ports, the LaunchAgent labels, the container-name prefix, and a front-door port offset. The four channels install and run side by side without fighting over one proxy or one port. The supported nightly distribution target is macOS 26 or newer on Apple silicon (arm64), installed as `shunt-nightly` through Homebrew.
+
+Channel state is deliberately separate. A nightly install does not discover or adopt `.shunt-dev` sidings, control repositories, or data baselines. Register an existing project again with the nightly binary, create a new siding, and prepare its data independently.
 
 ## The dashboard
 
@@ -119,6 +121,7 @@ The dashboard's mutation API accepts only POSTs with a loopback `Host`, exact sa
 - `shunt run <name> <cmd>` — run a command inside the guest from the app's workdir.
 - `shunt warm` — refresh every configured dependency-image tag from its registry.
 - `shunt data promote [siding]` / `data rollback` — replace the complete baseline from a quiesced siding, or swap back one generation.
+- `shunt version`: print the build channel, `version=<build-version>`, and its resolved identity.
 - `shunt dashboard`, `reapply`, `config` — round out the rest.
 
 ## Gotchas worth remembering

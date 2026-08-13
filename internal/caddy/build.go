@@ -12,7 +12,16 @@ import (
 
 // l4Module is the layer4 plugin that gives Caddy raw TCP proxying (for DB/TCP
 // front-door routes alongside HTTP).
-const l4Module = "github.com/mholt/caddy-l4"
+const (
+	caddyVersion  = "v2.11.4"
+	l4Module      = "github.com/mholt/caddy-l4"
+	l4Version     = "v0.1.2"
+	xcaddyVersion = "v0.4.6"
+)
+
+func xcaddyBuildArgs(binPath string) []string {
+	return []string{"build", caddyVersion, "--output", binPath, "--with", l4Module + "@" + l4Version}
+}
 
 // Build produces this channel's Caddy binary (Caddy + caddy-l4) via xcaddy,
 // writing it to the channel's global dir. It's a no-op if the binary already
@@ -29,12 +38,12 @@ func Build(ctx context.Context, force bool) (string, error) {
 	}
 	if !proc.Look("xcaddy") {
 		return "", fmt.Errorf("xcaddy not found on PATH; install it with " +
-			"`go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest`")
+			"`go install github.com/caddyserver/xcaddy/cmd/xcaddy@" + xcaddyVersion + "`")
 	}
 	if err := os.MkdirAll(filepath.Dir(binPath), 0o755); err != nil {
 		return "", fmt.Errorf("create caddy dir: %w", err)
 	}
-	if err := proc.RunPassthrough(ctx, "xcaddy", "build", "--output", binPath, "--with", l4Module); err != nil {
+	if err := proc.RunPassthrough(ctx, "xcaddy", xcaddyBuildArgs(binPath)...); err != nil {
 		return "", fmt.Errorf("xcaddy build: %w", err)
 	}
 	return binPath, nil

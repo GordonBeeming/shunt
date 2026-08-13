@@ -59,3 +59,17 @@ func TestFromReleaseChannelDirName(t *testing.T) {
 		t.Errorf("got project=%q siding=%q", loc.Project, loc.Siding)
 	}
 }
+
+func TestFromNightlyChannelDirName(t *testing.T) {
+	prev := config.Channel
+	defer func() { config.Channel = prev }()
+	config.Channel = "nightly"
+
+	loc, err := From("/Users/x/repos/.shunt-nightly/myapp/exp3/src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc.Project != "myapp" || loc.ConfigDir != "/Users/x/repos/.shunt-nightly/myapp" || loc.Siding != "exp3" {
+		t.Errorf("got project=%q configDir=%q siding=%q", loc.Project, loc.ConfigDir, loc.Siding)
+	}
+}

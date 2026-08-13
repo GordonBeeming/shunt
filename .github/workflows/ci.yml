@@ -11,8 +11,8 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -38,10 +38,40 @@ jobs:
       contents: read
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
       - name: APFS clone, baseline, and cache tests
         run: go test ./internal/fsclone ./internal/databaseline ./internal/imagecache -race -count=1
+
+  release-hardening:
+    name: Release fixtures and packaging checks
+    permissions:
+      contents: read
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install actionlint v1.7.11
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
+      - name: Lint GitHub Actions workflows
+        run: |
+          actionlint_bin="$(go env GOPATH)/bin/actionlint"
+          "$actionlint_bin" -ignore 'label "(macos-27|apple-container)" is unknown'
+      - name: Shell, renderer, and reproducibility checks
+        run: |
+          shellcheck packaging/nightly/*.sh packaging/homebrew/render.sh
+          packaging/nightly/fixtures.sh
+          ruby -c packaging/homebrew/shunt-nightly.rb.tmpl
+          packaging/nightly/package.sh 0.0.0-nightly.1 "$RUNNER_TEMP/a"
+          packaging/nightly/package.sh 0.0.0-nightly.1 "$RUNNER_TEMP/b"
+          cmp "$RUNNER_TEMP/a/shunt-nightly_darwin_arm64.tar.gz" "$RUNNER_TEMP/b/shunt-nightly_darwin_arm64.tar.gz"
+          packaging/homebrew/render.sh 0.0.0-nightly.1 nightly-1 "$(printf 'a%.0s' {1..64})" "$RUNNER_TEMP/shunt-nightly.rb"
+          test -f "$RUNNER_TEMP/shunt-nightly.rb"
+          brew style "$RUNNER_TEMP/shunt-nightly.rb"

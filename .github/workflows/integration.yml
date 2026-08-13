@@ -1,7 +1,7 @@
 name: Integration
 
 # Integration tests drive the real Apple `container` runtime + .NET Aspire, so
-# they run on the dedicated self-hosted macOS-26 runner with Apple `container`,
+# they run on the dedicated self-hosted macOS-27 runner with Apple `container`,
 # `dotnet`, and the `aspire` CLI installed. Hosted macOS images do not provide
 # Apple container or enough disk for this base-image smoke. Same-repository PRs
 # run it only after the repository owner marks the change safe to test; fork and
@@ -17,18 +17,22 @@ jobs:
   integration:
     name: integration tests
     if: >-
-      github.event_name != 'pull_request' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event_name == 'schedule' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
        github.event.pull_request.author_association == 'OWNER' &&
        contains(github.event.pull_request.labels.*.name, 'safe-to-test'))
     permissions:
       contents: read
-    runs-on: [self-hosted, macos-26, apple-container]
+    runs-on: [self-hosted, macos-27, apple-container]
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
       - name: verify Apple container prerequisite
@@ -41,16 +45,20 @@ jobs:
         run: go test -p 1 -tags integration ./internal/image ./internal/imagecache ./internal/siding -count=1 -timeout 30m
 
   extended:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: >-
+      (github.event_name == 'schedule' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     name: extended Apple container integration
     permissions:
       contents: read
-    runs-on: [self-hosted, macos-26, apple-container]
+    runs-on: [self-hosted, macos-27, apple-container]
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
       - name: verify Apple container prerequisite

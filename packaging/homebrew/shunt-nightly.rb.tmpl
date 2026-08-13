@@ -1,0 +1,43 @@
+# typed: strict
+# frozen_string_literal: true
+
+# Installs immutable nightly prereleases beside the stable and beta channels.
+class ShuntNightly < Formula
+  desc "Run parallel app experiments in isolated Apple container guests"
+  homepage "https://github.com/GordonBeeming/shunt"
+  url "https://github.com/GordonBeeming/shunt/releases/download/__TAG__/shunt-nightly_darwin_arm64.tar.gz"
+  version "__VERSION__"
+  sha256 "__SHA256__"
+  license "FSL-1.1-MIT"
+
+  depends_on arch: :arm64
+  depends_on "container"
+  depends_on "go"
+  depends_on macos: :tahoe
+
+  def install
+    bin.install "shunt-nightly"
+  end
+
+  def caveats
+    <<~EOS
+      Shunt uses Apple's container runtime. Start it with `container system start`
+      before running `shunt-nightly init`.
+
+      `shunt-nightly init` requires the .NET SDK, even for non-.NET projects.
+
+      `shunt-nightly init` requires xcaddy. Install it with:
+        go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+
+      Ensure Go's bin directory is on PATH:
+        export PATH="$(go env GOPATH)/bin:$PATH"
+    EOS
+  end
+
+  test do
+    output = shell_output("#{bin}/shunt-nightly version")
+    assert_match "channel=nightly", output
+    assert_match "binary=shunt-nightly", output
+    assert_match "version=#{version}", output
+  end
+end

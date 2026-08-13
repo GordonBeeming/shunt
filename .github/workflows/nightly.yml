@@ -1,0 +1,291 @@
+name: Nightly release
+
+on:
+  schedule:
+    - cron: "23 19 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Publish a new nightly even when this commit already has a valid release.
+        required: false
+        default: false
+        type: boolean
+
+# Every job starts read-only. Only the release-state and retention mutations
+# receive a repository write token; tap publishing authenticates independently
+# with its deploy and signing keys.
+permissions:
+  contents: read
+
+concurrency:
+  group: shunt-nightly-publish
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Select nightly release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.select.outputs.tag }}
+      version: ${{ steps.select.outputs.version }}
+      previous_version: ${{ steps.select.outputs.previous_version }}
+      previous_tag: ${{ steps.select.outputs.previous_tag }}
+      previous_sha256: ${{ steps.select.outputs.previous_sha256 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Select tag by immutable release precedence
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "nightly releases require main; got $GITHUB_REF" >&2; exit 1; }
+          tap_dir="$RUNNER_TEMP/homebrew-tap"
+          packaging/nightly/retry.sh 4 packaging/nightly/clone-tap.sh https://github.com/GordonBeeming/homebrew-tap.git "$tap_dir"
+          packaging/nightly/retry.sh 4 packaging/nightly/read-releases.sh "$RUNNER_TEMP/releases.json"
+          GITHUB_SHA="$GITHUB_SHA" TAP_FORMULA="$tap_dir/Formula/shunt-nightly.rb" \
+            packaging/nightly/select-release.sh "$FORCE" "$GITHUB_RUN_NUMBER" "$RUNNER_TEMP/releases.json" | tee "$RUNNER_TEMP/selection"
+          cat "$RUNNER_TEMP/selection" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Build and validate release payload
+    needs: gate
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install actionlint v1.7.11
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
+      - name: Run release fixtures and lint scripts
+        run: |
+          "$(go env GOPATH)/bin/actionlint" -ignore 'label "(macos-27|apple-container)" is unknown' .github/workflows/ci.yml .github/workflows/integration.yml .github/workflows/nightly.yml
+          packaging/nightly/fixtures.sh
+          bash packaging/homebrew/consumer-fixtures.sh
+          bash .github/workflows/fixtures/integration-conditions.sh
+          bash .github/workflows/fixtures/nightly-contract.sh
+          shellcheck packaging/nightly/*.sh packaging/homebrew/render.sh .github/workflows/fixtures/*.sh
+          ruby -c packaging/homebrew/shunt-nightly.rb.tmpl
+      - name: Build two deterministic archives
+        id: package
+        run: |
+          set -euo pipefail
+          packaging/nightly/package.sh "${{ needs.gate.outputs.version }}" "$RUNNER_TEMP/a"
+          packaging/nightly/package.sh "${{ needs.gate.outputs.version }}" "$RUNNER_TEMP/b"
+          cmp "$RUNNER_TEMP/a/shunt-nightly_darwin_arm64.tar.gz" "$RUNNER_TEMP/b/shunt-nightly_darwin_arm64.tar.gz"
+          sha256=$(awk '{print $1}' "$RUNNER_TEMP/a/shunt-nightly_darwin_arm64.tar.gz.sha256")
+          packaging/homebrew/render.sh "${{ needs.gate.outputs.version }}" "${{ needs.gate.outputs.tag }}" "$sha256" "$RUNNER_TEMP/shunt-nightly.rb"
+          brew style "$RUNNER_TEMP/shunt-nightly.rb"
+          brew audit --strict --formula "$RUNNER_TEMP/shunt-nightly.rb"
+          mkdir -p "$RUNNER_TEMP/release-payload"
+          cp "$RUNNER_TEMP/a/shunt-nightly_darwin_arm64.tar.gz" "$RUNNER_TEMP/a/shunt-nightly_darwin_arm64.tar.gz.sha256" "$RUNNER_TEMP/release-payload/"
+          cp "$RUNNER_TEMP/shunt-nightly.rb" "$RUNNER_TEMP/release-payload/shunt-nightly.rb"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+      - name: Store verified release payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-release-${{ needs.gate.outputs.tag }}
+          path: ${{ runner.temp }}/release-payload
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish immutable release
+    needs: [gate, package]
+    runs-on: macos-15
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    outputs:
+      sha256: ${{ needs.package.outputs.sha256 }}
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.gate.outputs.version }}
+      SHA256: ${{ needs.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Fetch the verified release payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nightly-release-${{ needs.gate.outputs.tag }}
+          path: ${{ runner.temp }}/release-payload
+      - name: Authenticate payload before release mutation
+        run: |
+          set -euo pipefail
+          payload="$RUNNER_TEMP/release-payload"
+          actual=$(awk '{print $1}' "$payload/shunt-nightly_darwin_arm64.tar.gz.sha256")
+          [[ "$actual" == "$SHA256" ]] || { echo "artifact checksum metadata does not match the validated digest" >&2; exit 1; }
+          (cd "$payload" && printf '%s  %s\n' "$SHA256" shunt-nightly_darwin_arm64.tar.gz | shasum -a 256 -c -)
+      - name: Create, authenticate, and publish immutable prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: packaging/nightly/publish-release.sh "$TAG" "$VERSION" "$GITHUB_SHA" "$RUNNER_TEMP/release-payload"
+
+  candidate-consumer:
+    name: Validate anonymous release-formula candidate
+    needs: [gate, release]
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.gate.outputs.version }}
+      SHA256: ${{ needs.release.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate anonymous release candidate before tap publication
+        run: packaging/nightly/consumer.sh candidate "$VERSION" "$TAG" "$SHA256"
+
+  publish-tap:
+    name: Sign and publish Homebrew formula
+    needs: [gate, release, candidate-consumer]
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - name: Fetch the release-authenticated formula
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nightly-release-${{ needs.gate.outputs.tag }}
+          path: ${{ runner.temp }}/release-payload
+      - name: Validate release-authenticated formula without signing keys
+        run: |
+          set -euo pipefail
+          brew style "$RUNNER_TEMP/release-payload/shunt-nightly.rb"
+          brew audit --strict --formula "$RUNNER_TEMP/release-payload/shunt-nightly.rb"
+      - name: Sign and push release-authenticated Homebrew formula
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          COMMIT_SIGNING_KEY: ${{ secrets.COMMIT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          : "${HOMEBREW_TAP_DEPLOY_KEY:?missing HOMEBREW_TAP_DEPLOY_KEY}"
+          : "${COMMIT_SIGNING_KEY:?missing COMMIT_SIGNING_KEY}"
+          key_dir="$RUNNER_TEMP/shunt-nightly-ssh"
+          mkdir -m 700 "$key_dir"
+          trap 'rm -rf "$key_dir"' EXIT
+          printf '%s\n' "$HOMEBREW_TAP_DEPLOY_KEY" > "$key_dir/tap"
+          printf '%s\n' "$COMMIT_SIGNING_KEY" > "$key_dir/signing"
+          chmod 600 "$key_dir/tap" "$key_dir/signing"
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$key_dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $key_dir/tap -o IdentitiesOnly=yes -o UserKnownHostsFile=$key_dir/known_hosts -o StrictHostKeyChecking=yes"
+          git clone git@github.com:GordonBeeming/homebrew-tap.git "$RUNNER_TEMP/tap"
+          formula="$RUNNER_TEMP/tap/Formula/shunt-nightly.rb"
+          if cmp -s "$RUNNER_TEMP/release-payload/shunt-nightly.rb" "$formula"; then
+            echo "Homebrew formula already exactly matches the immutable release."
+            exit 0
+          fi
+          cp "$RUNNER_TEMP/release-payload/shunt-nightly.rb" "$formula"
+          cd "$RUNNER_TEMP/tap"
+          git config user.name 'shunt-nightly-release[bot]'
+          git config user.email 'shunt-nightly-release[bot]@users.noreply.github.com'
+          git config gpg.format ssh
+          git config user.signingkey "$key_dir/signing"
+          git config commit.gpgsign true
+          git add Formula/shunt-nightly.rb
+          git commit -S -m "Update shunt-nightly to $VERSION"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then exit 0; fi
+            [[ "$attempt" != 3 ]] || { echo "tap push failed after 3 attempts" >&2; exit 1; }
+            sleep $((attempt * 2))
+            git pull --rebase origin main
+          done
+
+  container-health:
+    name: Post-publication Apple container health
+    needs: [gate, release]
+    runs-on: [self-hosted, macos-27, apple-container]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - name: Run exact-SHA Apple container runtime suite
+        env:
+          SHUNT_CONTAINER_INTEGRATION: '1'
+        run: |
+          set -euo pipefail
+          container --version
+          go test -p 1 -tags integration ./... -count=1 -timeout 30m
+
+  consumer-health:
+    name: Post-publication Homebrew consumer health
+    needs: [gate, release, publish-tap]
+    runs-on: [self-hosted, macos-27, apple-container]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.gate.outputs.version }}
+      SHA256: ${{ needs.release.outputs.sha256 }}
+      PREVIOUS_VERSION: ${{ needs.gate.outputs.previous_version }}
+      PREVIOUS_TAG: ${{ needs.gate.outputs.previous_tag }}
+      PREVIOUS_SHA256: ${{ needs.gate.outputs.previous_sha256 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - name: Validate named public tap formula, binary, and bundled skill
+        run: packaging/nightly/consumer.sh tap "$VERSION" "$TAG" "$SHA256" "$PREVIOUS_VERSION" "$PREVIOUS_TAG" "$PREVIOUS_SHA256"
+
+  retention:
+    name: Retain successful public nightlies
+    needs: [gate, container-health, consumer-health]
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prune releases only after public consumer health passes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          packaging/nightly/retry.sh 4 packaging/nightly/read-releases.sh "$RUNNER_TEMP/releases.json"
+          while IFS= read -r old_tag; do
+            [[ -n "$old_tag" && "$old_tag" != "$TAG" ]] || continue
+            echo "deleting retained-window overflow release $old_tag"
+            packaging/nightly/delete-release.sh "$old_tag"
+          done < <(packaging/nightly/prune-releases.sh "$TAG" "$RUNNER_TEMP/releases.json")

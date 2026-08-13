@@ -119,7 +119,7 @@ func nodeStart(pkgPath string) string {
 
 func skipDir(name string) bool {
 	switch name {
-	case ".git", "node_modules", "bin", "obj", ".shunt", ".shunt-dev", ".shunt-beta":
+	case ".git", "node_modules", "bin", "obj", ".shunt", ".shunt-dev", ".shunt-beta", ".shunt-nightly":
 		return true
 	}
 	return false

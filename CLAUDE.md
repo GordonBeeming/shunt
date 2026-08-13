@@ -15,6 +15,15 @@ go build -ldflags "-X github.com/gordonbeeming/shunt/internal/config.Channel=dev
 shunt-dev skill install --all
 ```
 
+The bundled skill uses an explicit command placeholder. `shunt-dev skill install` renders that placeholder as the binary performing the install, including `shunt-nightly`; literal `.shunt-dev` migration text remains unchanged. To inspect the nightly-rendered copy locally, build the nightly channel and install its skill:
+
+```bash
+go build -ldflags "-X github.com/gordonbeeming/shunt/internal/config.Channel=nightly" -o ~/.local/bin/shunt-nightly .
+shunt-nightly skill install --all
+```
+
+The nightly build is distributed through Homebrew for macOS 26 or newer on Apple silicon. Its first `init` needs Go, `xcaddy`, and the .NET SDK on `PATH`; Apple `container` provides the host runtime. The Aspire CLI remains conditional on an Aspire app. A project moving from dev to nightly must be registered again and start with a new siding and data baseline. Do not copy `.shunt-dev` state or migrate a dev siding.
+
 ## Git
 
 Use the GitButler flow from the global rules (this repo lives on `gitbutler/workspace`; commit with `but`). Sidings themselves are plain-git worktrees — see the global git rule for the carve-out.
