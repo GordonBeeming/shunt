@@ -82,27 +82,23 @@ func loadOrInitializeNewApp(ctx context.Context) (state.App, error) {
 		return state.App{}, fmt.Errorf("get cwd: %w", err)
 	}
 
-	// A cwd inside an existing siding resolves directly to its project state.
-	if loc, resolveErr := resolve.From(cwd); resolveErr == nil && loc.Siding != "" {
-		if app, loadErr := state.LoadApp(loc.ConfigDir); loadErr == nil {
-			if app.LiveSiding == state.HostTarget {
-				app.LiveSiding = ""
-			}
-			return app, nil
-		} else if !errors.Is(loadErr, state.ErrNotFound) {
-			return state.App{}, loadErr
-		}
-	}
-
 	repoRoot, err := gitText(ctx, cwd, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return state.App{}, fmt.Errorf("`%s new` requires a Git repository: %w", bin(), err)
 	}
 	repoRoot = filepath.Clean(repoRoot)
-	configDir, err := config.ProjectConfigDir(repoRoot)
+	loc, existing, err := resolveGitRootProject(repoRoot)
 	if err != nil {
 		return state.App{}, err
 	}
+	if existing != nil {
+		app := *existing
+		if app.LiveSiding == state.HostTarget {
+			app.LiveSiding = ""
+		}
+		return app, nil
+	}
+	configDir := loc.ConfigDir
 
 	var app state.App
 	err = siding.WithProjectOperation(ctx, configDir, func() error {
@@ -139,6 +135,49 @@ func loadOrInitializeNewApp(ctx context.Context) (state.App, error) {
 		return state.App{}, err
 	}
 	return app, nil
+}
+
+// resolveGitRootProject recognizes a Git root as a siding only when durable
+// state records that siding and its canonical source path is exactly this root.
+// A coincidental .shunt[-channel]/<project>/<name>/... path remains its own repo.
+func resolveGitRootProject(repoRoot string) (resolve.Location, *state.App, error) {
+	repoRoot = filepath.Clean(repoRoot)
+	loc, err := resolve.From(repoRoot)
+	if err != nil {
+		return resolve.Location{}, nil, err
+	}
+	if loc.Siding == "" {
+		return loc, nil, nil
+	}
+
+	app, err := state.LoadApp(loc.ConfigDir)
+	if err != nil {
+		if !errors.Is(err, state.ErrNotFound) {
+			return resolve.Location{}, nil, err
+		}
+		return gitRepositoryLocation(repoRoot)
+	}
+	if _, exists := app.Sidings[loc.Siding]; exists {
+		src, _, pathErr := siding.Paths(app, loc.Siding)
+		if pathErr != nil {
+			return resolve.Location{}, nil, pathErr
+		}
+		if filepath.Clean(src) == repoRoot {
+			return loc, &app, nil
+		}
+	}
+	return gitRepositoryLocation(repoRoot)
+}
+
+func gitRepositoryLocation(repoRoot string) (resolve.Location, *state.App, error) {
+	configDir, err := config.ProjectConfigDir(repoRoot)
+	if err != nil {
+		return resolve.Location{}, nil, err
+	}
+	return resolve.Location{
+		Project:   filepath.Base(repoRoot),
+		ConfigDir: configDir,
+	}, nil, nil
 }
 
 func createSiding(ctx context.Context, configDir, name, branch, from string) (state.App, state.Siding, error) {

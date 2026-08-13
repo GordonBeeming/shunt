@@ -13,10 +13,16 @@ import (
 // l4Module is the layer4 plugin that gives Caddy raw TCP proxying (for DB/TCP
 // front-door routes alongside HTTP).
 const (
-	caddyVersion  = "v2.11.4"
-	l4Module      = "github.com/mholt/caddy-l4"
-	l4Version     = "v0.1.2"
-	xcaddyVersion = "v0.4.6"
+	caddyVersion              = "v2.11.4"
+	forwardAuthFixedInVersion = "v2.11.5"
+	// forwardAuthSupported must remain false while the pinned Caddy version is
+	// below the upstream fix. Shunt only generates reverse_proxy and layer4
+	// proxy handlers; this policy blocks forward_auth from becoming supported
+	// accidentally without reviewing a pin update.
+	forwardAuthSupported = false
+	l4Module             = "github.com/mholt/caddy-l4"
+	l4Version            = "v0.1.2"
+	xcaddyVersion        = "v0.4.6"
 )
 
 func xcaddyBuildArgs(binPath string) []string {

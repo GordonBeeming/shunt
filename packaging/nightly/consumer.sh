@@ -12,7 +12,8 @@ usage:
   consumer.sh candidate VERSION TAG SHA256 [--fixture]
   consumer.sh tap VERSION TAG SHA256 [PREVIOUS_VERSION PREVIOUS_TAG PREVIOUS_SHA256] [--fixture]
 
-candidate validates the rendered candidate formula before tap publication.
+candidate downloads and verifies the anonymous archive, then installs and tests
+the rendered candidate formula before tap publication.
 tap renders and installs the exact prior public formula on a clean runner,
 freshly retaps the named formula, then validates an upgrade to the candidate.
 
@@ -83,7 +84,25 @@ fi
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+cleanup_candidate_install=false
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ "$cleanup_candidate_install" == true ]]; then
+    if ! brew uninstall --force "$formula_name"; then
+      echo "failed to clean up the candidate Homebrew install" >&2
+      [[ "$status" -ne 0 ]] || status=1
+    elif [[ -n "$(installed_receipt)" ]]; then
+      echo "candidate Homebrew receipt remained after cleanup" >&2
+      [[ "$status" -ne 0 ]] || status=1
+    fi
+  fi
+  rm -rf "$tmp"
+  exit "$status"
+}
+
+trap cleanup EXIT
 candidate_formula="$tmp/shunt-nightly.rb"
 "$root/packaging/homebrew/render.sh" "$version" "$tag" "$sha256" "$candidate_formula"
 previous_formula="$tmp/previous-shunt-nightly.rb"
@@ -108,8 +127,8 @@ download_anonymous_release() {
   local archive="$tmp/$asset"
   local actual curl_bin=${SHUNT_NIGHTLY_CURL:-curl}
   echo "downloading anonymous release asset: $url"
-  # Candidate validation runs on hosted macOS 15. It verifies the public bytes
-  # without trying to install or execute an arm64/macOS-26+-only formula there.
+  # Verify the complete public archive independently of Homebrew before the
+  # local candidate formula downloads and installs those same immutable bytes.
   env -u GH_TOKEN -u GITHUB_TOKEN "$curl_bin" --fail --silent --show-error --location --max-time 180 --output "$archive" "$url"
   actual=$(shasum -a 256 "$archive" | awk '{print $1}')
   [[ "$actual" == "$sha256" ]] || { printf 'anonymous archive digest mismatch: expected=%s actual=%s\n' "$sha256" "$actual" >&2; exit 1; }
@@ -204,7 +223,13 @@ fi
 
 case "$mode" in
   candidate)
+    command -v brew >/dev/null || { echo "brew is required on the macOS consumer runner" >&2; exit 1; }
     download_anonymous_release
+    uninstall_existing
+    cleanup_candidate_install=true
+    brew install "$candidate_formula"
+    brew test "$candidate_formula"
+    assert_installed_consumer
     ;;
   tap)
     command -v brew >/dev/null || { echo "brew is required on the macOS consumer runner" >&2; exit 1; }

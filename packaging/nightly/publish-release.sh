@@ -33,20 +33,6 @@ release_json="$work/release.json"
 download_dir="$work/downloads"
 mkdir -p "$download_dir"
 
-# GitHub can publish a mutable release successfully even when the repository
-# policy is off. Refuse before creating a draft, because later asset checks
-# cannot make an already-published mutable release safe.
-immutable_setting="$work/immutable-releases.json"
-if ! gh api "repos/$repo/immutable-releases" > "$immutable_setting"; then
-  echo "cannot read the immutable-releases setting; publication is blocked until GitHub reports it enabled" >&2
-  exit 1
-fi
-immutable_state=$(jq -r 'if .enabled == true then "enabled" elif .enabled == false then "disabled" else "invalid" end' "$immutable_setting")
-if [[ "$immutable_state" != enabled ]]; then
-  printf 'immutable releases must be enabled before publication; GitHub reported %s\n' "$immutable_state" >&2
-  exit 1
-fi
-
 fetch_release() {
   "$script_dir/retry.sh" 4 "$script_dir/read-release.sh" "$release_response" "repos/$repo/releases/tags/$tag"
   local status
@@ -72,6 +58,24 @@ download_existing() {
   ((${#names[@]} == 0)) || "$script_dir/retry.sh" 4 gh release download "$tag" --dir "$download_dir" --clobber "${names[@]}"
 }
 
+require_immutable_or_cleanup() {
+  if "$script_dir/verify-immutable-release.sh" "$release_json"; then
+    return 0
+  fi
+
+  # The workflow token cannot read the admin-only immutable-release setting.
+  # This authoritative response is the lock boundary. The exact candidate was
+  # authenticated before this call, so it is safe to reconcile its deletion
+  # before failing; no downstream candidate or tap step may continue.
+  echo "published release $tag was mutable; reconciling deletion before aborting" >&2
+  if "$script_dir/delete-release.sh" "$tag"; then
+    echo "deleted mutable release $tag; enable immutable releases before retrying" >&2
+  else
+    echo "could not reconcile deletion of mutable release $tag" >&2
+  fi
+  return 1
+}
+
 if fetch_release; then
   assert_metadata
 else
@@ -90,7 +94,7 @@ is_draft=$(jq -r '.draft // false' "$release_json")
 if [[ "$is_draft" == false ]]; then
   download_existing
   "$script_dir/verify-release.sh" "$release_json" "$tag" "$commit" "$asset" "$expected" "$download_dir"
-  "$script_dir/verify-immutable-release.sh" "$release_json"
+  require_immutable_or_cleanup || exit 1
   echo "published immutable release already exactly matches $tag"
   exit 0
 fi
@@ -122,5 +126,5 @@ fetch_release
 rm -f "$download_dir/$asset" "$download_dir/$checksum"
 download_existing
 "$script_dir/verify-release.sh" "$release_json" "$tag" "$commit" "$asset" "$expected" "$download_dir"
-"$script_dir/verify-immutable-release.sh" "$release_json"
+require_immutable_or_cleanup || exit 1
 echo "published immutable nightly release $tag"

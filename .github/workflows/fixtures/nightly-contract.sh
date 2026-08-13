@@ -29,6 +29,26 @@ require_consumer_health() {
   }
 }
 
+require_candidate_consumer() {
+  local text="$1" explanation="$2"
+  awk '
+    /^  candidate-consumer:/ { in_job=1; next }
+    in_job && /^  [^[:space:]]/ { exit }
+    in_job { print }
+  ' "$workflow" | grep -Fq -- "$text" || {
+    printf 'missing candidate-consumer workflow contract: %s\n' "$explanation" >&2
+    exit 1
+  }
+}
+
+release_job() {
+  awk '
+    /^  release:/ { in_job=1; next }
+    in_job && /^  [^[:space:]]/ { exit }
+    in_job { print }
+  ' "$workflow"
+}
+
 line_of() {
   local text="$1"
   rg -n -F -- "$text" "$workflow" | head -n1 | cut -d: -f1
@@ -76,6 +96,22 @@ require_consumer_health 'PREVIOUS_TAG: ${{ needs.gate.outputs.previous_tag }}' '
 require_consumer_health 'PREVIOUS_SHA256: ${{ needs.gate.outputs.previous_sha256 }}' 'prior formula checksum reaches consumer health'
 require_consumer_health 'runs-on: macos-26' 'consumer health uses the hosted macOS 26 runner'
 require_consumer_health 'packaging/nightly/consumer.sh tap "$VERSION" "$TAG" "$SHA256" "$PREVIOUS_VERSION" "$PREVIOUS_TAG" "$PREVIOUS_SHA256"' 'consumer health validates the public tap install and upgrade path'
+require_candidate_consumer 'runs-on: macos-26' 'candidate validation uses the hosted arm64 macOS 26 runner'
+require_candidate_consumer 'packaging/nightly/consumer.sh candidate "$VERSION" "$TAG" "$SHA256"' 'candidate validation installs and tests the local formula before publication'
+release_job | grep -Fq 'GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}' || {
+  echo 'release job must use the dedicated immutable settings read token' >&2
+  exit 1
+}
+release_job | grep -Fq 'gh api "repos/$GITHUB_REPOSITORY/immutable-releases"' || {
+  echo 'release job must verify immutable releases before mutation' >&2
+  exit 1
+}
+immutable_preflight_line=$(release_job | rg -n -F 'gh api "repos/$GITHUB_REPOSITORY/immutable-releases"' | head -n1 | cut -d: -f1)
+release_checkout_line=$(release_job | rg -n -F 'uses: actions/checkout@' | head -n1 | cut -d: -f1)
+[[ -n "$immutable_preflight_line" && -n "$release_checkout_line" && "$immutable_preflight_line" -lt "$release_checkout_line" ]] || {
+  echo 'immutable-release preflight must run before release checkout' >&2
+  exit 1
+}
 
 write_scopes=$(rg -F -c 'contents: write' "$workflow" | awk -F: '{sum += $NF} END {print sum + 0}')
 [[ "$write_scopes" == 2 ]] || {

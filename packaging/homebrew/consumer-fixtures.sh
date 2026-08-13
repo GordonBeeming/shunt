@@ -37,6 +37,7 @@ install_binary() {
   cat > "$state/cellar/bin/shunt-nightly" <<'BIN'
 #!/usr/bin/env bash
 set -euo pipefail
+echo "shunt-nightly $*" >> "${MOCK_BREW_STATE:?}/calls"
 case "${1:-}" in
   version) echo "shunt channel=nightly binary=shunt-nightly version=${MOCK_TARGET_VERSION:?}" ;;
   skill)
@@ -67,7 +68,10 @@ case "${1:-}" in
     ;;
   upgrade) install_binary "$target" ;;
   uninstall) : > "$state/version"; rm -f "$state/bin/shunt-nightly" ;;
-  test|update) : ;;
+  test)
+    [[ "${MOCK_BREW_TEST_FAIL:-false}" != true ]]
+    ;;
+  update) : ;;
   untap)
     [[ "${2:-}" == --force && "${3:-}" == gordonbeeming/tap ]]
     ;;
@@ -87,7 +91,7 @@ echo "curl $*" >> "$state/calls"
 for ((index = 1; index <= $#; index++)); do
   if [[ "${!index}" == --output ]]; then
     next=$((index + 1))
-    printf payload > "${!next}"
+    printf '%s' "${MOCK_CURL_PAYLOAD:-payload}" > "${!next}"
     break
   fi
 done
@@ -144,10 +148,60 @@ expect_failure run_consumer "$invalid_previous" tap "$version" "$tag" "$sha256" 
 candidate=$(make_mock_tools candidate)
 run_consumer "$candidate" candidate "$version" "$tag" "$sha256"
 grep -Fq 'curl --fail' "$candidate/calls"
-if grep -Fq 'brew ' "$candidate/calls"; then
-  echo 'candidate validation unexpectedly invoked Homebrew' >&2
+grep -Fq ' --output ' "$candidate/calls"
+grep -Eq '^brew install .*/shunt-nightly\.rb$' "$candidate/calls"
+grep -Eq '^brew test .*/shunt-nightly\.rb$' "$candidate/calls"
+grep -Fxq 'brew --prefix' "$candidate/calls"
+grep -Fxq 'brew --prefix shunt-nightly' "$candidate/calls"
+grep -Fxq 'shunt-nightly version' "$candidate/calls"
+grep -Fxq 'shunt-nightly skill install --all' "$candidate/calls"
+grep -Fxq 'brew uninstall --force shunt-nightly' "$candidate/calls"
+[[ -z "$(cat "$candidate/version")" ]] || {
+  echo 'candidate validation left a Homebrew receipt behind' >&2
+  exit 1
+}
+curl_line=$(grep -n -m1 '^curl .* --output ' "$candidate/calls" | cut -d: -f1)
+install_line=$(grep -n -m1 -E '^brew install .*/shunt-nightly\.rb$' "$candidate/calls" | cut -d: -f1)
+[[ -n "$curl_line" && -n "$install_line" && "$curl_line" -lt "$install_line" ]] || {
+  echo 'candidate formula was installed before the anonymous archive digest check' >&2
+  exit 1
+}
+
+candidate_digest_failure=$(make_mock_tools candidate-digest-failure)
+if PATH="$candidate_digest_failure/bin:$PATH" MOCK_BREW_STATE="$candidate_digest_failure" MOCK_TARGET_VERSION="$version" \
+  MOCK_CURL_PAYLOAD=wrong-payload SHUNT_NIGHTLY_CURL=curl \
+  "$root/packaging/nightly/consumer.sh" candidate "$version" "$tag" "$sha256"; then
+  echo 'candidate archive digest mismatch fixture unexpectedly succeeded' >&2
   exit 1
 fi
+if grep -Eq '^brew (install|test) ' "$candidate_digest_failure/calls"; then
+  echo 'candidate archive digest mismatch reached Homebrew installation' >&2
+  exit 1
+fi
+
+candidate_rerun=$(make_mock_tools candidate-rerun "$version")
+run_consumer "$candidate_rerun" candidate "$version" "$tag" "$sha256"
+[[ "$(grep -Fc 'brew uninstall --force shunt-nightly' "$candidate_rerun/calls")" == 2 ]] || {
+  echo 'candidate rerun did not clean both the stale and newly validated installs' >&2
+  exit 1
+}
+[[ -z "$(cat "$candidate_rerun/version")" ]] || {
+  echo 'candidate rerun left a Homebrew receipt behind' >&2
+  exit 1
+}
+
+candidate_test_failure=$(make_mock_tools candidate-test-failure)
+if PATH="$candidate_test_failure/bin:$PATH" MOCK_BREW_STATE="$candidate_test_failure" MOCK_TARGET_VERSION="$version" \
+  MOCK_BREW_TEST_FAIL=true SHUNT_NIGHTLY_CURL=curl \
+  "$root/packaging/nightly/consumer.sh" candidate "$version" "$tag" "$sha256"; then
+  echo 'candidate Homebrew test failure fixture unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -Fxq 'brew uninstall --force shunt-nightly' "$candidate_test_failure/calls"
+[[ -z "$(cat "$candidate_test_failure/version")" ]] || {
+  echo 'failed candidate validation left a Homebrew receipt behind' >&2
+  exit 1
+}
 
 probe_failure=$(make_mock_tools probe-failure)
 if PATH="$probe_failure/bin:$PATH" MOCK_BREW_STATE="$probe_failure" MOCK_TARGET_VERSION="$version" MOCK_CURL_FAIL=true SHUNT_NIGHTLY_CURL=curl \

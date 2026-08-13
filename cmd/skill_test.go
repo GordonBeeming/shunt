@@ -3,6 +3,7 @@ package cmd
 import (
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -11,6 +12,42 @@ import (
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/skillfiles"
 )
+
+func TestRenderedStatusScriptReportsWorktreeOnlyState(t *testing.T) {
+	identity := config.Identity{Channel: "dev", BinaryName: "shunt-dev", ProjectDirName: ".shunt-dev"}
+	dest := t.TempDir()
+	if err := writeSkill(dest, identity); err != nil {
+		t.Fatal(err)
+	}
+	fakeBinary := filepath.Join(t.TempDir(), "shunt-dev")
+	fake := `#!/bin/sh
+printf '%s\n' '{"active":true,"registered":false,"project":"sample","sidings":[{"name":"shell","live":false,"appRunning":false,"guestRunning":false,"src":"/work/shell","ip":"","dashboard":""}]}'
+`
+	if err := os.WriteFile(fakeBinary, []byte(fake), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", filepath.Join(dest, "scripts", "status.sh"))
+	cmd.Env = append(os.Environ(), "SHUNT_BIN="+fakeBinary)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("status script: %v\n%s", err, out)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"shunt worktree-only project: sample",
+		"guest runtime is not registered",
+		"shell",
+		"edit: /work/shell",
+		"next: edit and test in this worktree",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("status output omits %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "next: shunt-dev up shell") {
+		t.Fatalf("worktree-only status suggests unavailable guest operation:\n%s", text)
+	}
+}
 
 func TestWriteSkillRendersCompleteTreeForEachChannel(t *testing.T) {
 	channels := []config.Identity{

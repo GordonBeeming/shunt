@@ -117,6 +117,23 @@ jobs:
       VERSION: ${{ needs.gate.outputs.version }}
       SHA256: ${{ needs.package.outputs.sha256 }}
     steps:
+      # The settings endpoint requires repository Administration(read), which
+      # GITHUB_TOKEN cannot request. Keep this fine-grained token step-scoped
+      # and run it before checkout or any repository-controlled code.
+      - name: Require immutable releases before any release mutation
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?missing IMMUTABLE_RELEASES_READ_TOKEN}"
+          setting=$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases") || {
+            echo "cannot verify immutable releases; enable the setting and provide its Administration(read) token" >&2
+            exit 1
+          }
+          jq -e '.enabled == true' <<<"$setting" >/dev/null || {
+            echo "immutable releases are not enabled for $GITHUB_REPOSITORY" >&2
+            exit 1
+          }
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
@@ -141,8 +158,8 @@ jobs:
   candidate-consumer:
     name: Validate anonymous release-formula candidate
     needs: [gate, release]
-    runs-on: macos-15
-    timeout-minutes: 30
+    runs-on: macos-26
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
@@ -154,7 +171,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Validate anonymous release candidate before tap publication
+      - name: Install and validate anonymous release candidate before tap publication
         run: packaging/nightly/consumer.sh candidate "$VERSION" "$TAG" "$SHA256"
 
   publish-tap:

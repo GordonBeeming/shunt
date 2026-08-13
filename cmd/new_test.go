@@ -117,6 +117,84 @@ func TestNewFromSubdirectoryUsesGitTopLevel(t *testing.T) {
 	}
 }
 
+func TestNewFromExistingSidingReusesCanonicalProjectState(t *testing.T) {
+	repo, configDir, commit := newShellOnlyCommandRepo(t)
+	withWorkingDirectory(t, repo)
+	first := newNewCmd()
+	first.SetArgs([]string{"first", "--branch", commit})
+	if err := first.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	withWorkingDirectory(t, filepath.Join(configDir, "first", "src"))
+	second := newNewCmd()
+	second.SetArgs([]string{"second", "--branch", commit})
+	if err := second.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := state.LoadApp(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(app.Sidings) != 2 || app.Sidings["first"].Name != "first" || app.Sidings["second"].Name != "second" {
+		t.Fatalf("canonical siding state = %#v", app.Sidings)
+	}
+}
+
+func TestNewDoesNotReuseUnrecordedSidingShapedPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := sourceStateTempDir(t)
+	outer := filepath.Join(root, "outer")
+	outerCommit := initializeCommandRepoAt(t, outer)
+	child := filepath.Join(outer, "child")
+	childCommit := initializeCommandRepoAt(t, child)
+
+	childConfigDir, err := config.ProjectConfigDir(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withWorkingDirectory(t, child)
+	seed := newNewCmd()
+	seed.SetArgs([]string{"seed", "--branch", childCommit})
+	if err := seed.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	collisionDir := filepath.Join(childConfigDir, "not-a-recorded-siding", "source")
+	if err := os.MkdirAll(collisionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := sourceGitOutput(t, collisionDir, "rev-parse", "--show-toplevel"); got != outer {
+		t.Fatalf("collision Git root = %q, want %q", got, outer)
+	}
+	withWorkingDirectory(t, collisionDir)
+	leaked := newNewCmd()
+	leaked.SetArgs([]string{"outer-work", "--branch", outerCommit})
+	if err := leaked.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	childApp, err := state.LoadApp(childConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(childApp.Sidings) != 1 || childApp.Sidings["seed"].Name != "seed" {
+		t.Fatalf("child project was changed through collision path: %#v", childApp.Sidings)
+	}
+	outerConfigDir, err := config.ProjectConfigDir(outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outerApp, err := state.LoadApp(outerConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outerApp.RepoPath != outer || len(outerApp.Sidings) != 1 || outerApp.Sidings["outer-work"].Name != "outer-work" {
+		t.Fatalf("actual outer project state = %#v", outerApp)
+	}
+}
+
 func TestNewOutsideGitRepositoryFailsClearly(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	withWorkingDirectory(t, t.TempDir())
@@ -237,6 +315,23 @@ func newShellOnlyCommandRepo(t *testing.T) (repo, configDir, commit string) {
 		t.Fatal(err)
 	}
 	return repo, configDir, commit
+}
+
+func initializeCommandRepoAt(t *testing.T, repo string) string {
+	t.Helper()
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sourceGitOutput(t, repo, "init", "-b", "main")
+	sourceGitOutput(t, repo, "config", "user.name", "Shunt Test")
+	sourceGitOutput(t, repo, "config", "user.email", "shunt@example.test")
+	sourceGitOutput(t, repo, "config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(repo, "source.txt"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sourceGitOutput(t, repo, "add", "source.txt")
+	sourceGitOutput(t, repo, "commit", "-m", "base")
+	return sourceGitOutput(t, repo, "rev-parse", "HEAD")
 }
 
 func TestCreateSidingPinsLatestCleanBaseCommit(t *testing.T) {

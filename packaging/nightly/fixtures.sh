@@ -37,7 +37,6 @@ state=${MOCK_RELEASE_STATE:?}
 assets=${MOCK_RELEASE_ASSETS:?}
 calls=${MOCK_RELEASE_CALLS:?}
 mode=${MOCK_RELEASE_MODE:-none}
-immutable_state=${MOCK_IMMUTABLE_STATE:-enabled}
 tag=${MOCK_RELEASE_TAG:?}
 commit=${MOCK_RELEASE_COMMIT:?}
 record() { printf '%s\n' "$*" >> "$calls"; }
@@ -62,16 +61,6 @@ case "${1:-}" in
       if release_exists; then response 200; exit 0; fi
       response 404
       exit 1
-    fi
-    if [[ "${1:-}" == "repos/GordonBeeming/shunt/immutable-releases" ]]; then
-      record 'immutable-preflight'
-      case "$immutable_state" in
-        enabled) printf '{"enabled":true}\n' ;;
-        disabled) printf '{"enabled":false}\n' ;;
-        unavailable) echo 'immutable release settings are unavailable' >&2; exit 1 ;;
-        *) echo "invalid immutable-state fixture: $immutable_state" >&2; exit 2 ;;
-      esac
-      exit 0
     fi
     if [[ "${1:-}" == --paginate ]]; then
       record 'api-list'
@@ -127,7 +116,11 @@ JSON
         shift
         [[ "$release_tag" == "$tag" && "${1:-}" == --draft=false ]] || exit 2
         record 'release publish'
-        jq '.draft = false | .immutable = true' "$state" > "$state.tmp"
+        if [[ "$mode" == publish-mutable* ]]; then
+          jq '.draft = false | .immutable = false' "$state" > "$state.tmp"
+        else
+          jq '.draft = false | .immutable = true' "$state" > "$state.tmp"
+        fi
         mv "$state.tmp" "$state"
         if [[ "$mode" == publish-swaps-archive ]]; then
           printf 'replaced-at-immutable-lock' > "$assets/shunt-nightly_darwin_arm64.tar.gz"
@@ -140,7 +133,7 @@ JSON
         [[ "$release_tag" == "$tag" ]] || exit 2
         record 'release delete'
         : > "$state"
-        [[ "$mode" != delete-after-success ]] || exit 1
+        [[ "$mode" != delete-after-success && "$mode" != publish-mutable-delete-after-success ]] || exit 1
         ;;
       *) echo "unexpected gh release invocation: $*" >&2; exit 2 ;;
     esac
@@ -152,13 +145,12 @@ MOCK
 }
 
 run_publisher() {
-  local directory=$1 mode=$2 immutable_state=${3:-enabled}
+  local directory=$1 mode=$2
   PATH="$directory/bin:$PATH" \
     MOCK_RELEASE_STATE="$directory/state.json" \
     MOCK_RELEASE_ASSETS="$directory/remote-assets" \
     MOCK_RELEASE_CALLS="$directory/calls" \
     MOCK_RELEASE_MODE="$mode" \
-    MOCK_IMMUTABLE_STATE="$immutable_state" \
     MOCK_RELEASE_TAG="$tag" \
     MOCK_RELEASE_COMMIT="$commit" \
     GITHUB_REPOSITORY=GordonBeeming/shunt \
@@ -191,21 +183,8 @@ write_release() {
 clean=$(prepare_case clean)
 run_publisher "$clean" none
 jq -e '.draft == false and .immutable == true and ([.assets[].name] | sort == ["shunt-nightly_darwin_arm64.tar.gz","shunt-nightly_darwin_arm64.tar.gz.sha256"])' "$clean/state.json" >/dev/null
-
-# The repository setting is read before every mutation. Disabled or unreadable
-# policy blocks release creation rather than publishing an asset that can change.
-disabled=$(prepare_case immutable-disabled)
-expect_failure run_publisher "$disabled" none disabled
-grep -Fxq 'immutable-preflight' "$disabled/calls"
-if rg -q 'release (create|upload|publish)' "$disabled/calls"; then
-  echo 'disabled immutable releases permitted a mutation' >&2
-  exit 1
-fi
-unavailable=$(prepare_case immutable-unavailable)
-expect_failure run_publisher "$unavailable" none unavailable
-grep -Fxq 'immutable-preflight' "$unavailable/calls"
-if rg -q 'release (create|upload|publish)' "$unavailable/calls"; then
-  echo 'unavailable immutable releases setting permitted a mutation' >&2
+if rg -q 'immutable-releases|immutable-preflight' "$clean/calls"; then
+  echo 'publisher attempted the admin-only immutable release settings preflight' >&2
   exit 1
 fi
 
@@ -233,6 +212,37 @@ published_count=$(grep -Fxc 'release publish' "$locked_replacement/calls")
   echo "locked replacement made $published_count publish requests" >&2
   exit 1
 }
+
+# A mutable post-publish response must delete only the authenticated candidate
+# and fail, which prevents the workflow from passing it to the tap update.
+mutable=$(prepare_case mutable)
+expect_failure run_publisher "$mutable" publish-mutable
+[[ ! -s "$mutable/state.json" ]] || { echo 'mutable published release was not deleted' >&2; exit 1; }
+grep -Fxq 'release publish' "$mutable/calls"
+grep -Fxq 'release delete' "$mutable/calls"
+if rg -q 'immutable-releases|immutable-preflight' "$mutable/calls"; then
+  echo 'mutable release recovery attempted the admin-only settings preflight' >&2
+  exit 1
+fi
+
+# Deletion may have succeeded before its transport response failed. A 404 on
+# the helper's retry read is a reconciled cleanup, but publication still fails.
+mutable_deleted=$(prepare_case mutable-delete-after-success)
+expect_failure run_publisher "$mutable_deleted" publish-mutable-delete-after-success
+[[ ! -s "$mutable_deleted/state.json" ]] || { echo 'retry-safe mutable cleanup left a release state' >&2; exit 1; }
+deleted_count=$(grep -Fxc 'release delete' "$mutable_deleted/calls")
+[[ "$deleted_count" == 1 ]] || { echo "retry-safe mutable cleanup made $deleted_count delete requests" >&2; exit 1; }
+
+# A mutable published candidate can survive an earlier delete response failure.
+# Resume must reconcile that state too, including the already-deleted 404 case.
+preexisting_mutable=$(prepare_case preexisting-mutable)
+write_release "$preexisting_mutable" false false "$commit" "$asset" "$checksum"
+cp "$preexisting_mutable/payload/$asset" "$preexisting_mutable/remote-assets/$asset"
+cp "$preexisting_mutable/payload/$checksum" "$preexisting_mutable/remote-assets/$checksum"
+expect_failure run_publisher "$preexisting_mutable" delete-after-success
+[[ ! -s "$preexisting_mutable/state.json" ]] || { echo 'pre-existing mutable release was not deleted' >&2; exit 1; }
+preexisting_deleted_count=$(grep -Fxc 'release delete' "$preexisting_mutable/calls")
+[[ "$preexisting_deleted_count" == 1 ]] || { echo "pre-existing mutable cleanup made $preexisting_deleted_count delete requests" >&2; exit 1; }
 
 # A matching partial draft is repairable. An existing mismatched byte is a hard
 # fence and must not issue an upload or publish request.

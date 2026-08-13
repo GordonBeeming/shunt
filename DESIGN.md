@@ -76,6 +76,8 @@ Two ways, picked per app:
 
 Either way a **switch repoints every route as a set** — frontend, API, and DB move to the same siding together — and if any one route fails to repoint, the already-switched ones roll back, so the front door is never half on one siding and half on another.
 
+Shunt pins Caddy v2.11.4 with `caddy-l4` v0.1.2 through xcaddy. Its generated configuration supports reverse-proxy and layer4-proxy handlers only: `forward_auth` is deliberately unsupported while this Caddy pin is below the upstream v2.11.5 fix for the `forward_auth`/`reverse_proxy` advisory. Enable it only as a separately reviewed capability after the fixed version is available and the pin changes.
+
 ## Data per siding
 
 Every declared siding volume is host-backed. Before the first promotion, the canonical source is empty, so the first `up` gets an empty volume set. `data promote` makes a quiesced siding's complete set the next canonical generation; future materializations and `reapply --fresh-data` rebuild from that generation. Baseline-backed sidings use `cp -c`, so writes stay local and removing the siding frees its copy.

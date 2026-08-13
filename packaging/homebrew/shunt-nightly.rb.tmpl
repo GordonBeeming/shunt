@@ -12,6 +12,7 @@ class ShuntNightly < Formula
 
   depends_on arch: :arm64
   depends_on "container"
+  depends_on "dotnet"
   depends_on "go"
   depends_on macos: :tahoe
 
@@ -21,10 +22,8 @@ class ShuntNightly < Formula
 
   def caveats
     <<~EOS
-      Shunt uses Apple's container runtime. Start it with `container system start`
-      before running `shunt-nightly init`.
-
-      `shunt-nightly init` requires the .NET SDK, even for non-.NET projects.
+      `shunt-nightly init` starts Apple's installed container runtime and uses
+      the .NET SDK, even for non-.NET projects.
 
       `shunt-nightly init` requires xcaddy. Install it with:
         go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6

@@ -24,6 +24,12 @@ shunt-nightly skill install --all
 
 The nightly build is distributed through Homebrew for macOS 26 or newer on Apple silicon. Its first `init` needs Go, `xcaddy`, and the .NET SDK on `PATH`; Apple `container` provides the host runtime. The Aspire CLI remains conditional on an Aspire app. A project moving from dev to nightly must be registered again and start with a new siding and data baseline. Do not copy `.shunt-dev` state or migrate a dev siding.
 
+Nightly publication uses a fine-grained `IMMUTABLE_RELEASES_READ_TOKEN` with repository Administration(read) only for the pre-mutation settings check. Store its source in 1Password and expose it only as the same-named Actions secret; release writes continue to use the job-scoped `GITHUB_TOKEN`.
+
+## Caddy pin and forward auth
+
+Caddy is pinned to v2.11.4 with `caddy-l4` v0.1.2 through xcaddy. Do not add or expose `forward_auth` while that pin remains: it is explicitly unsupported until the upstream v2.11.5 fix for the `forward_auth`/`reverse_proxy` advisory is available, the pin is updated, and support is separately reviewed.
+
 ## Git
 
 Use the GitButler flow from the global rules (this repo lives on `gitbutler/workspace`; commit with `but`). Sidings themselves are plain-git worktrees — see the global git rule for the carve-out.
