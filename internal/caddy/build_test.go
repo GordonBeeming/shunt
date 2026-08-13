@@ -22,11 +22,14 @@ func TestXcaddyBuildArgsPinEveryModule(t *testing.T) {
 		t.Fatalf("xcaddy build args = %q, want %q", got, want)
 	}
 	wantManifest := buildManifest{
-		Version:       1,
+		Version:       2,
 		CaddyVersion:  "v2.11.4",
+		CaddySum:      "h1:XKxkMTgNSizEvKG6QHue6cAsFOteU2qA61w2tKkCWi0=",
 		Module:        "github.com/mholt/caddy-l4",
 		ModuleVersion: "v0.1.2",
+		ModuleSum:     "h1:23rhxVar8F5Sl7sYKDgEReI1yT//+e8J7EtMwO2yJpU=",
 		XCaddyVersion: "v0.4.6",
+		XCaddySum:     "h1:/kbArNJZFPewjwlijr83WdssSuhSZ9XT2cDSWmonkjc=",
 		BuildRecipe:   append([]string{"xcaddy"}, xcaddyBuildArgs(buildOutputToken)...),
 		BinarySHA256:  "",
 	}
@@ -172,32 +175,81 @@ func TestBuildRebuildsWhenManifestDoesNotMatch(t *testing.T) {
 	}
 }
 
-func TestBuildRejectsMismatchedXCaddyVersion(t *testing.T) {
-	binPath := filepath.Join(t.TempDir(), "caddy", "shunt")
-	buildCalled := false
-	operations := buildOperations{
-		findXCaddy: func() (string, error) { return "/test/xcaddy", nil },
-		xcaddyVersion: func(_ context.Context, path string) (string, error) {
-			if path != "/test/xcaddy" {
-				t.Fatalf("version path = %q, want /test/xcaddy", path)
+func TestBuildRebuildsWhenManifestAttestationSumDoesNotMatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*buildManifest)
+	}{
+		{name: "Caddy", mutate: func(manifest *buildManifest) { manifest.CaddySum = "h1:wrong" }},
+		{name: "caddy-l4", mutate: func(manifest *buildManifest) { manifest.ModuleSum = "h1:wrong" }},
+		{name: "xcaddy", mutate: func(manifest *buildManifest) { manifest.XCaddySum = "h1:wrong" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			binPath := filepath.Join(t.TempDir(), "caddy", "shunt")
+			if err := os.MkdirAll(filepath.Dir(binPath), 0o755); err != nil {
+				t.Fatal(err)
 			}
-			return "v0.4.5\n", nil
-		},
-		build: func(context.Context, string, []string, ...string) error {
-			buildCalled = true
-			return nil
-		},
-	}
+			if err := os.WriteFile(binPath, []byte("stale"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			stale := manifestForBinary(t, binPath)
+			test.mutate(&stale)
+			if err := writeBuildManifestAtomic(buildManifestPath(binPath), stale); err != nil {
+				t.Fatal(err)
+			}
+			calls := &buildCallCounts{}
 
-	_, err := build(context.Background(), false, binPath, operations)
-	if err == nil || !strings.Contains(err.Error(), "xcaddy version mismatch") {
-		t.Fatalf("build error = %v, want xcaddy version mismatch", err)
+			if _, err := build(context.Background(), false, binPath, successfulBuildOperations(t, binPath, calls)); err != nil {
+				t.Fatalf("rebuild mismatched %s sum: %v", test.name, err)
+			}
+			if calls.build != 1 {
+				t.Fatalf("build calls = %d, want 1", calls.build)
+			}
+			if !buildCacheMatches(binPath, buildManifestPath(binPath), expectedBuildManifest()) {
+				t.Fatal("sum-mismatched manifest was not replaced with the current attested identity")
+			}
+		})
 	}
-	if buildCalled {
-		t.Fatal("build ran with a mismatched xcaddy version")
-	}
-	if _, statErr := os.Stat(buildManifestPath(binPath)); !os.IsNotExist(statErr) {
-		t.Fatalf("manifest exists after version mismatch: %v", statErr)
+}
+
+func TestBuildRejectsMismatchedXCaddyAttestation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		output string
+	}{
+		{name: "wrong version", output: "v0.4.5 " + xcaddyVersionSum + "\n"},
+		{name: "missing sum", output: xcaddyVersion + "\n"},
+		{name: "wrong sum", output: xcaddyVersion + " h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			binPath := filepath.Join(t.TempDir(), "caddy", "shunt")
+			buildCalled := false
+			operations := buildOperations{
+				findXCaddy: func() (string, error) { return "/test/xcaddy", nil },
+				xcaddyVersion: func(_ context.Context, path string) (string, error) {
+					if path != "/test/xcaddy" {
+						t.Fatalf("version path = %q, want /test/xcaddy", path)
+					}
+					return test.output, nil
+				},
+				build: func(context.Context, string, []string, ...string) error {
+					buildCalled = true
+					return nil
+				},
+			}
+
+			_, err := build(context.Background(), false, binPath, operations)
+			if err == nil || !strings.Contains(err.Error(), "xcaddy version mismatch") {
+				t.Fatalf("build error = %v, want xcaddy version mismatch", err)
+			}
+			if buildCalled {
+				t.Fatal("build ran with mismatched xcaddy attestation")
+			}
+			if _, statErr := os.Stat(buildManifestPath(binPath)); !os.IsNotExist(statErr) {
+				t.Fatalf("manifest exists after xcaddy attestation mismatch: %v", statErr)
+			}
+		})
 	}
 }
 
@@ -220,7 +272,7 @@ func TestBuildFailurePreservesMatchingBinaryAndManifest(t *testing.T) {
 	operations := buildOperations{
 		findXCaddy: func() (string, error) { return "/test/xcaddy", nil },
 		xcaddyVersion: func(context.Context, string) (string, error) {
-			return "v0.4.6\n", nil
+			return xcaddyVersion + " " + xcaddyVersionSum + "\n", nil
 		},
 		build: func(context.Context, string, []string, ...string) error {
 			return errors.New("compile failed")
@@ -249,11 +301,11 @@ func TestBuildFailurePreservesMatchingBinaryAndManifest(t *testing.T) {
 }
 
 func TestMatchesXCaddyVersionAcceptsOnlyReleaseOutput(t *testing.T) {
-	validSum := "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	exact := xcaddyVersion + " " + xcaddyVersionSum
 	for _, output := range []string{
-		"v0.4.6",
-		"v0.4.6\n",
-		"v0.4.6 " + validSum + "\n",
+		exact,
+		exact + "\n",
+		" \t" + exact + "\r\n",
 	} {
 		if !matchesXCaddyVersion(output) {
 			t.Errorf("matchesXCaddyVersion(%q) = false, want true", output)
@@ -261,11 +313,14 @@ func TestMatchesXCaddyVersionAcceptsOnlyReleaseOutput(t *testing.T) {
 	}
 	for _, output := range []string{
 		"",
+		xcaddyVersion,
+		xcaddyVersion + "\n",
 		"v0.4.5",
 		"xcaddy v0.4.6",
 		"v0.4.6-dirty",
 		"v0.4.6 h1:not-a-real-sum",
-		"v0.4.6 " + validSum + " => ./local",
+		"v0.4.6 h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		exact + " => ./local",
 	} {
 		if matchesXCaddyVersion(output) {
 			t.Errorf("matchesXCaddyVersion(%q) = true, want false", output)
@@ -273,13 +328,18 @@ func TestMatchesXCaddyVersionAcceptsOnlyReleaseOutput(t *testing.T) {
 	}
 }
 
-func TestControlledBuildEnvironmentRemovesEveryXCaddyVariable(t *testing.T) {
+func TestControlledBuildEnvironmentEnforcesPublicModuleVerification(t *testing.T) {
 	environment := []string{
 		"PATH=/usr/bin:/bin",
 		"XCADDY_SKIP_BUILD=1",
 		"XCADDY_GO_BUILD_FLAGS=-race",
 		"XCADDY_RACE_DETECTOR=1",
 		"XCADDY_SETCAP=1",
+		"GOPROXY=https://proxy.example.test",
+		"GOSUMDB=off",
+		"GOPRIVATE=github.com/caddyserver/*",
+		"GONOPROXY=*",
+		"GONOSUMDB=github.com/mholt/*",
 		"NOT_XCADDY_SKIP_BUILD=keep",
 		"xcaddy_lowercase=keep",
 	}
@@ -287,6 +347,11 @@ func TestControlledBuildEnvironmentRemovesEveryXCaddyVariable(t *testing.T) {
 		"PATH=/usr/bin:/bin",
 		"NOT_XCADDY_SKIP_BUILD=keep",
 		"xcaddy_lowercase=keep",
+		"GOPROXY=https://proxy.golang.org,direct",
+		"GOSUMDB=sum.golang.org",
+		"GOPRIVATE=",
+		"GONOPROXY=",
+		"GONOSUMDB=",
 	}
 	if got := controlledBuildEnvironment(environment); !reflect.DeepEqual(got, want) {
 		t.Fatalf("controlled environment = %q, want %q", got, want)
@@ -299,7 +364,7 @@ func TestBuildRejectsSuccessWithoutNewOutput(t *testing.T) {
 	operations := buildOperations{
 		findXCaddy: func() (string, error) { return "/test/xcaddy", nil },
 		xcaddyVersion: func(context.Context, string) (string, error) {
-			return "v0.4.6\n", nil
+			return xcaddyVersion + " " + xcaddyVersionSum + "\n", nil
 		},
 		build: func(context.Context, string, []string, ...string) error {
 			return nil
@@ -328,7 +393,7 @@ func TestBuildRejectsOutputWithoutOwnerExecutePermission(t *testing.T) {
 	operations := buildOperations{
 		findXCaddy: func() (string, error) { return "/test/xcaddy", nil },
 		xcaddyVersion: func(context.Context, string) (string, error) {
-			return "v0.4.6\n", nil
+			return xcaddyVersion + " " + xcaddyVersionSum + "\n", nil
 		},
 		build: func(_ context.Context, _ string, _ []string, args ...string) error {
 			return os.WriteFile(outputPathFromBuildArgs(t, args), []byte("not-owner-executable"), 0o001)
@@ -356,8 +421,8 @@ func TestVerifyCaddyBuildInfoRequiresExactUnreplacedPins(t *testing.T) {
 		return &debug.BuildInfo{
 			Main: debug.Module{Path: "caddy", Version: "(devel)"},
 			Deps: []*debug.Module{
-				{Path: caddyModule, Version: caddyVersion},
-				{Path: l4Module, Version: l4Version},
+				{Path: caddyModule, Version: caddyVersion, Sum: caddyVersionSum},
+				{Path: l4Module, Version: l4Version, Sum: l4VersionSum},
 				{Path: "example.com/transitive", Version: "v1.0.0"},
 			},
 		}
@@ -373,9 +438,20 @@ func TestVerifyCaddyBuildInfoRequiresExactUnreplacedPins(t *testing.T) {
 	}{
 		{name: "missing Caddy", mutate: func(info *debug.BuildInfo) { info.Deps = info.Deps[1:] }, match: "Caddy module"},
 		{name: "wrong Caddy", mutate: func(info *debug.BuildInfo) { info.Deps[0].Version = "v2.10.2" }, match: "want exactly v2.11.4"},
+		{name: "empty Caddy sum", mutate: func(info *debug.BuildInfo) { info.Deps[0].Sum = "" }, match: "Caddy module sum"},
+		{name: "wrong Caddy sum", mutate: func(info *debug.BuildInfo) { info.Deps[0].Sum = "h1:wrong" }, match: "want exactly " + caddyVersionSum},
+		{name: "duplicate Caddy", mutate: func(info *debug.BuildInfo) {
+			info.Deps = append(info.Deps, &debug.Module{Path: caddyModule, Version: caddyVersion, Sum: caddyVersionSum})
+		}, match: "occurs more than once"},
 		{name: "missing caddy-l4", mutate: func(info *debug.BuildInfo) { info.Deps = append(info.Deps[:1], info.Deps[2:]...) }, match: "caddy-l4 module"},
 		{name: "wrong caddy-l4", mutate: func(info *debug.BuildInfo) { info.Deps[1].Version = "v0.1.1" }, match: "want exactly v0.1.2"},
-		{name: "pinned replacement", mutate: func(info *debug.BuildInfo) { info.Deps[1].Replace = &debug.Module{Path: "../local"} }, match: "uses a replacement"},
+		{name: "empty caddy-l4 sum", mutate: func(info *debug.BuildInfo) { info.Deps[1].Sum = "" }, match: "caddy-l4 module sum"},
+		{name: "wrong caddy-l4 sum", mutate: func(info *debug.BuildInfo) { info.Deps[1].Sum = "h1:wrong" }, match: "want exactly " + l4VersionSum},
+		{name: "duplicate caddy-l4", mutate: func(info *debug.BuildInfo) {
+			info.Deps = append(info.Deps, &debug.Module{Path: l4Module, Version: l4Version, Sum: l4VersionSum})
+		}, match: "occurs more than once"},
+		{name: "Caddy replacement", mutate: func(info *debug.BuildInfo) { info.Deps[0].Replace = &debug.Module{Path: "../local-caddy"} }, match: "uses a replacement"},
+		{name: "caddy-l4 replacement", mutate: func(info *debug.BuildInfo) { info.Deps[1].Replace = &debug.Module{Path: "../local-l4"} }, match: "uses a replacement"},
 		{name: "transitive replacement", mutate: func(info *debug.BuildInfo) { info.Deps[2].Replace = &debug.Module{Path: "../local"} }, match: "uses a replacement"},
 	}
 	for _, test := range tests {
@@ -434,8 +510,10 @@ func TestConcurrentFailedAndSuccessfulBuildsCannotInterleave(t *testing.T) {
 	firstDone := make(chan error, 1)
 	secondDone := make(chan error, 1)
 	firstOperations := buildOperations{
-		findXCaddy:    func() (string, error) { return "/test/xcaddy", nil },
-		xcaddyVersion: func(context.Context, string) (string, error) { return "v0.4.6\n", nil },
+		findXCaddy: func() (string, error) { return "/test/xcaddy", nil },
+		xcaddyVersion: func(context.Context, string) (string, error) {
+			return xcaddyVersion + " " + xcaddyVersionSum + "\n", nil
+		},
 		build: func(context.Context, string, []string, ...string) error {
 			close(firstBuildStarted)
 			<-allowFirstFailure
@@ -448,7 +526,9 @@ func TestConcurrentFailedAndSuccessfulBuildsCannotInterleave(t *testing.T) {
 			close(secondEntered)
 			return "/test/xcaddy", nil
 		},
-		xcaddyVersion: func(context.Context, string) (string, error) { return "v0.4.6\n", nil },
+		xcaddyVersion: func(context.Context, string) (string, error) {
+			return xcaddyVersion + " " + xcaddyVersionSum + "\n", nil
+		},
 		build: func(_ context.Context, _ string, _ []string, args ...string) error {
 			return os.WriteFile(args[3], []byte("second build"), 0o755)
 		},
@@ -504,14 +584,14 @@ func successfulBuildOperations(t *testing.T, binPath string, calls *buildCallCou
 			if path != "/test/xcaddy" {
 				t.Fatalf("version path = %q, want /test/xcaddy", path)
 			}
-			return "v0.4.6 h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n", nil
+			return xcaddyVersion + " " + xcaddyVersionSum + "\n", nil
 		},
 		build: func(_ context.Context, path string, environment []string, args ...string) error {
 			calls.build++
 			if path != "/test/xcaddy" {
 				t.Fatalf("build path = %q, want /test/xcaddy", path)
 			}
-			assertNoXCaddyEnvironment(t, environment)
+			assertControlledBuildEnvironment(t, environment)
 			output := outputPathFromBuildArgs(t, args)
 			if filepath.Dir(output) != filepath.Dir(binPath) || output == binPath {
 				t.Fatalf("temporary output = %q, want unique path beside %q", output, binPath)
@@ -545,12 +625,31 @@ func outputPathFromBuildArgs(t *testing.T, args []string) string {
 	return output
 }
 
-func assertNoXCaddyEnvironment(t *testing.T, environment []string) {
+func assertControlledBuildEnvironment(t *testing.T, environment []string) {
 	t.Helper()
+	want := map[string]string{
+		"GOPROXY":   publicGoProxy,
+		"GOSUMDB":   publicGoSumDB,
+		"GOPRIVATE": "",
+		"GONOPROXY": "",
+		"GONOSUMDB": "",
+	}
+	seen := map[string]int{}
 	for _, entry := range environment {
-		name, _, found := strings.Cut(entry, "=")
+		name, value, found := strings.Cut(entry, "=")
 		if found && strings.HasPrefix(name, "XCADDY_") {
 			t.Fatalf("controlled build environment retained %q", entry)
+		}
+		if expected, exists := want[name]; exists {
+			seen[name]++
+			if value != expected {
+				t.Errorf("controlled build environment has %s=%q, want %q", name, value, expected)
+			}
+		}
+	}
+	for name := range want {
+		if seen[name] != 1 {
+			t.Errorf("controlled build environment has %d %s entries, want exactly one", seen[name], name)
 		}
 	}
 }

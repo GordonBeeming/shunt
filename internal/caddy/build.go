@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"debug/buildinfo"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -35,21 +34,29 @@ const (
 	// proxy handlers; this policy blocks forward_auth from becoming supported
 	// accidentally without reviewing a pin update.
 	forwardAuthSupported = false
+	caddyModule          = "github.com/caddyserver/caddy/v2"
+	caddyVersionSum      = "h1:XKxkMTgNSizEvKG6QHue6cAsFOteU2qA61w2tKkCWi0="
 	l4Module             = "github.com/mholt/caddy-l4"
 	l4Version            = "v0.1.2"
+	l4VersionSum         = "h1:23rhxVar8F5Sl7sYKDgEReI1yT//+e8J7EtMwO2yJpU="
 	xcaddyVersion        = "v0.4.6"
-	caddyModule          = "github.com/caddyserver/caddy/v2"
+	xcaddyVersionSum     = "h1:/kbArNJZFPewjwlijr83WdssSuhSZ9XT2cDSWmonkjc="
 	buildOutputToken     = "<temporary-output>"
+	publicGoProxy        = "https://proxy.golang.org,direct"
+	publicGoSumDB        = "sum.golang.org"
 )
 
-const buildManifestVersion = 1
+const buildManifestVersion = 2
 
 type buildManifest struct {
 	Version       int      `json:"version"`
 	CaddyVersion  string   `json:"caddyVersion"`
+	CaddySum      string   `json:"caddySum"`
 	Module        string   `json:"module"`
 	ModuleVersion string   `json:"moduleVersion"`
+	ModuleSum     string   `json:"moduleSum"`
 	XCaddyVersion string   `json:"xcaddyVersion"`
+	XCaddySum     string   `json:"xcaddySum"`
 	BuildRecipe   []string `json:"buildRecipe"`
 	BinarySHA256  string   `json:"binarySHA256"`
 }
@@ -106,9 +113,12 @@ func expectedBuildManifest() buildManifest {
 	return buildManifest{
 		Version:       buildManifestVersion,
 		CaddyVersion:  caddyVersion,
+		CaddySum:      caddyVersionSum,
 		Module:        l4Module,
 		ModuleVersion: l4Version,
+		ModuleSum:     l4VersionSum,
 		XCaddyVersion: xcaddyVersion,
+		XCaddySum:     xcaddyVersionSum,
 		BuildRecipe:   append([]string{"xcaddy"}, args...),
 	}
 }
@@ -167,9 +177,9 @@ func buildLocked(ctx context.Context, force bool, binPath string, operations bui
 		return "", fmt.Errorf("check xcaddy version: %w", err)
 	}
 	if !matchesXCaddyVersion(versionOutput) {
-		return "", fmt.Errorf("xcaddy version mismatch: got %q, want %s; install it with "+
+		return "", fmt.Errorf("xcaddy version mismatch: got %q, want %s %s; install it with "+
 			"`go install github.com/caddyserver/xcaddy/cmd/xcaddy@%s`",
-			strings.TrimSpace(versionOutput), xcaddyVersion, xcaddyVersion)
+			strings.TrimSpace(versionOutput), xcaddyVersion, xcaddyVersionSum, xcaddyVersion)
 	}
 	tempPath, err := newBuildOutputPath(filepath.Dir(binPath))
 	if err != nil {
@@ -206,15 +216,29 @@ func buildLocked(ctx context.Context, force bool, binPath string, operations bui
 }
 
 func controlledBuildEnvironment(environment []string) []string {
-	controlled := make([]string, 0, len(environment))
+	controlled := make([]string, 0, len(environment)+5)
 	for _, entry := range environment {
 		name, _, found := strings.Cut(entry, "=")
-		if found && strings.HasPrefix(name, "XCADDY_") {
-			continue
+		if found {
+			switch {
+			case strings.HasPrefix(name, "XCADDY_"),
+				name == "GOPROXY",
+				name == "GOSUMDB",
+				name == "GOPRIVATE",
+				name == "GONOPROXY",
+				name == "GONOSUMDB":
+				continue
+			}
 		}
 		controlled = append(controlled, entry)
 	}
-	return controlled
+	return append(controlled,
+		"GOPROXY="+publicGoProxy,
+		"GOSUMDB="+publicGoSumDB,
+		"GOPRIVATE=",
+		"GONOPROXY=",
+		"GONOSUMDB=",
+	)
 }
 
 func newBuildOutputPath(directory string) (string, error) {
@@ -273,13 +297,25 @@ func verifyCaddyBuildInfo(info *debug.BuildInfo) error {
 		}
 		switch module.Path {
 		case caddyModule:
-			if foundCaddy || module.Version != caddyVersion {
+			if foundCaddy {
+				return fmt.Errorf("Caddy module %s occurs more than once", caddyModule)
+			}
+			if module.Version != caddyVersion {
 				return fmt.Errorf("Caddy module version is %q, want exactly %s", module.Version, caddyVersion)
+			}
+			if module.Sum != caddyVersionSum {
+				return fmt.Errorf("Caddy module sum is %q, want exactly %s", module.Sum, caddyVersionSum)
 			}
 			foundCaddy = true
 		case l4Module:
-			if foundL4 || module.Version != l4Version {
+			if foundL4 {
+				return fmt.Errorf("caddy-l4 module %s occurs more than once", l4Module)
+			}
+			if module.Version != l4Version {
 				return fmt.Errorf("caddy-l4 module version is %q, want exactly %s", module.Version, l4Version)
+			}
+			if module.Sum != l4VersionSum {
+				return fmt.Errorf("caddy-l4 module sum is %q, want exactly %s", module.Sum, l4VersionSum)
 			}
 			foundL4 = true
 		}
@@ -386,15 +422,7 @@ func fileSHA256(path string) (string, error) {
 }
 
 func matchesXCaddyVersion(output string) bool {
-	fields := strings.Fields(strings.TrimSpace(output))
-	if len(fields) == 1 {
-		return fields[0] == xcaddyVersion
-	}
-	if len(fields) != 2 || fields[0] != xcaddyVersion || !strings.HasPrefix(fields[1], "h1:") {
-		return false
-	}
-	digest, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(fields[1], "h1:"))
-	return err == nil && len(digest) == 32
+	return strings.TrimSpace(output) == xcaddyVersion+" "+xcaddyVersionSum
 }
 
 func writeBuildManifestAtomic(path string, manifest buildManifest) error {
