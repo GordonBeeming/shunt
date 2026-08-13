@@ -28,7 +28,8 @@ type activeSiding struct {
 }
 
 type activeResult struct {
-	Active     bool           `json:"active"`              // does cwd belong to a shunt-managed project?
+	Active     bool           `json:"active"`              // is cwd a registered shunt app? Kept for existing consumers.
+	Managed    bool           `json:"managed"`             // does cwd belong to a project with durable Shunt state?
 	Registered bool           `json:"registered"`          // has app add published runtime state to the registry?
 	Project    string         `json:"project"`             // project (repo folder) name
 	ConfigDir  string         `json:"configDir,omitempty"` // <repos>/.shunt[-ch]/<project>
@@ -54,7 +55,7 @@ func newActiveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if !res.Active {
+			if !res.Managed {
 				return emitInactive(res, asJSON)
 			}
 
@@ -114,7 +115,8 @@ func activeResultForDir(ctx context.Context, cwd string) (activeResult, error) {
 		return res, nil
 	}
 
-	res.Active = true
+	res.Managed = true
+	res.Active = registered
 	res.ConfigDir = app.ConfigDir
 	res.RepoPath = app.RepoPath
 	for name, s := range app.Sidings {
@@ -157,9 +159,11 @@ func activeProjectForDir(ctx context.Context, cwd string) (resolve.Location, *st
 }
 
 // emitInactive reports a directory with no Shunt state. With --json it prints
-// {active:false} and exits 0 (so scripts can read it); plain mode exits non-zero.
+// {active:false,managed:false} and exits 0 (so scripts can read it); plain mode
+// exits non-zero.
 func emitInactive(res activeResult, asJSON bool) error {
 	res.Active = false
+	res.Managed = false
 	if asJSON {
 		return printJSON(res)
 	}

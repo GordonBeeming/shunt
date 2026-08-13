@@ -66,8 +66,11 @@ jobs:
           "$actionlint_bin"
       - name: Shell, renderer, and reproducibility checks
         run: |
-          shellcheck packaging/nightly/*.sh packaging/homebrew/render.sh
-          packaging/nightly/fixtures.sh
+          shellcheck packaging/nightly/*.sh packaging/homebrew/render.sh .github/workflows/fixtures/*.sh internal/skillfiles/files/scripts/status.sh
+          bash packaging/nightly/fixtures.sh
+          bash packaging/homebrew/consumer-fixtures.sh
+          bash .github/workflows/fixtures/integration-conditions.sh
+          bash .github/workflows/fixtures/nightly-contract.sh
           ruby -c packaging/homebrew/shunt-nightly.rb.tmpl
           packaging/nightly/package.sh 0.0.0-nightly.1 "$RUNNER_TEMP/a"
           packaging/nightly/package.sh 0.0.0-nightly.1 "$RUNNER_TEMP/b"

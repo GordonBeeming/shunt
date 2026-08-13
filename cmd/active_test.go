@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -44,8 +45,8 @@ func TestActiveDiscoversWorktreeOnlyStateFromRepoNestedDirAndSiding(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !got.Active || got.Registered {
-				t.Fatalf("active/registered = %t/%t, want true/false: %#v", got.Active, got.Registered, got)
+			if !got.Managed || got.Active || got.Registered {
+				t.Fatalf("managed/active/registered = %t/%t/%t, want true/false/false: %#v", got.Managed, got.Active, got.Registered, got)
 			}
 			if got.Project != app.Name || got.ConfigDir != configDir || got.RepoPath != repo || got.Siding != tt.cwdSiding {
 				t.Fatalf("resolved project = %#v", got)
@@ -91,7 +92,7 @@ func TestActivePreservesRegisteredProjectDiscovery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !got.Active || !got.Registered || got.Project != app.Name || got.ConfigDir != configDir || got.Siding != tt.cwdSiding {
+			if !got.Managed || !got.Active || !got.Registered || got.Project != app.Name || got.ConfigDir != configDir || got.Siding != tt.cwdSiding {
 				t.Fatalf("registered active result = %#v", got)
 			}
 		})
@@ -135,13 +136,55 @@ func TestActiveDoesNotUseRegisteredProjectWithSameBasename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Active || got.Registered {
-		t.Fatalf("active/registered = %t/%t, want true/false: %#v", got.Active, got.Registered, got)
+	if !got.Managed || got.Active || got.Registered {
+		t.Fatalf("managed/active/registered = %t/%t/%t, want true/false/false: %#v", got.Managed, got.Active, got.Registered, got)
 	}
 	if got.Project != "shared" || got.ConfigDir != shellOnlyConfigDir || got.RepoPath != shellOnlyRepo {
 		t.Fatalf("same-basename shell-only project resolved as %#v", got)
 	}
 	if len(got.Sidings) != 1 || got.Sidings[0].Name != "shell-only-siding" {
 		t.Fatalf("same-basename shell-only sidings = %#v", got.Sidings)
+	}
+}
+
+func TestActiveJSONKeepsLegacyActiveFalseForWorktreeOnlyState(t *testing.T) {
+	repo, _, _ := newShellOnlyCommandRepo(t)
+	withWorkingDirectory(t, repo)
+	cmd := newNewCmd()
+	cmd.SetArgs([]string{"shell"})
+	if err := cmd.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := activeResultForDir(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current struct {
+		Active     bool `json:"active"`
+		Managed    bool `json:"managed"`
+		Registered bool `json:"registered"`
+	}
+	if err := json.Unmarshal(payload, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Active || !current.Managed || current.Registered {
+		t.Fatalf("serialized compatibility fields = %#v, want active=false managed=true registered=false; JSON: %s", current, payload)
+	}
+
+	// A pre-managed-field consumer only observes active and must continue to
+	// treat worktree-only state as not yet registered for guest operations.
+	var legacy struct {
+		Active bool `json:"active"`
+	}
+	if err := json.Unmarshal(payload, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Active {
+		t.Fatalf("legacy active-only consumer sees worktree-only state as registered: %s", payload)
 	}
 }

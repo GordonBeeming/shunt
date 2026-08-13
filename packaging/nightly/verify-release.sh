@@ -23,10 +23,10 @@ if [[ "$actual_tag" != "$tag" || "$actual_target" != "$commit" || "$actual_prere
   exit 1
 fi
 
-asset_count=$(jq --arg asset "$asset" '[.assets[] | select(.name == $asset)] | length' "$release_json")
-checksum_count=$(jq --arg asset "$checksum" '[.assets[] | select(.name == $asset)] | length' "$release_json")
-if [[ "$asset_count" != 1 || "$checksum_count" != 1 ]]; then
-  printf 'release assets differ: expected one %s and one %s; actual archive_count=%s checksum_count=%s\n' "$asset" "$checksum" "$asset_count" "$checksum_count" >&2
+if ! jq -e --arg asset "$asset" --arg checksum "$checksum" '
+  ([.assets[]?.name] | sort) == ([$asset, $checksum] | sort)
+' "$release_json" >/dev/null; then
+  printf 'release assets differ: expected exactly %s and %s\n' "$asset" "$checksum" >&2
   exit 1
 fi
 

@@ -21,7 +21,7 @@ func TestRenderedStatusScriptReportsWorktreeOnlyState(t *testing.T) {
 	}
 	fakeBinary := filepath.Join(t.TempDir(), "shunt-dev")
 	fake := `#!/bin/sh
-printf '%s\n' '{"active":true,"registered":false,"project":"sample","sidings":[{"name":"shell","live":false,"appRunning":false,"guestRunning":false,"src":"/work/shell","ip":"","dashboard":""}]}'
+printf '%s\n' '{"active":false,"managed":true,"registered":false,"project":"sample","sidings":[{"name":"shell","live":false,"appRunning":false,"guestRunning":false,"src":"/work/shell","ip":"","dashboard":""}]}'
 `
 	if err := os.WriteFile(fakeBinary, []byte(fake), 0o700); err != nil {
 		t.Fatal(err)
@@ -46,6 +46,31 @@ printf '%s\n' '{"active":true,"registered":false,"project":"sample","sidings":[{
 	}
 	if strings.Contains(text, "next: shunt-dev up shell") {
 		t.Fatalf("worktree-only status suggests unavailable guest operation:\n%s", text)
+	}
+}
+
+func TestRenderedStatusScriptAcceptsLegacyRegisteredJSON(t *testing.T) {
+	identity := config.Identity{Channel: "dev", BinaryName: "shunt-dev", ProjectDirName: ".shunt-dev"}
+	dest := t.TempDir()
+	if err := writeSkill(dest, identity); err != nil {
+		t.Fatal(err)
+	}
+	fakeBinary := filepath.Join(t.TempDir(), "shunt-dev")
+	fake := `#!/bin/sh
+printf '%s\n' '{"active":true,"project":"sample","sidings":[]}'
+`
+	if err := os.WriteFile(fakeBinary, []byte(fake), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", filepath.Join(dest, "scripts", "status.sh"))
+	cmd.Env = append(os.Environ(), "SHUNT_BIN="+fakeBinary)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("status script: %v\n%s", err, out)
+	}
+	text := string(out)
+	if !strings.Contains(text, "shunt app: sample") || !strings.Contains(text, "no sidings yet") {
+		t.Fatalf("legacy registered JSON was not recognized:\n%s", text)
 	}
 }
 

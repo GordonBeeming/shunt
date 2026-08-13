@@ -267,6 +267,17 @@ cp "$checksum_partial/payload/$checksum" "$checksum_partial/remote-assets/$check
 run_publisher "$checksum_partial" none
 jq -e '.draft == false and .immutable == true' "$checksum_partial/state.json" >/dev/null
 
+# A draft may be repaired only when every existing asset belongs to the exact
+# archive/checksum set. An unexpected file must block before an upload or publish.
+extra_draft=$(prepare_case extra-draft)
+write_release "$extra_draft" true false "$commit" "$asset" unexpected.txt
+cp "$extra_draft/payload/$asset" "$extra_draft/remote-assets/$asset"
+expect_failure run_publisher "$extra_draft" none
+if rg -q 'release (upload|publish|create)' "$extra_draft/calls"; then
+  echo 'draft with an extra asset permitted a release mutation' >&2
+  exit 1
+fi
+
 # An immutable release is resumable only when every invariant already matches.
 immutable=$(prepare_case immutable)
 write_release "$immutable" false true "$commit" "$asset" "$checksum"
@@ -275,6 +286,16 @@ cp "$immutable/payload/$checksum" "$immutable/remote-assets/$checksum"
 run_publisher "$immutable" none
 if rg -q 'release (create|upload|publish)' "$immutable/calls"; then
   echo 'matching immutable release was mutated' >&2
+  exit 1
+fi
+
+immutable_extra=$(prepare_case immutable-extra)
+write_release "$immutable_extra" false true "$commit" "$asset" "$checksum" unexpected.txt
+cp "$immutable_extra/payload/$asset" "$immutable_extra/remote-assets/$asset"
+cp "$immutable_extra/payload/$checksum" "$immutable_extra/remote-assets/$checksum"
+expect_failure run_publisher "$immutable_extra" none
+if rg -q 'release (create|upload|publish)' "$immutable_extra/calls"; then
+  echo 'published immutable release with an extra asset was mutated' >&2
   exit 1
 fi
 

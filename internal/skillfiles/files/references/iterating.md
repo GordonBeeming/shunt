@@ -98,9 +98,13 @@ Shunt does not clone that store per siding. Mount `~/.microsoft/usersecrets` rea
 
 ## Reading `active --json` to decide the next move
 
-- `appRunning == false` → `{{shunt-command}} up <name>`
-- `appRunning == true` but `live == false` → `{{shunt-command}} switch <name>`
-- both `true` → it's already serving; nothing to do
+- `managed == false` → create a worktree with `{{shunt-command}} new <name>`
+- `managed == true` and `registered == false` → edit/test in a siding; add `.shunt.app.json` and run `{{shunt-command}} app add` before any guest operation
+- `registered == true` and `appRunning == false` → `{{shunt-command}} up <name>`
+- `registered == true`, `appRunning == true`, but `live == false` → `{{shunt-command}} switch <name>`
+- `registered`, `appRunning`, and `live` all `true` → it's already serving; nothing to do
+
+`active` retains its compatibility meaning of a registered app. New consumers should use `managed` to distinguish no state from worktree-only state, and `registered` before recommending guest commands.
 
 `scripts/status.sh` wraps this and prints the recommended next command.
 

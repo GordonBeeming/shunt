@@ -5,7 +5,7 @@ set -euo pipefail
 BIN="${SHUNT_BIN:-{{shunt-command}}}"
 
 json="$("$BIN" active --json 2>/dev/null || true)"
-if [ -z "$json" ] || ! printf '%s' "$json" | grep -q '"active": *true'; then
+if [ -z "$json" ]; then
   echo "No Shunt state here. Create a siding with: $BIN new <name>"
   exit 0
 fi
@@ -17,7 +17,11 @@ BIN="$BIN" JSON="$tmp" python3 <<'PY'
 import json, os
 b = os.environ["BIN"]
 d = json.load(open(os.environ["JSON"]))
-registered = d.get("registered", True)
+managed = d.get("managed", d.get("active", False))
+if not managed:
+    print(f"No Shunt state here. Create a siding with: {b} new <name>")
+    raise SystemExit(0)
+registered = d.get("registered", d.get("active", False))
 kind = "app" if registered else "worktree-only project"
 print(f"shunt {kind}: {d['project']}")
 if not registered:
