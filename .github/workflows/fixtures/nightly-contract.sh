@@ -8,6 +8,7 @@ set -euo pipefail
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/../../.." && pwd)
 workflow="$root/.github/workflows/nightly.yml"
 workflows_dir="$root/.github/workflows"
+consumer="$root/packaging/nightly/consumer.sh"
 
 require() {
   local text="$1" explanation="$2"
@@ -65,6 +66,11 @@ assert_before() {
   }
 }
 
+consumer_line_of() {
+  local text="$1" occurrence=${2:-1}
+  rg -n -F -- "$text" "$consumer" | sed -n "${occurrence}p" | cut -d: -f1
+}
+
 require 'package:' 'read-only package job'
 require 'release:' 'minimal release mutation job'
 require 'candidate-consumer:' 'anonymous candidate consumer gate'
@@ -98,6 +104,20 @@ require_consumer_health 'runs-on: macos-26' 'consumer health uses the hosted mac
 require_consumer_health 'packaging/nightly/consumer.sh tap "$VERSION" "$TAG" "$SHA256" "$PREVIOUS_VERSION" "$PREVIOUS_TAG" "$PREVIOUS_SHA256"' 'consumer health validates the public tap install and upgrade path'
 require_candidate_consumer 'runs-on: macos-26' 'candidate validation uses the hosted arm64 macOS 26 runner'
 require_candidate_consumer 'packaging/nightly/consumer.sh candidate "$VERSION" "$TAG" "$SHA256"' 'candidate validation installs and tests the local formula before publication'
+candidate_go_line=$(consumer_line_of '    assert_supported_homebrew_go' 1)
+candidate_install_line=$(consumer_line_of '    brew install "$candidate_formula"')
+candidate_test_line=$(consumer_line_of '    brew test "$candidate_formula"')
+tap_go_line=$(consumer_line_of '    assert_supported_homebrew_go' 2)
+tap_success_line=$(consumer_line_of '  assert_installed_consumer' 2)
+[[ -n "$candidate_go_line" && -n "$candidate_install_line" && -n "$candidate_test_line" && \
+  "$candidate_install_line" -lt "$candidate_go_line" && "$candidate_go_line" -lt "$candidate_test_line" ]] || {
+  echo 'candidate Homebrew Go gate must run after formula install and before candidate success checks' >&2
+  exit 1
+}
+[[ -n "$tap_go_line" && -n "$tap_success_line" && "$tap_go_line" -lt "$tap_success_line" ]] || {
+  echo 'named-tap Homebrew Go gate must run before consumer health success' >&2
+  exit 1
+}
 release_job | grep -Fq 'GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}' || {
   echo 'release job must use the dedicated immutable settings read token' >&2
   exit 1

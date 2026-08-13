@@ -144,6 +144,43 @@ assert_absent() {
   [[ -z "$receipt" ]] || { echo "expected no $formula_name install, found: $receipt" >&2; exit 1; }
 }
 
+assert_supported_homebrew_go() {
+  local go_prefix go_bin identity minor patch
+  go_prefix=$(brew --prefix go) || {
+    echo "Homebrew Go is required on the macOS consumer runner" >&2
+    return 1
+  }
+  go_bin="$go_prefix/bin/go"
+  [[ -x "$go_bin" ]] || {
+    echo "Homebrew Go executable is missing or not executable: $go_bin" >&2
+    return 1
+  }
+  identity=$(GOENV=off GOTOOLCHAIN=local "$go_bin" version) || {
+    echo "could not read the Homebrew Go toolchain identity: $go_bin" >&2
+    return 1
+  }
+  if [[ ! "$identity" =~ ^go\ version\ go1\.(25|26)\.(0|[1-9][0-9]*)\ darwin/arm64$ ]]; then
+    printf 'unsupported Homebrew Go toolchain identity %q; need Go 1.25.13+ or 1.26.6+ on darwin/arm64\n' "$identity" >&2
+    return 1
+  fi
+  minor=${BASH_REMATCH[1]}
+  patch=${BASH_REMATCH[2]}
+  case "$minor" in
+    25)
+      if ((patch < 13)); then
+        printf 'unsupported Homebrew Go toolchain identity %q; need Go 1.25.13+ or 1.26.6+ on darwin/arm64\n' "$identity" >&2
+        return 1
+      fi
+      ;;
+    26)
+      if ((patch < 6)); then
+        printf 'unsupported Homebrew Go toolchain identity %q; need Go 1.25.13+ or 1.26.6+ on darwin/arm64\n' "$identity" >&2
+        return 1
+      fi
+      ;;
+  esac
+}
+
 uninstall_existing() {
   if [[ -n "$(installed_receipt)" ]]; then
     brew uninstall --force "$formula_name"
@@ -228,6 +265,7 @@ case "$mode" in
     uninstall_existing
     cleanup_candidate_install=true
     brew install "$candidate_formula"
+    assert_supported_homebrew_go
     brew test "$candidate_formula"
     assert_installed_consumer
     ;;
@@ -249,6 +287,7 @@ case "$mode" in
       printf 'unexpected Homebrew receipt after fresh retap: %s\n' "$receipt" >&2
       exit 1
     fi
+    assert_supported_homebrew_go
     ;;
 esac
 
