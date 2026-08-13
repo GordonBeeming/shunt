@@ -73,7 +73,7 @@ jobs:
         run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
       - name: Run release fixtures and lint scripts
         run: |
-          "$(go env GOPATH)/bin/actionlint" -ignore 'label "(macos-27|apple-container)" is unknown' .github/workflows/ci.yml .github/workflows/integration.yml .github/workflows/nightly.yml
+          "$(go env GOPATH)/bin/actionlint" .github/workflows/ci.yml .github/workflows/nightly.yml
           packaging/nightly/fixtures.sh
           bash packaging/homebrew/consumer-fixtures.sh
           bash .github/workflows/fixtures/integration-conditions.sh
@@ -216,33 +216,10 @@ jobs:
             git pull --rebase origin main
           done
 
-  container-health:
-    name: Post-publication Apple container health
-    needs: [gate, release]
-    runs-on: [self-hosted, macos-27, apple-container]
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version-file: go.mod
-      - name: Run exact-SHA Apple container runtime suite
-        env:
-          SHUNT_CONTAINER_INTEGRATION: '1'
-        run: |
-          set -euo pipefail
-          container --version
-          go test -p 1 -tags integration ./... -count=1 -timeout 30m
-
   consumer-health:
     name: Post-publication Homebrew consumer health
     needs: [gate, release, publish-tap]
-    runs-on: [self-hosted, macos-27, apple-container]
+    runs-on: macos-26
     timeout-minutes: 60
     permissions:
       contents: read
@@ -266,7 +243,7 @@ jobs:
 
   retention:
     name: Retain successful public nightlies
-    needs: [gate, container-health, consumer-health]
+    needs: [gate, consumer-health]
     runs-on: macos-15
     timeout-minutes: 20
     permissions:

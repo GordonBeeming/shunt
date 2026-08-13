@@ -28,6 +28,16 @@ The nightly build is distributed through Homebrew for macOS 26 or newer on Apple
 
 Use the GitButler flow from the global rules (this repo lives on `gitbutler/workspace`; commit with `but`). Sidings themselves are plain-git worktrees — see the global git rule for the carve-out.
 
+## Local pre-push integration check
+
+Before pushing, run the hardware-dependent integration suite locally:
+
+```bash
+SHUNT_CONTAINER_INTEGRATION=1 go test -p 1 -tags integration ./... -count=1 -timeout 30m
+```
+
+This requires a running Apple container service on macOS 26+ Apple silicon. CI intentionally does not run this suite.
+
 ## Test fixtures
 
 Two real Aspire repos are used to validate the infra and must never appear in shipped docs/README/help: `acme/SampleApp` (fast) and `acme/MyApp` (heavy). They exist only to prove shunt works end to end.

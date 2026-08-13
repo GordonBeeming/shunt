@@ -63,7 +63,7 @@ jobs:
       - name: Lint GitHub Actions workflows
         run: |
           actionlint_bin="$(go env GOPATH)/bin/actionlint"
-          "$actionlint_bin" -ignore 'label "(macos-27|apple-container)" is unknown'
+          "$actionlint_bin"
       - name: Shell, renderer, and reproducibility checks
         run: |
           shellcheck packaging/nightly/*.sh packaging/homebrew/render.sh
