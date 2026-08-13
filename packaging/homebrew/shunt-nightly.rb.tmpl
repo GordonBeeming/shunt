@@ -28,6 +28,9 @@ class ShuntNightly < Formula
       `shunt-nightly init` requires xcaddy. Install it with:
         go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
 
+      Use Go 1.25.12+ on the 1.25 line or Go 1.26.5+ on the 1.26 line.
+      Newer Go minor lines are rejected until reviewed.
+
       Ensure Go's bin directory is on PATH:
         export PATH="$(go env GOPATH)/bin:$PATH"
     EOS

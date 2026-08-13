@@ -30,7 +30,7 @@ brew install gordonbeeming/tap/shunt-nightly
 
 Later, upgrade with `brew update && brew upgrade gordonbeeming/tap/shunt-nightly`.
 
-The first `init` needs Go, `xcaddy`, and the .NET SDK on your `PATH`. Install `xcaddy` with `go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6`, then make sure Go's bin directory is on your `PATH`. Shunt uses `xcaddy` to build its Caddy binary; Apple `container` is the host runtime, and Docker runs inside each guest. The Aspire CLI is required only for .NET Aspire apps.
+The first `init` needs a reviewed Go patch release, `xcaddy`, and the .NET SDK on your `PATH`. Supported Go releases are 1.25.12 or newer on the 1.25 line and 1.26.5 or newer on the 1.26 line; newer minor lines are rejected until reviewed. Install `xcaddy` with `go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6`, then make sure Go's bin directory is on your `PATH`. Shunt uses `xcaddy` to build its Caddy binary; Apple `container` is the host runtime, and Docker runs inside each guest. The Aspire CLI is required only for .NET Aspire apps.
 
 Initialise the nightly channel once, then install its agent skill:
 

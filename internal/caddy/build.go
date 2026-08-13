@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -48,6 +50,7 @@ const (
 	buildGOOS            = "darwin"
 	buildGOARCH          = "arm64"
 	buildGOARM64         = "v8.0"
+	buildWorkspaceToken  = "<build-workspace>"
 )
 
 const buildManifestVersion = 3
@@ -63,7 +66,10 @@ var deterministicGoEnvironment = []string{
 	"GOWORK=off",
 	"GOEXPERIMENT=",
 	"GOTOOLCHAIN=local",
-	"GOTMPDIR=",
+	"GOTMPDIR=" + buildWorkspaceToken + "/tmp",
+	"GOCACHE=" + buildWorkspaceToken + "/gocache",
+	"GOMODCACHE=" + buildWorkspaceToken + "/gomodcache",
+	"GOPATH=" + buildWorkspaceToken + "/gopath",
 	"GOCACHEPROG=",
 	"CGO_ENABLED=0",
 	"GOOS=" + buildGOOS,
@@ -157,7 +163,7 @@ var systemBuildOperations = buildOperations{
 	},
 	goVersion: func(ctx context.Context, goPath string) (string, error) {
 		cmd := exec.CommandContext(ctx, goPath, "env", "GOVERSION", "GOOS", "GOARCH")
-		cmd.Env = controlledBuildEnvironment(os.Environ(), goPath)
+		cmd.Env = controlledGoIdentityEnvironment(os.Environ())
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return "", fmt.Errorf("run %s env: %w: %s", goPath, err, strings.TrimSpace(string(output)))
@@ -177,6 +183,11 @@ var systemBuildOperations = buildOperations{
 	build: func(ctx context.Context, xcaddyPath string, environment []string, args ...string) error {
 		cmd := exec.CommandContext(ctx, xcaddyPath, args...)
 		cmd.Env = environment
+		output, err := xcaddyOutputPath(args)
+		if err != nil {
+			return err
+		}
+		cmd.Dir = filepath.Dir(output)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.Stdin = os.Stdin
@@ -195,6 +206,11 @@ type localBuildLock struct {
 type heldBuildLock struct {
 	file  *os.File
 	local *localBuildLock
+}
+
+type buildWorkspace struct {
+	root   string
+	output string
 }
 
 var localBuildLocks sync.Map
@@ -266,7 +282,7 @@ func build(ctx context.Context, force bool, binPath string, operations buildOper
 	return buildLocked(ctx, force, binPath, operations)
 }
 
-func buildLocked(ctx context.Context, force bool, binPath string, operations buildOperations) (string, error) {
+func buildLocked(ctx context.Context, force bool, binPath string, operations buildOperations) (result string, err error) {
 	goPath, toolchain, err := resolveGoToolchain(ctx, operations)
 	if err != nil {
 		return "", err
@@ -296,32 +312,36 @@ func buildLocked(ctx context.Context, force bool, binPath string, operations bui
 			"`go install github.com/caddyserver/xcaddy/cmd/xcaddy@%s`",
 			strings.TrimSpace(versionOutput), xcaddyVersion, xcaddyVersionSum, xcaddyVersion)
 	}
-	tempPath, err := newBuildOutputPath(filepath.Dir(binPath))
+	workspace, err := newBuildWorkspace(filepath.Dir(binPath))
 	if err != nil {
-		return "", fmt.Errorf("reserve temporary caddy output: %w", err)
+		return "", fmt.Errorf("create isolated Caddy build workspace: %w", err)
 	}
-	defer os.Remove(tempPath)
+	defer func() {
+		if cleanupErr := removeBuildWorkspace(workspace.root); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("clean isolated Caddy build workspace: %w", cleanupErr))
+		}
+	}()
 	if operations.build == nil {
 		return "", errors.New("xcaddy build callback is required")
 	}
-	if err := operations.build(ctx, xcaddyPath, controlledBuildEnvironment(os.Environ(), goPath), xcaddyBuildArgs(tempPath)...); err != nil {
+	if err := operations.build(ctx, xcaddyPath, controlledBuildEnvironment(os.Environ(), goPath, workspace.root), xcaddyBuildArgs(workspace.output)...); err != nil {
 		return "", fmt.Errorf("xcaddy build: %w", err)
 	}
-	if err := validateBuiltExecutable(tempPath); err != nil {
+	if err := validateBuiltExecutable(workspace.output); err != nil {
 		return "", fmt.Errorf("validate xcaddy output: %w", err)
 	}
 	if operations.verifyBinary == nil {
 		return "", errors.New("Caddy build-info verifier is required")
 	}
-	if err := operations.verifyBinary(tempPath, toolchain); err != nil {
+	if err := operations.verifyBinary(workspace.output, toolchain); err != nil {
 		return "", fmt.Errorf("verify xcaddy output: %w", err)
 	}
-	digest, err := fileSHA256(tempPath)
+	digest, err := fileSHA256(workspace.output)
 	if err != nil {
 		return "", fmt.Errorf("digest caddy binary: %w", err)
 	}
 	expected.BinarySHA256 = digest
-	if err := os.Rename(tempPath, binPath); err != nil {
+	if err := os.Rename(workspace.output, binPath); err != nil {
 		return "", fmt.Errorf("install caddy binary: %w", err)
 	}
 	if err := writeBuildManifestAtomic(manifestPath, expected); err != nil {
@@ -330,10 +350,22 @@ func buildLocked(ctx context.Context, force bool, binPath string, operations bui
 	return binPath, nil
 }
 
-func controlledBuildEnvironment(environment []string, goPath string) []string {
+func controlledBuildEnvironment(environment []string, goPath, workspace string) []string {
 	controlled := stripControlledBuildEnvironment(environment)
-	controlled = append(controlled, deterministicGoEnvironment...)
+	for _, setting := range deterministicGoEnvironment {
+		controlled = append(controlled, strings.ReplaceAll(setting, buildWorkspaceToken, workspace))
+	}
 	return append(controlled, "XCADDY_WHICH_GO="+goPath)
+}
+
+func controlledGoIdentityEnvironment(environment []string) []string {
+	controlled := stripControlledBuildEnvironment(environment)
+	return append(controlled,
+		"GOENV=off",
+		"GOTOOLCHAIN=local",
+		"GOOS="+buildGOOS,
+		"GOARCH="+buildGOARCH,
+	)
 }
 
 func stripControlledBuildEnvironment(environment []string) []string {
@@ -358,20 +390,54 @@ func controlledGoVariable(name string) bool {
 	return false
 }
 
-func newBuildOutputPath(directory string) (string, error) {
-	temp, err := os.CreateTemp(directory, ".caddy-build-*")
+func newBuildWorkspace(directory string) (buildWorkspace, error) {
+	root, err := os.MkdirTemp(directory, ".caddy-build-*")
 	if err != nil {
-		return "", err
+		return buildWorkspace{}, err
 	}
-	path := temp.Name()
-	if err := temp.Close(); err != nil {
-		os.Remove(path)
-		return "", err
+	workspace := buildWorkspace{root: root, output: filepath.Join(root, "caddy")}
+	for _, name := range []string{"tmp", "gocache", "gomodcache", "gopath"} {
+		if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
+			return buildWorkspace{}, errors.Join(err, removeBuildWorkspace(root))
+		}
 	}
-	if err := os.Remove(path); err != nil {
-		return "", err
+	return workspace, nil
+}
+
+func xcaddyOutputPath(args []string) (string, error) {
+	for index, arg := range args {
+		if arg != "--output" {
+			continue
+		}
+		if index+1 >= len(args) || !filepath.IsAbs(args[index+1]) {
+			return "", fmt.Errorf("xcaddy build requires an absolute --output path")
+		}
+		return args[index+1], nil
 	}
-	return path, nil
+	return "", errors.New("xcaddy build requires --output")
+}
+
+func removeBuildWorkspace(root string) error {
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, fs.ErrNotExist) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		mode := fs.FileMode(0o600)
+		if entry.IsDir() {
+			mode = 0o700
+		}
+		return os.Chmod(path, mode)
+	})
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return os.RemoveAll(root)
 }
 
 func validateBuiltExecutable(path string) error {
@@ -479,10 +545,28 @@ func resolveGoToolchain(ctx context.Context, operations buildOperations) (string
 
 func parseGoToolchainIdentity(output string) (goToolchainIdentity, error) {
 	fields := strings.Fields(output)
-	if len(fields) != 3 || !strings.HasPrefix(fields[0], "go1.") || fields[1] != buildGOOS || fields[2] != buildGOARCH {
-		return goToolchainIdentity{}, fmt.Errorf("unsupported Go toolchain identity %q; want `go1.x %s %s`", strings.TrimSpace(output), buildGOOS, buildGOARCH)
+	if len(fields) != 3 || fields[1] != buildGOOS || fields[2] != buildGOARCH {
+		return goToolchainIdentity{}, unsupportedGoToolchainError(output)
+	}
+	version := strings.TrimPrefix(fields[0], "go")
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return goToolchainIdentity{}, unsupportedGoToolchainError(output)
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	patch, patchErr := strconv.Atoi(parts[2])
+	if majorErr != nil || minorErr != nil || patchErr != nil || fields[0] != fmt.Sprintf("go%d.%d.%d", major, minor, patch) {
+		return goToolchainIdentity{}, unsupportedGoToolchainError(output)
+	}
+	if major != 1 || !((minor == 25 && patch >= 12) || (minor == 26 && patch >= 5)) {
+		return goToolchainIdentity{}, unsupportedGoToolchainError(output)
 	}
 	return goToolchainIdentity{Version: fields[0]}, nil
+}
+
+func unsupportedGoToolchainError(output string) error {
+	return fmt.Errorf("unsupported Go toolchain identity %q; upgrade to Go 1.25.12+ or Go 1.26.5+ on %s/%s (newer minor and major lines require review)", strings.TrimSpace(output), buildGOOS, buildGOARCH)
 }
 
 func verifyCaddyBuildSettings(settings []debug.BuildSetting) error {

@@ -4,7 +4,7 @@
 
 A siding's guest starts with an empty Docker store. A `0700` content-addressed cache directory keeps immutable image generations, with one Docker-load export per image. It is daemon-free: Apple `container` is the macOS runtime, and Docker runs inside each guest.
 
-The shared first-time setup block in `SKILL.md` is the source of truth for every channel's host prerequisites. It includes `xcaddy`, the .NET SDK, Apple `container`, and the conditional Aspire CLI requirement.
+The shared first-time setup block in `SKILL.md` is the source of truth for every channel's host prerequisites. It includes the reviewed Go patch floors, `xcaddy`, the .NET SDK, Apple `container`, and the conditional Aspire CLI requirement.
 
 The first `up` and guest recreation assure Shunt's exact content-versioned base image before materializing a siding. Worktree-only `new` does not touch the runtime. A stale `latest` tag is never accepted as a substitute, and a missing Shunt base tag is built from the binary's embedded assets instead of being pulled from a registry.
 

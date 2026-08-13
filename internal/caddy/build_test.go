@@ -2,6 +2,7 @@ package caddy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -380,8 +381,15 @@ func TestResolveGoToolchainRequiresAbsoluteValidatedIdentity(t *testing.T) {
 		want       goToolchainIdentity
 		errorMatch string
 	}{
-		{name: "valid", path: "/toolchains/go", version: "go1.26.5\ndarwin\narm64\n", want: testGoToolchain},
+		{name: "Go 1.25 minimum", path: "/toolchains/go", version: "go1.25.12\ndarwin\narm64\n", want: goToolchainIdentity{Version: "go1.25.12"}},
+		{name: "Go 1.26 minimum", path: "/toolchains/go", version: "go1.26.5\ndarwin\narm64\n", want: testGoToolchain},
 		{name: "relative path", path: "bin/go", version: "go1.26.5\ndarwin\narm64\n", errorMatch: "not absolute"},
+		{name: "Go 1.25 too old", path: "/toolchains/go", version: "go1.25.11\ndarwin\narm64\n", errorMatch: "upgrade to Go 1.25.12+ or Go 1.26.5+"},
+		{name: "Go 1.26 too old", path: "/toolchains/go", version: "go1.26.4\ndarwin\narm64\n", errorMatch: "upgrade to Go 1.25.12+ or Go 1.26.5+"},
+		{name: "prerelease", path: "/toolchains/go", version: "go1.26.5rc1\ndarwin\narm64\n", errorMatch: "unsupported Go toolchain identity"},
+		{name: "future minor", path: "/toolchains/go", version: "go1.27.0\ndarwin\narm64\n", errorMatch: "newer minor and major lines require review"},
+		{name: "future major", path: "/toolchains/go", version: "go2.0.0\ndarwin\narm64\n", errorMatch: "newer minor and major lines require review"},
+		{name: "noncanonical", path: "/toolchains/go", version: "go1.026.5\ndarwin\narm64\n", errorMatch: "unsupported Go toolchain identity"},
 		{name: "wrong target", path: "/toolchains/go", version: "go1.26.5\nlinux\narm64\n", errorMatch: "unsupported Go toolchain identity"},
 		{name: "development toolchain", path: "/toolchains/go", version: "devel go1.27-deadbeef\ndarwin\narm64\n", errorMatch: "unsupported Go toolchain identity"},
 		{name: "trailing text", path: "/toolchains/go", version: "go1.26.5\ndarwin\narm64\nunexpected\n", errorMatch: "unsupported Go toolchain identity"},
@@ -467,13 +475,14 @@ func TestControlledBuildEnvironmentEnforcesPublicModuleVerification(t *testing.T
 		"NOT_XCADDY_SKIP_BUILD=keep",
 		"xcaddy_lowercase=keep",
 	}
+	workspace := "/test/workspace"
 	want := append([]string{
 		"PATH=/usr/bin:/bin",
 		"NOT_XCADDY_SKIP_BUILD=keep",
 		"xcaddy_lowercase=keep",
-	}, deterministicGoEnvironment...)
+	}, resolvedDeterministicEnvironment(workspace)...)
 	want = append(want, "XCADDY_WHICH_GO=/test/toolchains/go")
-	if got := controlledBuildEnvironment(environment, "/test/toolchains/go"); !reflect.DeepEqual(got, want) {
+	if got := controlledBuildEnvironment(environment, "/test/toolchains/go", workspace); !reflect.DeepEqual(got, want) {
 		t.Fatalf("controlled environment = %q, want %q", got, want)
 	}
 }
@@ -488,7 +497,7 @@ func TestControlledBuildEnvironmentIgnoresPersistentGoEnvironment(t *testing.T) 
 		t.Fatal(err)
 	}
 	command := exec.Command(goPath, "env", "GOENV", "GOFLAGS", "GOWORK", "GOEXPERIMENT", "GOTOOLCHAIN", "CGO_ENABLED", "GOOS", "GOARCH", "GOARM64")
-	command.Env = controlledBuildEnvironment(append(os.Environ(), "GOENV="+goEnvPath), goPath)
+	command.Env = controlledBuildEnvironment(append(os.Environ(), "GOENV="+goEnvPath), goPath, t.TempDir())
 	output, err := command.Output()
 	if err != nil {
 		t.Fatalf("read controlled go environment: %v", err)
@@ -496,6 +505,152 @@ func TestControlledBuildEnvironmentIgnoresPersistentGoEnvironment(t *testing.T) 
 	want := "\n\noff\n\nlocal\n0\ndarwin\narm64\nv8.0\n"
 	if string(output) != want {
 		t.Fatalf("controlled go env output = %q, want %q", output, want)
+	}
+}
+
+func TestBuildUsesFreshWorkspaceAndIgnoresInheritedCaches(t *testing.T) {
+	poisoned := t.TempDir()
+	poisonedPaths := map[string]string{
+		"GOMODCACHE": filepath.Join(poisoned, "gomodcache"),
+		"GOCACHE":    filepath.Join(poisoned, "gocache"),
+		"GOPATH":     filepath.Join(poisoned, "gopath"),
+		"GOTMPDIR":   filepath.Join(poisoned, "tmp"),
+	}
+	for name, path := range poisonedPaths {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "poisoned"), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(name, path)
+	}
+
+	binPath := filepath.Join(t.TempDir(), "caddy", "shunt")
+	var workspaces []string
+	for range 2 {
+		calls := &buildCallCounts{}
+		operations := successfulBuildOperations(t, binPath, calls)
+		buildOperation := operations.build
+		operations.build = func(ctx context.Context, path string, environment []string, args ...string) error {
+			output := outputPathFromBuildArgs(t, args)
+			workspace := filepath.Dir(output)
+			workspaces = append(workspaces, workspace)
+			actual := environmentMap(environment)
+			for name, leaf := range map[string]string{
+				"GOMODCACHE": "gomodcache",
+				"GOCACHE":    "gocache",
+				"GOPATH":     "gopath",
+				"GOTMPDIR":   "tmp",
+			} {
+				want := filepath.Join(workspace, leaf)
+				if actual[name] != want {
+					t.Fatalf("%s = %q, want fresh workspace path %q", name, actual[name], want)
+				}
+				if _, err := os.Stat(filepath.Join(actual[name], "poisoned")); !os.IsNotExist(err) {
+					t.Fatalf("%s reused poisoned cache contents: %v", name, err)
+				}
+			}
+			return buildOperation(ctx, path, environment, args...)
+		}
+		if _, err := build(context.Background(), true, binPath, operations); err != nil {
+			t.Fatalf("isolated build: %v", err)
+		}
+		if _, err := os.Stat(workspaces[len(workspaces)-1]); !os.IsNotExist(err) {
+			t.Fatalf("build workspace remained after success: %v", err)
+		}
+	}
+	if workspaces[0] == workspaces[1] {
+		t.Fatalf("successive builds reused workspace %q", workspaces[0])
+	}
+	manifest, err := os.ReadFile(buildManifestPath(binPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, workspace := range workspaces {
+		if strings.Contains(string(manifest), workspace) {
+			t.Fatalf("manifest persisted random workspace %q: %s", workspace, manifest)
+		}
+	}
+	var recorded buildManifest
+	if err := json.Unmarshal(manifest, &recorded); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(recorded.GoEnvironment, deterministicGoEnvironment) {
+		t.Fatalf("manifest environment = %q, want stable policy %q", recorded.GoEnvironment, deterministicGoEnvironment)
+	}
+}
+
+func TestBuildCleansWorkspaceAfterFailure(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "caddy", "shunt")
+	var workspace string
+	operations := withTestGo(buildOperations{
+		findXCaddy: func() (string, error) { return "/test/xcaddy", nil },
+		xcaddyVersion: func(context.Context, string) (string, error) {
+			return xcaddyVersion + " " + xcaddyVersionSum + "\n", nil
+		},
+		build: func(_ context.Context, _ string, _ []string, args ...string) error {
+			workspace = filepath.Dir(outputPathFromBuildArgs(t, args))
+			moduleDirectory := filepath.Join(workspace, "gomodcache", "example.com", "module@v1.0.0")
+			if err := os.MkdirAll(moduleDirectory, 0o755); err != nil {
+				return err
+			}
+			moduleFile := filepath.Join(moduleDirectory, "module.go")
+			if err := os.WriteFile(moduleFile, []byte("package module\n"), 0o444); err != nil {
+				return err
+			}
+			if err := os.Chmod(moduleDirectory, 0o555); err != nil {
+				return err
+			}
+			return errors.New("injected build failure")
+		},
+	})
+	if _, err := build(context.Background(), false, binPath, operations); err == nil || !strings.Contains(err.Error(), "injected build failure") {
+		t.Fatalf("build error = %v, want injected failure", err)
+	}
+	if workspace == "" {
+		t.Fatal("build did not create a workspace")
+	}
+	if _, err := os.Stat(workspace); !os.IsNotExist(err) {
+		t.Fatalf("build workspace remained after failure: %v", err)
+	}
+}
+
+func TestRealBuildUsesReviewedToolchainAndFreshCaches(t *testing.T) {
+	if os.Getenv("SHUNT_CADDY_REAL_BUILD") != "1" {
+		t.Skip("set SHUNT_CADDY_REAL_BUILD=1 to exercise xcaddy with fresh authenticated caches")
+	}
+	for _, command := range []string{"go", "xcaddy"} {
+		if _, err := exec.LookPath(command); err != nil {
+			t.Fatalf("%s is required for the real Caddy build: %v", command, err)
+		}
+	}
+	poisoned := t.TempDir()
+	for _, name := range []string{"GOMODCACHE", "GOCACHE", "GOPATH", "GOTMPDIR"} {
+		path := filepath.Join(poisoned, strings.ToLower(name)+"-not-a-directory")
+		if err := os.WriteFile(path, []byte("must not be used"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(name, path)
+	}
+	binPath := filepath.Join(t.TempDir(), "caddy", "shunt")
+	if _, err := build(context.Background(), true, binPath, systemBuildOperations); err != nil {
+		t.Fatalf("real isolated Caddy build: %v", err)
+	}
+	output, err := exec.Command(binPath, "version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("run real Caddy output: %v: %s", err, output)
+	}
+	want := caddyVersion + " " + caddyVersionSum
+	if strings.TrimSpace(string(output)) != want {
+		t.Fatalf("real Caddy version = %q, want %q", strings.TrimSpace(string(output)), want)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(binPath), ".caddy-build-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("real build left isolated workspaces: %q", matches)
 	}
 }
 
@@ -757,10 +912,11 @@ func successfulBuildOperations(t *testing.T, binPath string, calls *buildCallCou
 			if path != "/test/xcaddy" {
 				t.Fatalf("build path = %q, want /test/xcaddy", path)
 			}
-			assertControlledBuildEnvironment(t, environment)
 			output := outputPathFromBuildArgs(t, args)
-			if filepath.Dir(output) != filepath.Dir(binPath) || output == binPath {
-				t.Fatalf("temporary output = %q, want unique path beside %q", output, binPath)
+			workspace := filepath.Dir(output)
+			assertControlledBuildEnvironment(t, environment, workspace)
+			if filepath.Dir(workspace) != filepath.Dir(binPath) || !strings.HasPrefix(filepath.Base(workspace), ".caddy-build-") || filepath.Base(output) != "caddy" {
+				t.Fatalf("temporary output = %q, want caddy in an isolated workspace beside %q", output, binPath)
 			}
 			if _, err := os.Lstat(output); !os.IsNotExist(err) {
 				t.Fatalf("temporary output existed before xcaddy build: %v", err)
@@ -772,8 +928,8 @@ func successfulBuildOperations(t *testing.T, binPath string, calls *buildCallCou
 			if toolchain != testGoToolchain {
 				t.Fatalf("verified toolchain = %#v, want %#v", toolchain, testGoToolchain)
 			}
-			if filepath.Dir(path) != filepath.Dir(binPath) || path == binPath {
-				t.Fatalf("verified path = %q, want temporary output beside %q", path, binPath)
+			if filepath.Dir(filepath.Dir(path)) != filepath.Dir(binPath) || filepath.Base(path) != "caddy" {
+				t.Fatalf("verified path = %q, want workspace output beside %q", path, binPath)
 			}
 			return nil
 		},
@@ -794,10 +950,10 @@ func outputPathFromBuildArgs(t *testing.T, args []string) string {
 	return output
 }
 
-func assertControlledBuildEnvironment(t *testing.T, environment []string) {
+func assertControlledBuildEnvironment(t *testing.T, environment []string, workspace string) {
 	t.Helper()
 	want := map[string]string{"XCADDY_WHICH_GO": "/test/toolchains/go"}
-	for _, setting := range deterministicGoEnvironment {
+	for _, setting := range resolvedDeterministicEnvironment(workspace) {
 		name, value, _ := strings.Cut(setting, "=")
 		want[name] = value
 	}
@@ -819,6 +975,25 @@ func assertControlledBuildEnvironment(t *testing.T, environment []string) {
 			t.Errorf("controlled build environment has %d %s entries, want exactly one", seen[name], name)
 		}
 	}
+}
+
+func resolvedDeterministicEnvironment(workspace string) []string {
+	resolved := make([]string, 0, len(deterministicGoEnvironment))
+	for _, setting := range deterministicGoEnvironment {
+		resolved = append(resolved, strings.ReplaceAll(setting, buildWorkspaceToken, workspace))
+	}
+	return resolved
+}
+
+func environmentMap(environment []string) map[string]string {
+	values := make(map[string]string, len(environment))
+	for _, setting := range environment {
+		name, value, found := strings.Cut(setting, "=")
+		if found {
+			values[name] = value
+		}
+	}
+	return values
 }
 
 func manifestForBinary(t *testing.T, binPath string) buildManifest {

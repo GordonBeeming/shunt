@@ -23,7 +23,7 @@ const universalPrerequisitesHeading = "## Host prerequisites shared by every cha
 const universalPrerequisitesTemplate = `
 ## Host prerequisites shared by every channel
 
-Before %s init, install Apple container, Go, xcaddy, and the .NET SDK on PATH. Docker runs inside each guest; Docker Desktop and OrbStack are not prerequisites. Install xcaddy with:
+Before %s init, install Apple container, a reviewed Go patch release, xcaddy, and the .NET SDK on PATH. Supported Go releases are 1.25.12 or newer on the 1.25 line and 1.26.5 or newer on the 1.26 line; newer minor lines are rejected until reviewed. Docker runs inside each guest; Docker Desktop and OrbStack are not prerequisites. Install xcaddy with:
 
     go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
 
