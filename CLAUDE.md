@@ -15,9 +15,43 @@ go build -ldflags "-X github.com/gordonbeeming/shunt/internal/config.Channel=dev
 shunt-dev skill install --all
 ```
 
+The bundled skill uses an explicit command placeholder. `shunt-dev skill install` renders that placeholder as the binary performing the install, including `shunt-nightly`; literal `.shunt-dev` migration text remains unchanged. To inspect the nightly-rendered copy locally, build the nightly channel and install its skill:
+
+```bash
+go build -ldflags "-X github.com/gordonbeeming/shunt/internal/config.Channel=nightly" -o ~/.local/bin/shunt-nightly .
+shunt-nightly skill install --all
+```
+
+The nightly build is distributed through Homebrew for macOS 26 or newer on Apple silicon. Homebrew's `go@1.25` formula is keg-only. Before the first `init`, select its binary, install `xcaddy` with it, and export both its bin directory and the selected xcaddy bin directory:
+
+```bash
+GO_BIN="$(brew --prefix go@1.25)/bin/go"
+XCADDY_BIN="$("$GO_BIN" env GOPATH | cut -d: -f1)/bin"
+GOBIN="$XCADDY_BIN" "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+export PATH="$(brew --prefix go@1.25)/bin:$XCADDY_BIN:$PATH"
+```
+
+The nightly package gate accepts canonical darwin/arm64 Go 1.25.13 or a later patch on the 1.25 line. Apple `container` provides the host runtime. The Aspire CLI remains conditional on an Aspire app. A project moving from dev to nightly must be registered again and start with a new siding and data baseline. Do not copy `.shunt-dev` state or migrate a dev siding.
+
+Nightly publication uses a fine-grained `IMMUTABLE_RELEASES_READ_TOKEN` with repository Administration(read) only for the pre-mutation settings check. Store its source in 1Password and expose it only as the same-named Actions secret; release writes continue to use the job-scoped `GITHUB_TOKEN`.
+
+## Caddy pin and forward auth
+
+Caddy is pinned to v2.11.4 with `caddy-l4` v0.1.2 through xcaddy. Do not add or expose `forward_auth` while that pin remains: it is explicitly unsupported until the upstream v2.11.5 fix for the `forward_auth`/`reverse_proxy` advisory is available, the pin is updated, and support is separately reviewed.
+
 ## Git
 
 Use the GitButler flow from the global rules (this repo lives on `gitbutler/workspace`; commit with `but`). Sidings themselves are plain-git worktrees — see the global git rule for the carve-out.
+
+## Local pre-push integration check
+
+Before pushing, run the hardware-dependent integration suite locally:
+
+```bash
+SHUNT_CONTAINER_INTEGRATION=1 go test -p 1 -tags integration ./... -count=1 -timeout 30m
+```
+
+This requires a running Apple container service on macOS 26+ Apple silicon. CI intentionally does not run this suite.
 
 ## Test fixtures
 

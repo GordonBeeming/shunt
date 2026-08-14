@@ -76,6 +76,8 @@ Two ways, picked per app:
 
 Either way a **switch repoints every route as a set** — frontend, API, and DB move to the same siding together — and if any one route fails to repoint, the already-switched ones roll back, so the front door is never half on one siding and half on another.
 
+Shunt pins Caddy v2.11.4 with `caddy-l4` v0.1.2 through xcaddy. Its generated configuration supports reverse-proxy and layer4-proxy handlers only: `forward_auth` is deliberately unsupported while this Caddy pin is below the upstream v2.11.5 fix for the `forward_auth`/`reverse_proxy` advisory. Enable it only as a separately reviewed capability after the fixed version is available and the pin changes.
+
 ## Data per siding
 
 Every declared siding volume is host-backed. Before the first promotion, the canonical source is empty, so the first `up` gets an empty volume set. `data promote` makes a quiesced siding's complete set the next canonical generation; future materializations and `reapply --fresh-data` rebuild from that generation. Baseline-backed sidings use `cp -c`, so writes stay local and removing the siding frees its copy.
@@ -92,7 +94,9 @@ The runner is a seam: it decides the start command, the guest env, and how shunt
 
 ## Channels
 
-A build-time `Channel` (`release` / `beta` / `dev`) drives everything channel-scoped: the binary name, the global dir, the Caddy admin and dashboard ports, the LaunchAgent labels, the container-name prefix, and a front-door port offset. So the three install and run side by side without fighting over one proxy or one port.
+A build-time `Channel` (`release` / `beta` / `nightly` / `dev`) drives everything channel-scoped: the binary name, the global dir, the Caddy admin and dashboard ports, the LaunchAgent labels, the container-name prefix, and a front-door port offset. The four channels install and run side by side without fighting over one proxy or one port. The supported nightly distribution target is macOS 26 or newer on Apple silicon (arm64), installed as `shunt-nightly` through Homebrew.
+
+Channel state is deliberately separate. A nightly install does not discover or adopt `.shunt-dev` sidings, control repositories, or data baselines. Register an existing project again with the nightly binary, create a new siding, and prepare its data independently.
 
 ## The dashboard
 
@@ -119,6 +123,7 @@ The dashboard's mutation API accepts only POSTs with a loopback `Host`, exact sa
 - `shunt run <name> <cmd>` — run a command inside the guest from the app's workdir.
 - `shunt warm` — refresh every configured dependency-image tag from its registry.
 - `shunt data promote [siding]` / `data rollback` — replace the complete baseline from a quiesced siding, or swap back one generation.
+- `shunt version`: print the build channel, `version=<build-version>`, and its resolved identity.
 - `shunt dashboard`, `reapply`, `config` — round out the rest.
 
 ## Gotchas worth remembering

@@ -8,9 +8,331 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
+
+func TestNewInitializesWorktreeOnlyStateWithoutContractOrRegistry(t *testing.T) {
+	repo, configDir, commit := newShellOnlyCommandRepo(t)
+	withWorkingDirectory(t, repo)
+
+	cmd := newNewCmd()
+	cmd.SetArgs([]string{"first"})
+	if err := cmd.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := state.LoadApp(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Name != filepath.Base(repo) || app.RepoPath != repo || app.ConfigDir != configDir {
+		t.Fatalf("worktree-only project identity = %#v", app)
+	}
+	if app.ControlRepoPath != filepath.Join(configDir, ".control.git") || app.BaseCommit != commit || app.BaseSiding != "first" {
+		t.Fatalf("worktree-only source state = control %q, base %q @ %q", app.ControlRepoPath, app.BaseSiding, app.BaseCommit)
+	}
+	if app.Runner != "" || app.Start != "" || app.Stop != "" || app.Workdir != "" || app.AppHostPath != "" || len(app.FrontDoor) != 0 || len(app.DataVolumes) != 0 || len(app.Env) != 0 || len(app.Mounts) != 0 || len(app.PrebakeImages) != 0 || len(app.PrebakeBuilds) != 0 || len(app.Volumes) != 0 || app.Memory != "" || app.CPUs != "" || app.HealthPort != 0 || app.HealthPath != "" {
+		t.Fatalf("worktree-only state unexpectedly contains runtime configuration: %#v", app)
+	}
+	sd, ok := app.Sidings["first"]
+	if !ok || sd.MaterializationPhase != state.PhaseWorktree {
+		t.Fatalf("first siding = %#v, exists = %t", sd, ok)
+	}
+	src, _, err := siding.Paths(app, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head := sourceGitOutput(t, src, "rev-parse", "HEAD"); head != commit {
+		t.Fatalf("first siding HEAD = %q, want clean source commit %q", head, commit)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".shunt.app.json")); !os.IsNotExist(err) {
+		t.Fatalf("new created or required a runtime contract: %v", err)
+	}
+	registry, err := state.LoadRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, registered := registry.Projects[app.Name]; registered || len(registry.Projects) != 0 {
+		t.Fatalf("worktree-only project was published to registry: %#v", registry.Projects)
+	}
+	registryPath, err := config.RegistryPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(registryPath); !os.IsNotExist(err) {
+		t.Fatalf("worktree-only new wrote the channel registry: %v", err)
+	}
+}
+
+func TestNewWithBranchWorksBeforeRegistration(t *testing.T) {
+	repo, configDir, commit := newShellOnlyCommandRepo(t)
+	withWorkingDirectory(t, repo)
+
+	cmd := newNewCmd()
+	cmd.SetArgs([]string{"explicit", "--branch", commit})
+	if err := cmd.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	app, err := state.LoadApp(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, _, err := siding.Paths(app, "explicit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head := sourceGitOutput(t, src, "rev-parse", "HEAD"); head != commit {
+		t.Fatalf("explicit siding HEAD = %q, want %q", head, commit)
+	}
+}
+
+func TestNewFromSubdirectoryUsesGitTopLevel(t *testing.T) {
+	repo, configDir, commit := newShellOnlyCommandRepo(t)
+	nested := filepath.Join(repo, "one", "two")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	withWorkingDirectory(t, nested)
+
+	cmd := newNewCmd()
+	cmd.SetArgs([]string{"nested", "--branch", commit})
+	if err := cmd.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	app, err := state.LoadApp(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.RepoPath != repo || app.Name != filepath.Base(repo) {
+		t.Fatalf("subdirectory initialized project as %#v", app)
+	}
+	wrongConfigDir, err := config.ProjectConfigDir(nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.LoadApp(wrongConfigDir); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("subdirectory unexpectedly received project state: %v", err)
+	}
+}
+
+func TestNewFromExistingSidingReusesCanonicalProjectState(t *testing.T) {
+	repo, configDir, commit := newShellOnlyCommandRepo(t)
+	withWorkingDirectory(t, repo)
+	first := newNewCmd()
+	first.SetArgs([]string{"first", "--branch", commit})
+	if err := first.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	withWorkingDirectory(t, filepath.Join(configDir, "first", "src"))
+	second := newNewCmd()
+	second.SetArgs([]string{"second", "--branch", commit})
+	if err := second.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := state.LoadApp(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(app.Sidings) != 2 || app.Sidings["first"].Name != "first" || app.Sidings["second"].Name != "second" {
+		t.Fatalf("canonical siding state = %#v", app.Sidings)
+	}
+}
+
+func TestNewDoesNotReuseUnrecordedSidingShapedPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := sourceStateTempDir(t)
+	outer := filepath.Join(root, "outer")
+	outerCommit := initializeCommandRepoAt(t, outer)
+	child := filepath.Join(outer, "child")
+	childCommit := initializeCommandRepoAt(t, child)
+
+	childConfigDir, err := config.ProjectConfigDir(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withWorkingDirectory(t, child)
+	seed := newNewCmd()
+	seed.SetArgs([]string{"seed", "--branch", childCommit})
+	if err := seed.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	collisionDir := filepath.Join(childConfigDir, "not-a-recorded-siding", "source")
+	if err := os.MkdirAll(collisionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := sourceGitOutput(t, collisionDir, "rev-parse", "--show-toplevel"); got != outer {
+		t.Fatalf("collision Git root = %q, want %q", got, outer)
+	}
+	withWorkingDirectory(t, collisionDir)
+	leaked := newNewCmd()
+	leaked.SetArgs([]string{"outer-work", "--branch", outerCommit})
+	if err := leaked.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	childApp, err := state.LoadApp(childConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(childApp.Sidings) != 1 || childApp.Sidings["seed"].Name != "seed" {
+		t.Fatalf("child project was changed through collision path: %#v", childApp.Sidings)
+	}
+	outerConfigDir, err := config.ProjectConfigDir(outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outerApp, err := state.LoadApp(outerConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outerApp.RepoPath != outer || len(outerApp.Sidings) != 1 || outerApp.Sidings["outer-work"].Name != "outer-work" {
+		t.Fatalf("actual outer project state = %#v", outerApp)
+	}
+}
+
+func TestNewOutsideGitRepositoryFailsClearly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	withWorkingDirectory(t, t.TempDir())
+	cmd := newNewCmd()
+	cmd.SetArgs([]string{"nowhere"})
+	err := cmd.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "requires a Git repository") {
+		t.Fatalf("new outside Git error = %v", err)
+	}
+}
+
+func TestAppAddEnrichesWorktreeOnlyStateAndRegisteredNewStillWorks(t *testing.T) {
+	repo, configDir, commit := newShellOnlyCommandRepo(t)
+	withWorkingDirectory(t, repo)
+	first := newNewCmd()
+	first.SetArgs([]string{"shell"})
+	if err := first.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before, err := state.LoadApp(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract := `{"runner":"node","start":"npm start","frontDoor":[{"key":"web","kind":"http","listenPort":3000,"resource":"web","guestPort":3000}]}`
+	if err := os.WriteFile(filepath.Join(repo, ".shunt.app.json"), []byte(contract), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restore := stubAppAddDependencies(t)
+	t.Cleanup(restore)
+	appAddEnsureControl = func(_ context.Context, control, source, _ string, _ string) (string, error) {
+		if control != before.ControlRepoPath || source != repo {
+			t.Fatalf("app add control/source = %q / %q", control, source)
+		}
+		return "different-seed", nil
+	}
+	if err := newAppAddCmd().ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	registered, err := state.LoadApp(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered.Runner != "node" || registered.Start != "npm start" || registered.ControlRepoPath != before.ControlRepoPath || registered.BaseSiding != before.BaseSiding || registered.BaseCommit != commit {
+		t.Fatalf("enriched registration = %#v", registered)
+	}
+	if got, ok := registered.Sidings["shell"]; !ok || got.Branch != before.Sidings["shell"].Branch {
+		t.Fatalf("app add did not preserve shell siding: %#v", registered.Sidings)
+	}
+	registry, err := state.LoadRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registry.Projects[registered.Name] != configDir {
+		t.Fatalf("registered project entry = %#v", registry.Projects)
+	}
+
+	second := newNewCmd()
+	second.SetArgs([]string{"registered", "--branch", commit})
+	if err := second.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := state.LoadApp(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := after.Sidings["registered"]; !ok || after.Runner != "node" {
+		t.Fatalf("new on registered app = %#v", after)
+	}
+}
+
+func TestConcurrentFirstNewCommandsShareOneProjectState(t *testing.T) {
+	repo, configDir, commit := newShellOnlyCommandRepo(t)
+	withWorkingDirectory(t, repo)
+	errCh := make(chan error, 2)
+	for _, name := range []string{"alpha", "beta"} {
+		name := name
+		go func() {
+			cmd := newNewCmd()
+			cmd.SetArgs([]string{name, "--branch", commit})
+			errCh <- cmd.ExecuteContext(context.Background())
+		}()
+	}
+	for range 2 {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+	app, err := state.LoadApp(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(app.Sidings) != 2 || app.Sidings["alpha"].Name != "alpha" || app.Sidings["beta"].Name != "beta" {
+		t.Fatalf("concurrent first new state = %#v", app.Sidings)
+	}
+}
+
+func newShellOnlyCommandRepo(t *testing.T) (repo, configDir, commit string) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	root := sourceStateTempDir(t)
+	repo = filepath.Join(root, "sample")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sourceGitOutput(t, repo, "init", "-b", "main")
+	sourceGitOutput(t, repo, "config", "user.name", "Shunt Test")
+	sourceGitOutput(t, repo, "config", "user.email", "shunt@example.test")
+	sourceGitOutput(t, repo, "config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(repo, "source.txt"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sourceGitOutput(t, repo, "add", "source.txt")
+	sourceGitOutput(t, repo, "commit", "-m", "base")
+	commit = sourceGitOutput(t, repo, "rev-parse", "HEAD")
+	configDir, err := config.ProjectConfigDir(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repo, configDir, commit
+}
+
+func initializeCommandRepoAt(t *testing.T, repo string) string {
+	t.Helper()
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sourceGitOutput(t, repo, "init", "-b", "main")
+	sourceGitOutput(t, repo, "config", "user.name", "Shunt Test")
+	sourceGitOutput(t, repo, "config", "user.email", "shunt@example.test")
+	sourceGitOutput(t, repo, "config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(repo, "source.txt"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sourceGitOutput(t, repo, "add", "source.txt")
+	sourceGitOutput(t, repo, "commit", "-m", "base")
+	return sourceGitOutput(t, repo, "rev-parse", "HEAD")
+}
 
 func TestCreateSidingPinsLatestCleanBaseCommit(t *testing.T) {
 	app := newSourceStateTestApp(t, true)

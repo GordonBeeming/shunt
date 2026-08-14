@@ -16,7 +16,8 @@ import (
 	"github.com/gordonbeeming/shunt/internal/ui"
 )
 
-// loadCurrentApp resolves the project from cwd and loads its registered app.
+// loadCurrentApp resolves the project from cwd and loads its persistent state.
+// That state may still be worktree-only until app add supplies runtime config.
 func loadCurrentApp() (state.App, resolve.Location, error) {
 	loc, err := resolve.FromCwd()
 	if err != nil {
@@ -35,7 +36,7 @@ func loadCurrentApp() (state.App, resolve.Location, error) {
 	return app, loc, nil
 }
 
-// bin is this build's command name (shunt / shunt-beta / shunt-dev), used in
+// bin is this build's command name (shunt / shunt-beta / shunt-nightly / shunt-dev), used in
 // user-facing hints so copy-pasted commands actually exist on PATH.
 func bin() string { return config.Current().BinaryName }
 

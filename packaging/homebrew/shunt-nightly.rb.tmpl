@@ -1,0 +1,48 @@
+# typed: strict
+# frozen_string_literal: true
+
+# Installs immutable nightly prereleases beside the stable and beta channels.
+class ShuntNightly < Formula
+  desc "Run parallel app experiments in isolated Apple container guests"
+  homepage "https://github.com/GordonBeeming/shunt"
+  url "https://github.com/GordonBeeming/shunt/releases/download/__TAG__/shunt-nightly_darwin_arm64.tar.gz"
+  version "__VERSION__"
+  sha256 "__SHA256__"
+  license "FSL-1.1-MIT"
+
+  depends_on arch: :arm64
+  depends_on "container"
+  depends_on "dotnet"
+  depends_on "go@1.25"
+  depends_on macos: :tahoe
+
+  def install
+    bin.install "shunt-nightly"
+  end
+
+  def caveats
+    <<~EOS
+      `shunt-nightly init` starts Apple's installed container runtime and uses
+      the .NET SDK, even for non-.NET projects.
+
+      `shunt-nightly init` requires xcaddy. Homebrew's go@1.25 formula is
+      keg-only, so select it explicitly and put both its bin directory and the
+      selected xcaddy bin directory on PATH before installing xcaddy and running
+      init:
+        GO_BIN="$(brew --prefix go@1.25)/bin/go"
+        XCADDY_BIN="$("$GO_BIN" env GOPATH | cut -d: -f1)/bin"
+        GOBIN="$XCADDY_BIN" "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+        export PATH="$(brew --prefix go@1.25)/bin:$XCADDY_BIN:$PATH"
+
+      This package gate accepts canonical darwin/arm64 Go 1.25.13 or a later
+      patch on the 1.25 line. Newer Go minor lines are rejected until reviewed.
+    EOS
+  end
+
+  test do
+    output = shell_output("#{bin}/shunt-nightly version")
+    assert_match "channel=nightly", output
+    assert_match "binary=shunt-nightly", output
+    assert_match "version=#{version}", output
+  end
+end

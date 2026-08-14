@@ -20,6 +20,7 @@ func TestAppleContainerGuestDockerAdmission(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	baseTag := Tag()
+	t.Logf("using base image %s", baseTag)
 	baseExisted := Exists(ctx, baseTag)
 	if err := EnsureBuilt(ctx, false); err != nil {
 		t.Fatalf("build content-versioned base image: %v", err)
@@ -50,7 +51,10 @@ func TestAppleContainerGuestDockerAdmission(t *testing.T) {
 
 	deadline := time.Now().Add(90 * time.Second)
 	for {
-		command := exec.CommandContext(ctx, "container", "exec", guest, "sh", "-c", "docker info >/dev/null 2>&1")
+		// docker info can succeed before the entrypoint has published its ready
+		// marker and exec'd the requested process as PID 1. Do not race repair
+		// against that still-running initial admission setup.
+		command := exec.CommandContext(ctx, "container", "exec", guest, "sh", "-c", "docker info >/dev/null 2>&1 && test -s /run/shunt/dockerd-offline.ready && test \"$(cat /proc/1/comm)\" = sleep")
 		if command.Run() == nil {
 			break
 		}
@@ -84,7 +88,13 @@ repair_count=$(grep -h -c 'repairing dockerd' /tmp/shunt-repair-1.log /tmp/shunt
 test "$repair_count" = 1
 docker info >/dev/null
 `
-	runHost(t, ctx, "container", "exec", guest, "sh", "-c", repairRace)
+	repairOutput, repairErr := exec.CommandContext(ctx, "container", "exec", guest, "sh", "-c", repairRace).CombinedOutput()
+	if repairErr != nil {
+		diagnostics, _ := exec.CommandContext(ctx, "container", "exec", guest, "sh", "-c", "cat /tmp/shunt-repair-1.log /tmp/shunt-repair-2.log /var/log/dockerd.log /var/log/shunt-docker-api-admission.log 2>/dev/null || true; ps -eo pid,ppid,stat,comm,args").CombinedOutput()
+		logs, _ := exec.CommandContext(ctx, "container", "logs", guest).CombinedOutput()
+		inspect, _ := exec.CommandContext(ctx, "container", "inspect", guest).CombinedOutput()
+		t.Fatalf("race dockerd repair: %v\n%s\nguest diagnostics:\n%s\ncontainer logs:\n%s\ncontainer inspect:\n%s", repairErr, repairOutput, diagnostics, logs, inspect)
+	}
 
 	script := `set -eux
 proof_tag=shunt-admission-proof:latest

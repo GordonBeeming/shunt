@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/fsclone"
+	"github.com/gordonbeeming/shunt/internal/resolve"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
@@ -19,7 +22,7 @@ func newNewCmd() *cobra.Command {
 	var branch, from string
 	c := &cobra.Command{
 		Use:   "new <name>",
-		Short: "Create a small worktree-only siding (use `" + bin() + " up` when it needs a guest)",
+		Short: "Create a small worktree-only siding",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -30,7 +33,7 @@ func newNewCmd() *cobra.Command {
 			if from != "" && branch != "" {
 				return fmt.Errorf("--from and --branch are mutually exclusive: --from continues an existing branch, --branch forks a new siding branch off a start point")
 			}
-			app, _, err := loadCurrentApp()
+			app, err := loadOrInitializeNewApp(ctx)
 			if err != nil {
 				return err
 			}
@@ -56,13 +59,125 @@ func newNewCmd() *cobra.Command {
 			fmt.Printf("%s siding %q ready — worktree only; no data or guest has been created.\n", tick(), name)
 			fmt.Printf("  edit code here:  %s\n", src)
 			fmt.Printf("  on branch:       %s\n", sd.Branch)
-			fmt.Printf("  grow it when needed:  "+bin()+" up %s   (creates data + guest, then starts the app)\n", name)
+			if app.Runner == "" {
+				fmt.Printf("  grow it when needed:  add .shunt.app.json, run "+bin()+" app add, then "+bin()+" up %s\n", name)
+			} else {
+				fmt.Printf("  grow it when needed:  "+bin()+" up %s   (creates data + guest, then starts the app)\n", name)
+			}
 			return nil
 		},
 	}
 	c.Flags().StringVar(&branch, "branch", "", "fork a new siding branch off this explicit start point (branch or commit; default: the clean source base)")
 	c.Flags().StringVar(&from, "from", "", "create the siding ON an existing remote branch (fetched + tracked), so commits push back to it")
 	return c
+}
+
+// loadOrInitializeNewApp keeps `new` useful before an application has any
+// runtime contract. Existing project state wins unchanged. Otherwise, the Git
+// top-level gets only the durable source-control state needed for managed
+// worktrees; app registration and the channel registry remain untouched.
+func loadOrInitializeNewApp(ctx context.Context) (state.App, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return state.App{}, fmt.Errorf("get cwd: %w", err)
+	}
+
+	repoRoot, err := gitText(ctx, cwd, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return state.App{}, fmt.Errorf("`%s new` requires a Git repository: %w", bin(), err)
+	}
+	repoRoot = filepath.Clean(repoRoot)
+	loc, existing, err := resolveGitRootProject(repoRoot)
+	if err != nil {
+		return state.App{}, err
+	}
+	if existing != nil {
+		app := *existing
+		if app.LiveSiding == state.HostTarget {
+			app.LiveSiding = ""
+		}
+		return app, nil
+	}
+	configDir := loc.ConfigDir
+
+	var app state.App
+	err = siding.WithProjectOperation(ctx, configDir, func() error {
+		current, loadErr := state.LoadApp(configDir)
+		if loadErr == nil {
+			app = current
+			if app.LiveSiding == state.HostTarget {
+				app.LiveSiding = ""
+			}
+			return nil
+		}
+		if !errors.Is(loadErr, state.ErrNotFound) {
+			return loadErr
+		}
+
+		app = state.App{
+			Version:         state.StateVersion,
+			Name:            filepath.Base(repoRoot),
+			RepoOrigin:      gitOrigin(ctx, repoRoot),
+			RepoPath:        repoRoot,
+			ControlRepoPath: filepath.Join(configDir, ".control.git"),
+			ConfigDir:       configDir,
+			Sidings:         map[string]state.Siding{},
+		}
+		if err := ensureControlRepository(ctx, &app, repoRoot, ""); err != nil {
+			return fmt.Errorf("initialize managed Git control repository: %w", err)
+		}
+		if err := state.SaveApp(app); err != nil {
+			return fmt.Errorf("save worktree-only project state: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return state.App{}, err
+	}
+	return app, nil
+}
+
+// resolveGitRootProject recognizes a Git root as a siding only when durable
+// state records that siding and its canonical source path is exactly this root.
+// A coincidental .shunt[-channel]/<project>/<name>/... path remains its own repo.
+func resolveGitRootProject(repoRoot string) (resolve.Location, *state.App, error) {
+	repoRoot = filepath.Clean(repoRoot)
+	loc, err := resolve.From(repoRoot)
+	if err != nil {
+		return resolve.Location{}, nil, err
+	}
+	if loc.Siding == "" {
+		return loc, nil, nil
+	}
+
+	app, err := state.LoadApp(loc.ConfigDir)
+	if err != nil {
+		if !errors.Is(err, state.ErrNotFound) {
+			return resolve.Location{}, nil, err
+		}
+		return gitRepositoryLocation(repoRoot)
+	}
+	if _, exists := app.Sidings[loc.Siding]; exists {
+		src, _, pathErr := siding.Paths(app, loc.Siding)
+		if pathErr != nil {
+			return resolve.Location{}, nil, pathErr
+		}
+		if filepath.Clean(src) == repoRoot {
+			return loc, &app, nil
+		}
+	}
+	return gitRepositoryLocation(repoRoot)
+}
+
+func gitRepositoryLocation(repoRoot string) (resolve.Location, *state.App, error) {
+	configDir, err := config.ProjectConfigDir(repoRoot)
+	if err != nil {
+		return resolve.Location{}, nil, err
+	}
+	return resolve.Location{
+		Project:   filepath.Base(repoRoot),
+		ConfigDir: configDir,
+	}, nil, nil
 }
 
 func createSiding(ctx context.Context, configDir, name, branch, from string) (state.App, state.Siding, error) {

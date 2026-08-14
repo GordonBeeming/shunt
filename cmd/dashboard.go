@@ -143,11 +143,7 @@ func newDashboardCmd() *cobra.Command {
 			}
 
 			if install {
-				exe, err := os.Executable()
-				if err != nil {
-					return err
-				}
-				if err := launchagent.InstallDashboard(ctx, exe); err != nil {
+				if err := installDashboardAgent(ctx, launchagent.InstallDashboard); err != nil {
 					return err
 				}
 				if err := waitForDashboard(ctx, url, dashboardStartupTimeout); err != nil {

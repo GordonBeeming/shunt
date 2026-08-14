@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gordonbeeming/shunt/internal/caddy"
@@ -25,6 +27,13 @@ func newInitCmd() *cobra.Command {
 			ctx := cmd.Context()
 
 			if err := ensureDirs(); err != nil {
+				return err
+			}
+
+			// image.EnsureBuilt is the first image operation. Start and verify the
+			// Apple runtime first so failures name the prerequisite, not a build.
+			fmt.Println("• starting container runtime…")
+			if err := container.EnsureSystemStarted(ctx); err != nil {
 				return err
 			}
 
@@ -63,15 +72,8 @@ func newInitCmd() *cobra.Command {
 			}
 
 			fmt.Println("• installing the dashboard LaunchAgent…")
-			if exe, err := os.Executable(); err == nil {
-				if err := launchagent.InstallDashboard(ctx, exe); err != nil {
-					fmt.Printf("  (dashboard agent install failed: %v — run `%s dashboard --install`)\n", err, bin())
-				}
-			}
-
-			fmt.Println("• starting container runtime…")
-			if err := container.EnsureSystemStarted(ctx); err != nil {
-				return err
+			if err := installDashboardAgent(ctx, launchagent.InstallDashboard); err != nil {
+				fmt.Printf("  (dashboard agent install failed: %v — run `%s dashboard --install`)\n", err, bin())
 			}
 
 			fmt.Println("• waiting for Caddy admin API…")
@@ -85,6 +87,36 @@ func newInitCmd() *cobra.Command {
 	}
 	c.Flags().BoolVar(&force, "force", false, "rebuild Caddy and the base image even if present")
 	return c
+}
+
+// installDashboardAgent resolves the stable invoked binary path before either
+// init or dashboard --install writes a LaunchAgent plist.
+func installDashboardAgent(ctx context.Context, install func(context.Context, string) error) error {
+	exe, err := invokedExecutablePath()
+	if err != nil {
+		return err
+	}
+	return install(ctx, exe)
+}
+
+// invokedExecutablePath keeps LaunchAgents pointed at the stable executable
+// path the user invoked. This matters for Homebrew, where os.Executable can
+// resolve the versioned Cellar path instead of the stable opt/bin symlink.
+func invokedExecutablePath() (string, error) {
+	argv0 := os.Args[0]
+	if argv0 != "" {
+		if strings.ContainsRune(argv0, os.PathSeparator) {
+			if filepath.IsAbs(argv0) {
+				return argv0, nil
+			}
+			if abs, err := filepath.Abs(argv0); err == nil {
+				return abs, nil
+			}
+		} else if path, err := exec.LookPath(argv0); err == nil {
+			return path, nil
+		}
+	}
+	return os.Executable()
 }
 
 // ensureDirs creates the per-channel machinery dirs (never project code).

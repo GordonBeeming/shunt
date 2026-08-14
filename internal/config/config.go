@@ -1,8 +1,8 @@
 // Package config resolves shunt's channel identity and everything derived from
 // it. A single build-time Channel value drives the binary name, global dir,
 // project-local dir name, Caddy admin port, front-door port offset, LaunchAgent
-// label, and container-name prefix — so release/beta/dev builds install and run
-// side by side without colliding.
+// label, and container-name prefix — so release/beta/nightly/dev builds install
+// and run side by side without colliding.
 package config
 
 import (
@@ -94,11 +94,15 @@ func GuestCPUs() string   { return orDefault(LoadUserConfig().CPUs, DefaultGuest
 // touches release state.
 var Channel = "dev"
 
+// BuildVersion is stamped into release binaries with -ldflags. Source builds
+// retain an explicit identity in `shunt version` output.
+var BuildVersion = "source"
+
 // Identity is the fully-resolved, channel-scoped set of names/ports/paths.
 type Identity struct {
-	Channel                string // "release" | "beta" | "dev"
-	BinaryName             string // shunt | shunt-beta | shunt-dev
-	GlobalDirName          string // .shunt | .shunt-beta | .shunt-dev (under $HOME)
+	Channel                string // "release" | "beta" | "nightly" | "dev"
+	BinaryName             string // shunt | shunt-beta | shunt-nightly | shunt-dev
+	GlobalDirName          string // .shunt[-channel] (under $HOME)
 	ProjectDirName         string // same name, used as the sibling project-local dir
 	AdminPort              int    // Caddy admin API port for this channel
 	DashboardPort          int    // shunt dashboard web UI port for this channel
@@ -137,6 +141,19 @@ func known(channel string) Identity {
 			LaunchAgentID:          "com.gordonbeeming.shunt-beta.caddy",
 			DashboardLaunchAgentID: "com.gordonbeeming.shunt-beta.dashboard",
 			ContainerPrefix:        "shuntbeta",
+		}
+	case "nightly":
+		return Identity{
+			Channel:                "nightly",
+			BinaryName:             "shunt-nightly",
+			GlobalDirName:          ".shunt-nightly",
+			ProjectDirName:         ".shunt-nightly",
+			AdminPort:              2319,
+			DashboardPort:          2320,
+			PortOffset:             300,
+			LaunchAgentID:          "com.gordonbeeming.shunt-nightly.caddy",
+			DashboardLaunchAgentID: "com.gordonbeeming.shunt-nightly.dashboard",
+			ContainerPrefix:        "shuntnightly",
 		}
 	default:
 		return Identity{

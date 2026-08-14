@@ -18,6 +18,68 @@ import (
 // there's one shunt skill (the installing channel decides which binary it calls).
 const skillName = "shunt"
 
+const universalPrerequisitesHeading = "## Host prerequisites shared by every channel"
+
+const universalPrerequisitesTemplate = `
+## Host prerequisites shared by every channel
+
+Before %s init, install Apple container, a reviewed Go patch release, xcaddy, and the .NET SDK on PATH. Supported Go releases are 1.25.13 or newer on the 1.25 line and 1.26.6 or newer on the 1.26 line; newer minor lines are rejected until reviewed. Docker runs inside each guest; Docker Desktop and OrbStack are not prerequisites. Install xcaddy with:
+
+    go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+
+Ensure Go's bin directory is on PATH. The Aspire CLI is required only for .NET Aspire apps.
+`
+
+const nightlyPrerequisitesTemplate = `
+## Nightly host prerequisites
+
+Before %s init, install Apple's container runtime and the .NET SDK on PATH. Homebrew's go@1.25 formula is keg-only, so select the canonical Go binary, install xcaddy with it, and export both its bin directory and the selected xcaddy bin directory before initialising:
+
+    GO_BIN="$(brew --prefix go@1.25)/bin/go"
+    XCADDY_BIN="$("$GO_BIN" env GOPATH | cut -d: -f1)/bin"
+    GOBIN="$XCADDY_BIN" "$GO_BIN" install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+    export PATH="$(brew --prefix go@1.25)/bin:$XCADDY_BIN:$PATH"
+
+The nightly package gate accepts canonical darwin/arm64 Go 1.25.13 or a later patch on the 1.25 line. Docker runs inside each guest; Docker Desktop and OrbStack are not prerequisites. The Aspire CLI is required only for .NET Aspire apps.
+`
+
+const standardOnboardingTemplate = `
+This skill targets the **%s** channel.
+
+%s
+With %s already on PATH, initialise its channel once and deploy this one shared %s skill to the agents you use:
+
+    %s init
+    %s skill install --all
+    %s version
+`
+
+const nightlyOnboardingTemplate = `
+When the public nightly package is available, install it from Homebrew on macOS 26 or newer on Apple silicon (arm64):
+
+    brew update
+    brew install gordonbeeming/tap/shunt-nightly
+
+%s
+With %s already on PATH, initialise the channel and deploy this one shared %s skill:
+
+    %s init
+    %s skill install --all
+    %s version
+
+Later, upgrade with brew update && brew upgrade gordonbeeming/tap/shunt-nightly. version includes the channel and build version, such as version=0.0.0-nightly.123.
+`
+
+// Placeholders are intentionally distinct from legacy state names such as
+// .shunt-dev. The renderer owns only operational channel-specific text; the
+// literal dev-to-nightly migration warning stays in the nightly rendering.
+const (
+	commandPlaceholder           = "{{shunt-command}}"
+	channelDirectoryPlaceholder  = "{{shunt-channel-directory}}"
+	channelOnboardingPlaceholder = "{{shunt-channel-onboarding}}"
+	nightlyMigrationPlaceholder  = "{{shunt-nightly-migration}}"
+)
+
 // agentTarget is an AI coding agent that may be installed and reads skills from a
 // skills/<name>/ dir. Presence of HomeRel under $HOME means it's installed. Add
 // new agents here as their skills layout is confirmed.
@@ -55,7 +117,7 @@ func newSkillInstallCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			bin := config.Current().BinaryName
+			identity := config.Current()
 
 			var detected []agentTarget
 			for _, t := range agentTargets() {
@@ -76,7 +138,7 @@ func newSkillInstallCmd() *cobra.Command {
 			fmt.Printf("%s installed the %q skill:\n", tick(), skillName)
 			for _, t := range selected {
 				dest := filepath.Join(home, t.SkillsRel, skillName)
-				if err := writeSkill(dest, bin); err != nil {
+				if err := writeSkill(dest, identity); err != nil {
 					return fmt.Errorf("install to %s: %w", t.Name, err)
 				}
 				fmt.Printf("    %-12s %s\n", t.Name, dest)
@@ -146,9 +208,10 @@ func pickAgents(detected []agentTarget) ([]agentTarget, error) {
 	return out, nil
 }
 
-// writeSkill walks the embedded skill tree into dest, replacing the dev binary
-// token with this build's command name and marking scripts executable.
-func writeSkill(dest, bin string) error {
+// writeSkill walks the embedded skill tree into dest, rendering the installing
+// channel's command, operational directory, and onboarding, then marking
+// scripts executable.
+func writeSkill(dest string, identity config.Identity) error {
 	const root = "files"
 	return fs.WalkDir(skillfiles.FS, root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -165,12 +228,46 @@ func writeSkill(dest, bin string) error {
 		if err != nil {
 			return err
 		}
-		// Source uses the dev command name; rewrite to this channel's binary.
-		content := strings.ReplaceAll(string(b), "shunt-dev", bin)
+		content := renderSkill(string(b), identity)
 		mode := os.FileMode(0o644)
 		if strings.HasPrefix(rel, "scripts"+string(os.PathSeparator)) {
 			mode = 0o755
 		}
 		return os.WriteFile(filepath.Join(dest, rel), []byte(content), mode)
 	})
+}
+
+func renderSkill(source string, identity config.Identity) string {
+	replacer := strings.NewReplacer(
+		commandPlaceholder, identity.BinaryName,
+		channelDirectoryPlaceholder, identity.ProjectDirName,
+		channelOnboardingPlaceholder, channelOnboarding(identity),
+		nightlyMigrationPlaceholder, nightlyMigration(identity),
+	)
+	return replacer.Replace(source)
+}
+
+func channelOnboarding(identity config.Identity) string {
+	prerequisites := universalPrerequisites(identity.BinaryName)
+	if identity.Channel == "nightly" {
+		prerequisites = nightlyPrerequisites(identity.BinaryName)
+		return fmt.Sprintf(nightlyOnboardingTemplate, prerequisites, identity.BinaryName, skillName, identity.BinaryName, identity.BinaryName, identity.BinaryName)
+	}
+
+	return fmt.Sprintf(standardOnboardingTemplate, identity.Channel, prerequisites, identity.BinaryName, skillName, identity.BinaryName, identity.BinaryName, identity.BinaryName)
+}
+
+func universalPrerequisites(binary string) string {
+	return fmt.Sprintf(universalPrerequisitesTemplate, binary)
+}
+
+func nightlyPrerequisites(binary string) string {
+	return fmt.Sprintf(nightlyPrerequisitesTemplate, binary)
+}
+
+func nightlyMigration(identity config.Identity) string {
+	if identity.Channel != "nightly" {
+		return ""
+	}
+	return "Nightly keeps its own ports, launch agents, project registrations, sidings, and data baselines. When a project already uses dev, run `" + identity.BinaryName + " app add` from the original checkout for the nightly channel and create a fresh `" + identity.BinaryName + " new <name>` siding. Do not copy `.shunt-dev`, reuse a dev siding, or migrate dev data."
 }
