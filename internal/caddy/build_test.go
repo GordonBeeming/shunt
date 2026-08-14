@@ -686,13 +686,24 @@ func TestSystemXCaddyBuildCancellationTerminatesProcessGroup(t *testing.T) {
 	}
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		err := syscall.Kill(childPID, 0)
-		if errors.Is(err, syscall.ESRCH) {
+		if processHasTerminated(childPID) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("xcaddy child PID %d survived cancellation", childPID)
+}
+
+func processHasTerminated(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	if errors.Is(err, syscall.ESRCH) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	output, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	return err == nil && strings.HasPrefix(strings.TrimSpace(string(output)), "Z")
 }
 
 func TestRealBuildUsesReviewedToolchainAndFreshCaches(t *testing.T) {
