@@ -356,6 +356,12 @@ if grep -q '^tap_version=' <<<"$first_selection"; then
   exit 1
 fi
 
+# macOS ships BSD sort, which has no GNU `-V` option. Select the greatest
+# numeric nightly suffix so selection remains portable across local and hosted runs.
+printf '[{"tag_name":"nightly-9","target_commitish":"%s","prerelease":true},{"tag_name":"nightly-10","target_commitish":"%s","prerelease":true}]\n' "$commit" "$commit" > "$tmp/selection.json"
+numeric_selection=$(GITHUB_SHA=$commit "$root/packaging/nightly/select-release.sh" false 12 "$tmp/selection.json")
+grep -Fxq 'tag=nightly-10' <<<"$numeric_selection"
+
 formula="$tmp/Formula/shunt-nightly.rb"
 mkdir -p "$(dirname -- "$formula")"
 previous_sha256=$(printf 'a%.0s' {1..64})

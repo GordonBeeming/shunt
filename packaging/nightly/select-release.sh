@@ -33,7 +33,7 @@ if [[ -n "$formula" && -f "$formula" ]]; then
   }
 fi
 
-matching_tags=$(jq -r --arg commit "$commit" '.[] | select(.prerelease == true and .target_commitish == $commit and (.tag_name | test("^nightly-[0-9]+$"))) | .tag_name' "$releases_json" | sort -V)
+matching_tags=$(jq -r --arg commit "$commit" '.[] | select(.prerelease == true and .target_commitish == $commit and (.tag_name | test("^nightly-[0-9]+$"))) | .tag_name' "$releases_json" | sort -t- -k2,2n)
 if [[ "$force" == true ]]; then
   tag="nightly-$run_number"
 elif [[ -n "$previous_tag" ]] && printf '%s\n' "$matching_tags" | grep -Fxq "$previous_tag"; then
