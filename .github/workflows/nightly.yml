@@ -73,6 +73,8 @@ jobs:
         run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
       - name: Install ShellCheck
         run: brew install shellcheck
+      - name: Install ripgrep
+        run: brew install ripgrep
       - name: Run release fixtures and lint scripts
         run: |
           "$(go env GOPATH)/bin/actionlint" .github/workflows/ci.yml .github/workflows/nightly.yml
