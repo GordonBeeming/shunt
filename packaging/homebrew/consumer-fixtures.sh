@@ -121,7 +121,11 @@ case "${1:-}" in
     fi
     install_binary "$installed_version"
     ;;
-  upgrade) install_binary "$target" ;;
+  upgrade)
+    previous_versions=$(cat "$state/version")
+    install_binary "$target"
+    [[ -z "$previous_versions" || "$previous_versions" == "$target" ]] || printf ' %s' "$previous_versions" >> "$state/version"
+    ;;
   uninstall) : > "$state/version"; rm -f "$state/bin/shunt-nightly" ;;
   test)
     [[ "${MOCK_BREW_TEST_FAIL:-false}" != true ]]
@@ -317,6 +321,10 @@ if grep -Fq 'brew install ' "$persistent/calls"; then
 fi
 grep -Fxq 'brew update' "$persistent/calls"
 grep -Fxq "brew upgrade gordonbeeming/tap/shunt-nightly" "$persistent/calls"
+[[ "$(cat "$persistent/version")" == "$version $previous" ]] || {
+  echo 'upgrade fixture did not retain both Homebrew Cellar versions' >&2
+  exit 1
+}
 
 rerun=$(make_mock_tools rerun "$version")
 run_consumer "$rerun" tap "$version" "$tag" "$sha256" "$version" "$tag" "$sha256"

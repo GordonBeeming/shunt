@@ -162,6 +162,17 @@ installed_receipt() {
   brew list --versions "$formula_name" 2>/dev/null || true
 }
 
+receipt_has_version() {
+  local receipt=$1 expected=$2 index
+  local -a fields
+  read -r -a fields <<<"$receipt"
+  [[ "${fields[0]:-}" == "$formula_name" ]] || return 1
+  for ((index = 1; index < ${#fields[@]}; index++)); do
+    [[ "${fields[$index]}" == "$expected" ]] && return 0
+  done
+  return 1
+}
+
 assert_absent() {
   local receipt
   receipt=$(installed_receipt)
@@ -205,7 +216,7 @@ assert_installed_consumer() {
   local receipt stable installed_binary version_output skill_home skill_root
   stable="$(brew --prefix)/bin/$formula_name"
   receipt=$(installed_receipt)
-  [[ "$receipt" == "$formula_name $version" ]] || { printf 'unexpected Homebrew receipt: expected=%s actual=%s\n' "$formula_name $version" "$receipt" >&2; exit 1; }
+  receipt_has_version "$receipt" "$version" || { printf 'Homebrew receipt does not contain the current version: expected=%s actual=%s\n' "$formula_name $version" "$receipt" >&2; exit 1; }
   installed_binary="$(brew --prefix "$formula_name")/bin/$formula_name"
   [[ -L "$stable" && -x "$stable" && -x "$installed_binary" && "$stable" -ef "$installed_binary" ]] || {
     echo "stable Homebrew binary is not the exact installed path: $stable -> $installed_binary" >&2
