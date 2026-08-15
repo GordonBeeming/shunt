@@ -85,14 +85,14 @@ case "${1:-}" in
         exit 0
       fi
       if [[ "$mode" == upload-tag-lag && -e "$calls.upload-tag-lag" ]]; then
-        cat "$state" | jq -s '[.]'
+        jq -s '[.]' "$state"
         jq --arg tag "$tag" '.tag_name = $tag' "$state" > "$state.tmp"
         mv "$state.tmp" "$state"
         rm -f "$calls.upload-tag-lag"
         exit 0
       fi
       if [[ "$mode" == upload-asset-lag && -e "$state.asset-lag" ]]; then
-        cat "$state.asset-lag" | jq -s '[.]'
+        jq -s '[.]' "$state.asset-lag"
         rm -f "$state.asset-lag"
         exit 0
       fi
