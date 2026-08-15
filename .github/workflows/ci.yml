@@ -70,7 +70,7 @@ jobs:
           "$actionlint_bin"
       - name: Shell, renderer, and reproducibility checks
         run: |
-          shellcheck packaging/nightly/*.sh packaging/homebrew/render.sh .github/workflows/fixtures/*.sh internal/skillfiles/files/scripts/status.sh
+          shellcheck packaging/nightly/*.sh packaging/homebrew/*.sh .github/workflows/fixtures/*.sh internal/skillfiles/files/scripts/status.sh
           bash packaging/nightly/fixtures.sh
           bash packaging/homebrew/consumer-fixtures.sh
           bash .github/workflows/fixtures/integration-conditions.sh
@@ -82,3 +82,4 @@ jobs:
           packaging/homebrew/render.sh 0.0.0-nightly.1 nightly-1 "$(printf 'a%.0s' {1..64})" "$RUNNER_TEMP/shunt-nightly.rb"
           test -f "$RUNNER_TEMP/shunt-nightly.rb"
           brew style "$RUNNER_TEMP/shunt-nightly.rb"
+          packaging/homebrew/audit.sh "$RUNNER_TEMP/shunt-nightly.rb"
