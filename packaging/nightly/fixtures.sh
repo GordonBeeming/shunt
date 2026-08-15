@@ -81,7 +81,7 @@ case "${1:-}" in
         exit 0
       fi
       if [[ "$mode" == publish-list-lag && "$list_count" == 3 ]]; then
-        jq '.draft = true | .immutable = false' "$state" | jq -s .
+        jq '.draft = true | .immutable = false' "$state" | jq -s '[.]'
         exit 0
       fi
       printf '[[%s]]\n' "$(release_exists && cat "$state" || printf '')"
