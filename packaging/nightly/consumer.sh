@@ -103,7 +103,7 @@ cleanup() {
   fi
   if [[ "$cleanup_staging_tap" == true ]]; then
     if ! brew untap --force "$staging_tap"; then
-      echo "failed to clean up the candidate Homebrew tap" >&2
+      echo "failed to clean up the candidate staging Homebrew tap: $staging_tap" >&2
       [[ "$status" -ne 0 ]] || status=1
     fi
   fi

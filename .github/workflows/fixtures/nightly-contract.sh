@@ -140,8 +140,8 @@ require_consumer_health 'packaging/nightly/consumer.sh tap "$VERSION" "$TAG" "$S
 require_candidate_consumer 'runs-on: macos-26' 'candidate validation uses the hosted arm64 macOS 26 runner'
 require_candidate_consumer 'packaging/nightly/consumer.sh candidate "$VERSION" "$TAG" "$SHA256"' 'candidate validation installs and tests the local formula before publication'
 candidate_go_line=$(consumer_line_of '    assert_supported_homebrew_go' 1)
-candidate_install_line=$(consumer_line_of '    brew install "$candidate_formula"')
-candidate_test_line=$(consumer_line_of '    brew test "$candidate_formula"')
+candidate_install_line=$(consumer_line_of '    brew install "$staged_formula"' 2)
+candidate_test_line=$(consumer_line_of '    brew test "$staged_formula"' 2)
 tap_go_line=$(consumer_line_of '    assert_supported_homebrew_go' 2)
 tap_success_line=$(consumer_line_of '  assert_installed_consumer' 2)
 [[ -n "$candidate_go_line" && -n "$candidate_install_line" && -n "$candidate_test_line" && \
