@@ -433,6 +433,7 @@ PATH="$not_found/bin:$PATH" MOCK_RELEASE_STATE="$not_found/state.json" MOCK_RELE
   "$root/packaging/nightly/read-release.sh" "$tmp/not-found.response" "repos/GordonBeeming/shunt/releases/tags/$tag"
 grep -Fqx 'HTTP/2 404' "$tmp/not-found.response"
 expect_failure "$root/packaging/nightly/retry.sh" 1 false
+expect_failure "$root/packaging/nightly/retry-not-found.sh" 4 false
 
 release_list=$(prepare_case release-list)
 write_release "$release_list" true false "$commit"

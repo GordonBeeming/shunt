@@ -104,7 +104,7 @@ else
   "$script_dir/create-release-draft.sh" "$tag" "$version" "$commit" "$notes"
   # GitHub can return success from draft creation before the paginated release
   # list exposes that draft. Retry the complete lookup, not only the HTTP read.
-  "$script_dir/retry.sh" 4 "$script_dir/find-release.sh" "$release_json" "$tag"
+  "$script_dir/retry-not-found.sh" 4 "$script_dir/find-release.sh" "$release_json" "$tag"
   assert_metadata
 fi
 

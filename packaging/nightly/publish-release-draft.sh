@@ -22,7 +22,7 @@ fi
 
 response=$(mktemp)
 trap 'rm -f "$response"' EXIT
-if "$script_dir/retry.sh" 4 "$script_dir/find-published-release.sh" "$response" "$tag" "$commit" "$asset"; then
+if "$script_dir/retry-not-found.sh" 4 "$script_dir/find-published-release.sh" "$response" "$tag" "$commit" "$asset"; then
   echo "release publish request failed after $tag was published; resuming" >&2
   exit 0
 fi
