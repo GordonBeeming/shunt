@@ -75,6 +75,11 @@ case "${1:-}" in
     fi
     if [[ "${1:-}" == --paginate ]]; then
       record 'api-list'
+      list_count=$(grep -Fxc 'api-list' "$calls")
+      if [[ "$mode" == create-list-lag && "$list_count" == 2 ]]; then
+        printf '[[]]\n'
+        exit 0
+      fi
       printf '[[%s]]\n' "$(release_exists && cat "$state" || printf '')"
       exit 0
     fi
@@ -213,6 +218,16 @@ for ambiguous in create-after-success upload-after-success publish-after-success
   run_publisher "$case_dir" "$ambiguous"
   jq -e '.draft == false and .immutable == true' "$case_dir/state.json" >/dev/null
 done
+
+# GitHub may acknowledge draft creation before its release list includes the
+# new draft. Retry selection as a whole so a successful create is resumable.
+eventual=$(prepare_case eventual-create)
+run_publisher "$eventual" create-list-lag
+jq -e '.draft == false and .immutable == true' "$eventual/state.json" >/dev/null
+[[ $(grep -Fxc 'api-list' "$eventual/calls") -ge 3 ]] || {
+  echo 'draft creation was not retried after an eventually consistent release list' >&2
+  exit 1
+}
 
 # A release can be replaced while reconciliation is running. A 404 for the
 # cached ID must trigger one fresh tag lookup, rather than trapping later

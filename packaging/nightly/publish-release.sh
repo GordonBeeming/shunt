@@ -102,7 +102,9 @@ else
   notes="$work/notes.md"
   printf 'Commit: %s\nRun: %s\n' "$commit" "${GITHUB_RUN_NUMBER:-unknown}" > "$notes"
   "$script_dir/create-release-draft.sh" "$tag" "$version" "$commit" "$notes"
-  fetch_release
+  # GitHub can return success from draft creation before the paginated release
+  # list exposes that draft. Retry the complete lookup, not only the HTTP read.
+  "$script_dir/retry.sh" 4 "$script_dir/find-release.sh" "$release_json" "$tag"
   assert_metadata
 fi
 

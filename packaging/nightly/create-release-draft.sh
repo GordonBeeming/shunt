@@ -21,7 +21,7 @@ fi
 
 response=$(mktemp)
 trap 'rm -f "$response"' EXIT
-if ! "$script_dir/find-release.sh" "$response" "$tag"; then
+if ! "$script_dir/retry.sh" 4 "$script_dir/find-release.sh" "$response" "$tag"; then
   echo "draft creation failed and the release could not be reconciled" >&2
   exit 1
 fi
