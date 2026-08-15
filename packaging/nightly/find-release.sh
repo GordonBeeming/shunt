@@ -22,8 +22,13 @@ case "$count" in
   1) jq --arg tag "$tag" '.[] | select(.tag_name == $tag)' "$releases" > "$temporary" ;;
   *) echo "multiple releases exist for tag $tag" >&2; exit 1 ;;
 esac
-if [[ -n "$required_asset" ]] && ! jq -e --arg name "$required_asset" \
-  '[.assets[] | select(.name == $name)] | length == 1' "$temporary" >/dev/null; then
-  exit 4
+if [[ -n "$required_asset" ]]; then
+  asset_count=$(jq -er --arg name "$required_asset" \
+    '[.assets[] | select(.name == $name)] | length' "$temporary") || exit $?
+  case "$asset_count" in
+    0) exit 4 ;;
+    1) ;;
+    *) echo "release lists $asset_count copies of required asset $required_asset" >&2; exit 1 ;;
+  esac
 fi
 mv "$temporary" "$output"

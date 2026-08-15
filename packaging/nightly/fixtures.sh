@@ -265,6 +265,33 @@ jq -e '.draft == false and .immutable == true' "$eventual_asset/state.json" >/de
   exit 1
 }
 
+# Only a missing required asset is retryable. Malformed release metadata must
+# fail immediately rather than becoming a misleading eventual-consistency wait.
+invalid_required_asset=$(prepare_case invalid-required-asset)
+write_release "$invalid_required_asset" true false "$commit" "$asset"
+jq '.assets = "invalid"' "$invalid_required_asset/state.json" > "$invalid_required_asset/state.tmp"
+mv "$invalid_required_asset/state.tmp" "$invalid_required_asset/state.json"
+if PATH="$invalid_required_asset/bin:$PATH" \
+  MOCK_RELEASE_STATE="$invalid_required_asset/state.json" \
+  MOCK_RELEASE_ASSETS="$invalid_required_asset/remote-assets" \
+  MOCK_RELEASE_CALLS="$invalid_required_asset/calls" \
+  MOCK_RELEASE_TAG="$tag" MOCK_RELEASE_COMMIT="$commit" \
+  "$root/packaging/nightly/retry-not-found.sh" 4 "$root/packaging/nightly/find-release.sh" \
+  "$invalid_required_asset/release.json" "$tag" "$asset"; then
+  echo 'malformed required asset metadata unexpectedly succeeded' >&2
+  exit 1
+else
+  invalid_required_asset_status=$?
+fi
+[[ "$invalid_required_asset_status" != 4 ]] || {
+  echo 'malformed required asset metadata was incorrectly retried as not found' >&2
+  exit 1
+}
+[[ $(grep -Fxc 'api-list' "$invalid_required_asset/calls") == 1 ]] || {
+  echo 'malformed required asset metadata unexpectedly retried' >&2
+  exit 1
+}
+
 # GitHub may acknowledge draft creation before its release list includes the
 # new draft. Retry selection as a whole so a successful create is resumable.
 eventual=$(prepare_case eventual-create)
