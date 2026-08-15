@@ -91,6 +91,11 @@ case "${1:-}" in
         rm -f "$calls.upload-tag-lag"
         exit 0
       fi
+      if [[ "$mode" == upload-asset-lag && -e "$state.asset-lag" ]]; then
+        cat "$state.asset-lag" | jq -s '[.]'
+        rm -f "$state.asset-lag"
+        exit 0
+      fi
       printf '[[%s]]\n' "$(release_exists && cat "$state" || printf '')"
       exit 0
     fi
@@ -117,6 +122,9 @@ case "${1:-}" in
         done
         [[ -f "$input" ]] || exit 2
         record "release upload $name"
+        if [[ "$mode" == upload-asset-lag ]]; then
+          cp "$state" "$state.asset-lag"
+        fi
         cp "$input" "$assets/$name"
         add_asset "$name"
         if [[ "$mode" == upload-tag-lag ]]; then
@@ -243,6 +251,17 @@ run_publisher "$eventual_upload" upload-tag-lag
 jq -e '.draft == false and .immutable == true' "$eventual_upload/state.json" >/dev/null
 [[ $(grep -Fxc 'api-list' "$eventual_upload/calls") -ge 4 ]] || {
   echo 'draft tag metadata was not retried after an eventually consistent asset upload' >&2
+  exit 1
+}
+
+# The expected tag can return before the upload itself is visible in the
+# release list. Keep retrying until the asset just uploaded is present rather
+# than carrying a valid-but-stale partial release into final verification.
+eventual_asset=$(prepare_case eventual-asset)
+run_publisher "$eventual_asset" upload-asset-lag
+jq -e '.draft == false and .immutable == true' "$eventual_asset/state.json" >/dev/null
+[[ $(grep -Fxc 'api-list' "$eventual_asset/calls") -ge 4 ]] || {
+  echo 'draft asset metadata was not retried after an eventually consistent asset upload' >&2
   exit 1
 }
 
