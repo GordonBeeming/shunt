@@ -51,7 +51,7 @@ expect_failure() {
 make_mock_tools() {
   local name=$1 installed=${2:-}
   local state="$tmp/$name"
-  mkdir -p "$state/bin" "$state/cellar/bin" "$state/go/bin"
+  mkdir -p "$state/bin" "$state/cellar/bin" "$state/go/bin" "$state/tap/Formula"
   printf '%s' "$installed" > "$state/version"
   : > "$state/calls"
   cat > "$state/go/bin/go" <<'GO'
@@ -103,6 +103,10 @@ case "${1:-}" in
     else echo "$state/cellar"
     fi
     ;;
+  --repository)
+    [[ "${2:-}" == shunt/nightly-candidate ]] || exit 2
+    echo "$state/tap"
+    ;;
   list)
     [[ "${2:-}" == --versions ]] || exit 2
     installed=$(cat "$state/version")
@@ -112,6 +116,8 @@ case "${1:-}" in
     installed_version=$target
     if [[ "${2:-}" == *.rb && -f "${2:-}" ]]; then
       installed_version=$(sed -nE 's/^[[:space:]]*version "([^"]+)"[[:space:]]*$/\1/p' "$2" | head -n1)
+    elif [[ "${2:-}" == shunt/nightly-candidate/shunt-nightly ]]; then
+      installed_version=$(sed -nE 's/^[[:space:]]*version "([^"]+)"[[:space:]]*$/\1/p' "$state/tap/Formula/shunt-nightly.rb" | head -n1)
     fi
     install_binary "$installed_version"
     ;;
@@ -122,10 +128,22 @@ case "${1:-}" in
     ;;
   update) : ;;
   untap)
-    [[ "${2:-}" == --force && "${3:-}" == gordonbeeming/tap ]]
+    [[ "${2:-}" == --force ]] || exit 2
+    case "${3:-}" in
+      gordonbeeming/tap) : ;;
+      shunt/nightly-candidate) rm -f "$state/staging-tapped" ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  tap-new)
+    [[ "${2:-}" == --no-git && "${3:-}" == shunt/nightly-candidate ]] || exit 2
+    : > "$state/staging-tapped"
     ;;
   tap)
-    if [[ $# -eq 1 ]]; then printf '%s\n' gordonbeeming/tap; fi
+    if [[ $# -eq 1 ]]; then
+      printf '%s\n' gordonbeeming/tap
+      [[ ! -e "$state/staging-tapped" ]] || printf '%s\n' shunt/nightly-candidate
+    fi
     ;;
   *) echo "unexpected mock brew call: $*" >&2; exit 2 ;;
 esac
@@ -261,7 +279,7 @@ for unsupported_go in \
     echo "unsupported Homebrew Go fixture unexpectedly succeeded: $unsupported_go" >&2
     exit 1
   fi
-  grep -Eq '^brew install .*/shunt-nightly\.rb$' "$rejected/calls" || {
+  grep -Fxq 'brew install shunt/nightly-candidate/shunt-nightly' "$rejected/calls" || {
     echo "unsupported Homebrew Go did not install the candidate formula: $unsupported_go" >&2
     exit 1
   }
@@ -308,8 +326,9 @@ candidate=$(make_mock_tools candidate)
 run_consumer "$candidate" candidate "$version" "$tag" "$sha256"
 grep -Fq 'curl --fail' "$candidate/calls"
 grep -Fq ' --output ' "$candidate/calls"
-grep -Eq '^brew install .*/shunt-nightly\.rb$' "$candidate/calls"
-grep -Eq '^brew test .*/shunt-nightly\.rb$' "$candidate/calls"
+grep -Fxq 'brew install shunt/nightly-candidate/shunt-nightly' "$candidate/calls"
+grep -Fxq 'brew test shunt/nightly-candidate/shunt-nightly' "$candidate/calls"
+grep -Fxq 'brew untap --force shunt/nightly-candidate' "$candidate/calls"
 grep -Fxq 'brew --prefix' "$candidate/calls"
 grep -Fxq 'brew --prefix shunt-nightly' "$candidate/calls"
 grep -Fxq 'shunt-nightly version' "$candidate/calls"
@@ -320,7 +339,7 @@ grep -Fxq 'brew uninstall --force shunt-nightly' "$candidate/calls"
   exit 1
 }
 curl_line=$(grep -n -m1 '^curl .* --output ' "$candidate/calls" | cut -d: -f1)
-install_line=$(grep -n -m1 -E '^brew install .*/shunt-nightly\.rb$' "$candidate/calls" | cut -d: -f1)
+install_line=$(grep -n -m1 -F 'brew install shunt/nightly-candidate/shunt-nightly' "$candidate/calls" | cut -d: -f1)
 [[ -n "$curl_line" && -n "$install_line" && "$curl_line" -lt "$install_line" ]] || {
   echo 'candidate formula was installed before the anonymous archive digest check' >&2
   exit 1
