@@ -340,8 +340,8 @@ grep -Fxq 'brew uninstall --force shunt-nightly' "$candidate/calls"
   exit 1
 }
 curl_line=$(grep -n -m1 '^curl .* --output ' "$candidate/calls" | cut -d: -f1)
-update_line=$(grep -n -m1 -F 'brew update' "$candidate/calls" | cut -d: -f1)
-install_line=$(grep -n -m1 -F 'brew install shunt/nightly-candidate/shunt-nightly' "$candidate/calls" | cut -d: -f1)
+update_line=$(grep -n -m1 -Fx 'brew update' "$candidate/calls" | cut -d: -f1)
+install_line=$(grep -n -m1 -Fx 'brew install shunt/nightly-candidate/shunt-nightly' "$candidate/calls" | cut -d: -f1)
 [[ -n "$curl_line" && -n "$update_line" && -n "$install_line" && "$curl_line" -lt "$update_line" && "$update_line" -lt "$install_line" ]] || {
   echo 'candidate Homebrew refresh and install did not follow the anonymous archive digest check' >&2
   exit 1
