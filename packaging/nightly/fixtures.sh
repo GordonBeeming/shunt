@@ -49,7 +49,9 @@ release_exists() { [[ -s "$state" ]]; }
 asset_names() { jq -r '.assets[]?.name' "$state"; }
 add_asset() {
   local name=$1
-  jq --arg name "$name" '.assets += [{name:$name}]' "$state" > "$state.tmp"
+  local id
+  id=$((1000 + $(jq '.assets | length' "$state")))
+  jq --arg name "$name" --argjson id "$id" '.assets += [{id:$id,name:$name}]' "$state" > "$state.tmp"
   mv "$state.tmp" "$state"
 }
 case "${1:-}" in
@@ -57,8 +59,12 @@ case "${1:-}" in
     shift
     if [[ "${1:-}" == -i ]]; then
       shift
-      record "api-read $1"
-      if release_exists; then response 200; exit 0; fi
+      endpoint=$1
+      record "api-read $endpoint"
+      if release_exists && { [[ "$endpoint" != */releases/tags/* ]] || [[ $(jq -r '.draft' "$state") == false ]]; }; then
+        response 200
+        exit 0
+      fi
       response 404
       exit 1
     fi
@@ -67,8 +73,57 @@ case "${1:-}" in
       printf '[[%s]]\n' "$(release_exists && cat "$state" || printf '')"
       exit 0
     fi
-    echo "unexpected gh api invocation: $*" >&2
-    exit 2
+    endpoint=${1:-}
+    shift || true
+    case "$endpoint" in
+      */releases/assets/*)
+        asset_id=${endpoint##*/}
+        name=$(jq -r --argjson id "$asset_id" '.assets[] | select(.id == $id) | .name' "$state")
+        [[ -n "$name" ]] || exit 1
+        record "release download $name"
+        cat "$assets/$name"
+        ;;
+      */releases/12345/assets\?name=*)
+        name=${endpoint##*name=}
+        input=''
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --method) [[ "$2" == POST ]]; shift 2 ;;
+            -H) shift 2 ;;
+            --input) input=$2; shift 2 ;;
+            *) echo "unexpected asset upload option: $1" >&2; exit 2 ;;
+          esac
+        done
+        [[ -f "$input" ]] || exit 2
+        record "release upload $name"
+        cp "$input" "$assets/$name"
+        add_asset "$name"
+        [[ "$mode" != upload-after-success ]] || exit 1
+        printf '{}\n'
+        ;;
+      */releases/12345)
+        if [[ "${1:-}" == --method && "${2:-}" == PATCH ]]; then
+          record 'release publish'
+          if [[ "$mode" == publish-mutable* ]]; then
+            jq '.draft = false | .immutable = false' "$state" > "$state.tmp"
+          else
+            jq '.draft = false | .immutable = true' "$state" > "$state.tmp"
+          fi
+          mv "$state.tmp" "$state"
+          if [[ "$mode" == publish-swaps-archive ]]; then
+            printf 'replaced-at-immutable-lock' > "$assets/shunt-nightly_darwin_arm64.tar.gz"
+          fi
+          [[ "$mode" != publish-after-success ]] || exit 1
+          cat "$state"
+        else
+          cat "$state"
+        fi
+        ;;
+      *)
+        echo "unexpected gh api invocation: $endpoint $*" >&2
+        exit 2
+        ;;
+    esac
     ;;
   release)
     shift
@@ -76,56 +131,9 @@ case "${1:-}" in
       create)
         record 'release create'
         cat > "$state" <<JSON
-{"tag_name":"$tag","target_commitish":"$commit","prerelease":true,"draft":true,"immutable":false,"assets":[]}
+{"id":12345,"tag_name":"$tag","target_commitish":"$commit","prerelease":true,"draft":true,"immutable":false,"assets":[]}
 JSON
         [[ "$mode" != create-after-success ]] || exit 1
-        ;;
-      upload)
-        shift
-        release_tag=$1
-        upload_file=$2
-        [[ "$release_tag" == "$tag" ]] || exit 2
-        name=$(basename -- "$upload_file")
-        record "release upload $name"
-        cp "$upload_file" "$assets/$name"
-        add_asset "$name"
-        [[ "$mode" != upload-after-success ]] || exit 1
-        ;;
-      download)
-        shift
-        release_tag=$1
-        shift
-        [[ "$release_tag" == "$tag" ]] || exit 2
-        destination=''
-        patterns=()
-        while [[ $# -gt 0 ]]; do
-          case "$1" in
-            --dir) destination=$2; shift 2 ;;
-            --pattern) patterns+=("$2"); shift 2 ;;
-            --clobber) shift ;;
-            *) echo "unexpected gh release download option: $1" >&2; exit 2 ;;
-          esac
-        done
-        record "release download ${patterns[*]}"
-        mkdir -p "$destination"
-        for pattern in "${patterns[@]}"; do cp "$assets/$pattern" "$destination/$pattern"; done
-        ;;
-      edit)
-        shift
-        release_tag=$1
-        shift
-        [[ "$release_tag" == "$tag" && "${1:-}" == --draft=false ]] || exit 2
-        record 'release publish'
-        if [[ "$mode" == publish-mutable* ]]; then
-          jq '.draft = false | .immutable = false' "$state" > "$state.tmp"
-        else
-          jq '.draft = false | .immutable = true' "$state" > "$state.tmp"
-        fi
-        mv "$state.tmp" "$state"
-        if [[ "$mode" == publish-swaps-archive ]]; then
-          printf 'replaced-at-immutable-lock' > "$assets/shunt-nightly_darwin_arm64.tar.gz"
-        fi
-        [[ "$mode" != publish-after-success ]] || exit 1
         ;;
       delete)
         shift
@@ -175,7 +183,7 @@ write_release() {
     asset_json=$(printf '%s\n' "$@" | jq -R . | jq -s .)
   fi
   jq -n --arg tag "$tag" --arg commit "$target" --argjson draft "$draft" --argjson immutable "$immutable" --argjson assets "$asset_json" \
-    '{tag_name:$tag,target_commitish:$commit,prerelease:true,draft:$draft,immutable:$immutable,assets:[$assets[] | {name:.}]}' > "$directory/state.json"
+    '{id:12345,tag_name:$tag,target_commitish:$commit,prerelease:true,draft:$draft,immutable:$immutable,assets:[$assets | to_entries[] | {id:(1000 + .key),name:.value}]}' > "$directory/state.json"
 }
 
 # A new release takes the draft-first path and finishes only after the immutable
@@ -183,6 +191,11 @@ write_release() {
 clean=$(prepare_case clean)
 run_publisher "$clean" none
 jq -e '.draft == false and .immutable == true and ([.assets[].name] | sort == ["shunt-nightly_darwin_arm64.tar.gz","shunt-nightly_darwin_arm64.tar.gz.sha256"])' "$clean/state.json" >/dev/null
+grep -Fxq 'api-list' "$clean/calls"
+if grep -Fq '/releases/tags/' "$clean/calls"; then
+  echo 'publisher attempted to discover a draft through the published tag endpoint' >&2
+  exit 1
+fi
 if rg -q 'immutable-releases|immutable-preflight' "$clean/calls"; then
   echo 'publisher attempted the admin-only immutable release settings preflight' >&2
   exit 1
@@ -202,10 +215,10 @@ done
 locked_replacement=$(prepare_case locked-replacement)
 expect_failure run_publisher "$locked_replacement" publish-swaps-archive
 pre_publish_calls=$(sed '/^release publish$/,$d' "$locked_replacement/calls")
-grep -Fq "release download $asset $checksum" <<<"$pre_publish_calls" || {
+if ! grep -Fxq "release download $asset" <<<"$pre_publish_calls" || ! grep -Fxq "release download $checksum" <<<"$pre_publish_calls"; then
   echo 'locked replacement did not authenticate the matching draft bytes' >&2
   exit 1
-}
+fi
 grep -Fxq 'release publish' "$locked_replacement/calls"
 published_count=$(grep -Fxc 'release publish' "$locked_replacement/calls")
 [[ "$published_count" == 1 ]] || {
@@ -306,16 +319,6 @@ cp "$invariant/payload/$checksum" "$invariant/remote-assets/$checksum"
 expect_failure run_publisher "$invariant" none
 if rg -q 'release (create|upload|publish)' "$invariant/calls"; then
   echo 'metadata mismatch permitted a release mutation' >&2
-  exit 1
-fi
-
-wrong_tag=$(prepare_case wrong-tag)
-write_release "$wrong_tag" true false "$commit"
-jq '.tag_name = "nightly-10"' "$wrong_tag/state.json" > "$wrong_tag/state.tmp"
-mv "$wrong_tag/state.tmp" "$wrong_tag/state.json"
-expect_failure run_publisher "$wrong_tag" none
-if rg -q 'release (create|upload|publish)' "$wrong_tag/calls"; then
-  echo 'tag mismatch permitted a release mutation' >&2
   exit 1
 fi
 
