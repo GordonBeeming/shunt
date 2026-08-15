@@ -280,6 +280,10 @@ case "$mode" in
     download_anonymous_release
     uninstall_existing
     cleanup_candidate_install=true
+    # Hosted runners can carry stale Homebrew API metadata. Refresh core before
+    # resolving the reviewed go@1.25 dependency so this tests the currently
+    # published formula rather than the runner image snapshot.
+    brew update
     stage_formula "$candidate_formula"
     brew install "$staged_formula"
     assert_supported_homebrew_go
