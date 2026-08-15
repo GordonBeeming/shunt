@@ -20,9 +20,15 @@ if "$script_dir/find-release.sh" "$temporary" "$tag"; then
 else
   exit $?
 fi
-jq -e --arg tag "$tag" --arg commit "$commit" --arg asset "$asset" '
+if jq -e --arg tag "$tag" --arg commit "$commit" --arg asset "$asset" '
   (.tag_name == $tag) and (.target_commitish == $commit) and
   (.draft == false) and (.prerelease == true) and
   ([.assets[] | select(.name == $asset)] | length == 1)
-' "$temporary" >/dev/null || exit 4
+' "$temporary" >/dev/null; then
+  :
+else
+  status=$?
+  [[ "$status" == 1 ]] && exit 4
+  exit "$status"
+fi
 mv "$temporary" "$output"

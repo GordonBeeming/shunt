@@ -244,6 +244,31 @@ jq -e '.draft == false and .immutable == true' "$eventual_publish/state.json" >/
   exit 1
 }
 
+# A malformed release response is a hard failure, not a delayed list entry.
+invalid_published=$(prepare_case invalid-published)
+write_release "$invalid_published" false true "$commit" "$asset"
+jq '.assets = "invalid"' "$invalid_published/state.json" > "$invalid_published/state.tmp"
+mv "$invalid_published/state.tmp" "$invalid_published/state.json"
+if PATH="$invalid_published/bin:$PATH" \
+  MOCK_RELEASE_STATE="$invalid_published/state.json" \
+  MOCK_RELEASE_ASSETS="$invalid_published/remote-assets" \
+  MOCK_RELEASE_CALLS="$invalid_published/calls" \
+  MOCK_RELEASE_TAG="$tag" MOCK_RELEASE_COMMIT="$commit" GITHUB_REPOSITORY=GordonBeeming/shunt \
+  "$root/packaging/nightly/retry-not-found.sh" 4 "$root/packaging/nightly/find-published-release.sh" "$invalid_published/release.json" "$tag" "$commit" "$asset"; then
+  echo 'malformed published release response unexpectedly succeeded' >&2
+  exit 1
+else
+  invalid_status=$?
+fi
+[[ "$invalid_status" != 4 ]] || {
+  echo 'malformed published release response was treated as not found' >&2
+  exit 1
+}
+[[ $(grep -Fxc 'api-list' "$invalid_published/calls") == 1 ]] || {
+  echo 'malformed published release response was retried' >&2
+  exit 1
+}
+
 # A release can be replaced while reconciliation is running. A 404 for the
 # cached ID must trigger one fresh tag lookup, rather than trapping later
 # reads on the missing ID.

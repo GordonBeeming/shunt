@@ -25,7 +25,7 @@ for attempt in $(seq 1 "$attempts"); do
   (( base_delay > 8 )) && base_delay=8
   jitter_ms=$((RANDOM % 501))
   printf -v delay '%s.%03d' "$base_delay" "$jitter_ms"
-  printf 'lookup attempt %s/%s was not found; retrying in %ss: %q' "$attempt" "$attempts" "$delay" "$1" >&2
+  printf 'lookup attempt %s/%s was not found; retrying in %ss:' "$attempt" "$attempts" "$delay" >&2
   for argument in "$@"; do printf ' %q' "$argument" >&2; done
   printf '\n' >&2
   sleep "$delay"
