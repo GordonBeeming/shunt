@@ -82,7 +82,7 @@ jobs:
           bash packaging/homebrew/consumer-fixtures.sh
           bash .github/workflows/fixtures/integration-conditions.sh
           bash .github/workflows/fixtures/nightly-contract.sh
-          shellcheck packaging/nightly/*.sh packaging/homebrew/render.sh .github/workflows/fixtures/*.sh
+          shellcheck packaging/nightly/*.sh packaging/homebrew/*.sh .github/workflows/fixtures/*.sh
           ruby -c packaging/homebrew/shunt-nightly.rb.tmpl
       - name: Build two deterministic archives
         id: package
@@ -94,10 +94,11 @@ jobs:
           sha256=$(awk '{print $1}' "$RUNNER_TEMP/a/shunt-nightly_darwin_arm64.tar.gz.sha256")
           packaging/homebrew/render.sh "${{ needs.gate.outputs.version }}" "${{ needs.gate.outputs.tag }}" "$sha256" "$RUNNER_TEMP/shunt-nightly.rb"
           brew style "$RUNNER_TEMP/shunt-nightly.rb"
-          brew audit --strict --formula "$RUNNER_TEMP/shunt-nightly.rb"
+          packaging/homebrew/audit.sh "$RUNNER_TEMP/shunt-nightly.rb"
           mkdir -p "$RUNNER_TEMP/release-payload"
           cp "$RUNNER_TEMP/a/shunt-nightly_darwin_arm64.tar.gz" "$RUNNER_TEMP/a/shunt-nightly_darwin_arm64.tar.gz.sha256" "$RUNNER_TEMP/release-payload/"
           cp "$RUNNER_TEMP/shunt-nightly.rb" "$RUNNER_TEMP/release-payload/shunt-nightly.rb"
+          cp packaging/homebrew/audit.sh "$RUNNER_TEMP/release-payload/homebrew-audit.sh"
           echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
       - name: Store verified release payload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -198,7 +199,7 @@ jobs:
         run: |
           set -euo pipefail
           brew style "$RUNNER_TEMP/release-payload/shunt-nightly.rb"
-          brew audit --strict --formula "$RUNNER_TEMP/release-payload/shunt-nightly.rb"
+          bash "$RUNNER_TEMP/release-payload/homebrew-audit.sh" "$RUNNER_TEMP/release-payload/shunt-nightly.rb"
       - name: Sign and push release-authenticated Homebrew formula
         env:
           HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}

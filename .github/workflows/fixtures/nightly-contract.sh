@@ -105,6 +105,9 @@ require 'previous_tag: ${{ steps.select.outputs.previous_tag }}' 'prior formula 
 require 'previous_sha256: ${{ steps.select.outputs.previous_sha256 }}' 'prior formula checksum gate output'
 require 'go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11' 'pinned actionlint CLI installation'
 require 'bash packaging/homebrew/consumer-fixtures.sh' 'hosted consumer-contract fixture coverage'
+require 'packaging/homebrew/audit.sh "$RUNNER_TEMP/shunt-nightly.rb"' 'packaged formula audit uses a temporary named tap'
+require 'cp packaging/homebrew/audit.sh "$RUNNER_TEMP/release-payload/homebrew-audit.sh"' 'audit helper travels with the authenticated release payload'
+require 'bash "$RUNNER_TEMP/release-payload/homebrew-audit.sh" "$RUNNER_TEMP/release-payload/shunt-nightly.rb"' 'release-authenticated formula audit uses the packaged temporary-tap helper'
 require_file "$formula" '  depends_on "go@1.25"' 'nightly formula uses the canonical versioned Go dependency'
 require_file "$consumer" 'homebrew_go_formula=go@1.25' 'nightly consumer validates the formula dependency itself installs'
 require_file "$consumer" 'formula_name=shunt-nightly' 'nightly consumer uses the formula identifier'
@@ -193,6 +196,11 @@ fi
 
 if rg -n 'retry\.sh [0-9]+ gh release delete|retry\.sh [0-9]+ gh release (create|upload|edit)' "$workflow"; then
   echo 'nightly workflow retries a mutation instead of reconciling its state' >&2
+  exit 1
+fi
+
+if rg -n -F 'brew audit' "$workflow"; then
+  echo 'nightly workflow must route every Homebrew audit through the named-tap helper' >&2
   exit 1
 fi
 
