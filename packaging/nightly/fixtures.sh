@@ -73,6 +73,10 @@ case "${1:-}" in
       printf '[[%s]]\n' "$(release_exists && cat "$state" || printf '')"
       exit 0
     fi
+    if [[ "${1:-}" == --hostname ]]; then
+      [[ "${2:-}" == uploads.github.com ]] || exit 2
+      shift 2
+    fi
     endpoint=${1:-}
     shift || true
     case "$endpoint" in

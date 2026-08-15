@@ -11,6 +11,7 @@ tag=$1
 version=$2
 commit=$3
 payload_dir=$4
+repo=${GITHUB_REPOSITORY:-GordonBeeming/shunt}
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 asset=shunt-nightly_darwin_arm64.tar.gz
 checksum="$asset.sha256"
@@ -32,6 +33,20 @@ download_dir="$work/downloads"
 mkdir -p "$download_dir"
 
 fetch_release() {
+  local response status release_id
+  release_id=$(jq -r '.id // empty' "$release_json" 2>/dev/null || true)
+  if [[ "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+    response="$work/release.response"
+    "$script_dir/retry.sh" 4 "$script_dir/read-release.sh" "$response" "repos/$repo/releases/$release_id"
+    status=$(sed -n 's/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$response" | tail -n 1)
+    if [[ "$status" == 200 ]]; then
+      sed '1,/^$/d' "$response" > "$release_json"
+      return 0
+    fi
+    [[ "$status" == 404 ]] && return 4
+    echo "unexpected release lookup state: $status" >&2
+    return 1
+  fi
   "$script_dir/find-release.sh" "$release_json" "$tag"
 }
 
