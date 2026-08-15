@@ -28,20 +28,33 @@ grep -Fxq "$expected  $asset" "$checksum_path" || { echo "payload checksum does 
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-release_response="$work/release.response"
 release_json="$work/release.json"
 download_dir="$work/downloads"
 mkdir -p "$download_dir"
 
 fetch_release() {
-  "$script_dir/retry.sh" 4 "$script_dir/read-release.sh" "$release_response" "repos/$repo/releases/tags/$tag"
-  local status
-  status=$(sed -n 's/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$release_response" | tail -n 1)
-  if [[ "$status" == 404 ]]; then
-    return 4
+  local response status release_id
+  release_id=$(jq -r '.id // empty' "$release_json" 2>/dev/null || true)
+  if [[ "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+    response="$work/release.response"
+    "$script_dir/retry.sh" 4 "$script_dir/read-release.sh" "$response" "repos/$repo/releases/$release_id"
+    status=$(sed -n 's/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$response" | tail -n 1)
+    if [[ "$status" == 200 ]]; then
+      sed '1,/^$/d' "$response" > "$release_json"
+      return 0
+    fi
+    if [[ "$status" == 404 ]]; then
+      # A release can be deleted and recreated while reconciliation is in
+      # flight. Discard the stale ID so the next lookup re-authenticates by
+      # tag instead of repeatedly querying the missing release.
+      rm -f "$release_json"
+      "$script_dir/find-release.sh" "$release_json" "$tag"
+      return
+    fi
+    echo "unexpected release lookup state: $status" >&2
+    return 1
   fi
-  [[ "$status" == 200 ]] || { echo "unexpected release lookup state: $status" >&2; return 1; }
-  sed '1,/^$/d' "$release_response" > "$release_json"
+  "$script_dir/find-release.sh" "$release_json" "$tag"
 }
 
 assert_metadata() {
@@ -52,10 +65,13 @@ assert_metadata() {
 }
 
 download_existing() {
-  local names=()
-  jq -e --arg name "$asset" '.assets[] | select(.name == $name)' "$release_json" >/dev/null && names+=(--pattern "$asset")
-  jq -e --arg name "$checksum" '.assets[] | select(.name == $name)' "$release_json" >/dev/null && names+=(--pattern "$checksum")
-  ((${#names[@]} == 0)) || "$script_dir/retry.sh" 4 gh release download "$tag" --dir "$download_dir" --clobber "${names[@]}"
+  local name asset_id
+  for name in "$asset" "$checksum"; do
+    asset_id=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .id' "$release_json")
+    if [[ -n "$asset_id" ]]; then
+      "$script_dir/retry.sh" 4 "$script_dir/download-release-asset.sh" "$asset_id" "$download_dir/$name"
+    fi
+  done
 }
 
 require_immutable_or_cleanup() {
@@ -105,7 +121,8 @@ download_existing
 for path in "$archive_path" "$checksum_path"; do
   name=$(basename -- "$path")
   if ! jq -e --arg name "$name" '.assets[] | select(.name == $name)' "$release_json" >/dev/null; then
-    "$script_dir/upload-release-asset.sh" "$tag" "$path"
+    release_id=$(jq -r '.id' "$release_json")
+    "$script_dir/upload-release-asset.sh" "$tag" "$release_id" "$path"
     fetch_release
     assert_metadata
     [[ $(jq -r '.draft // false' "$release_json") == true ]] || { echo "release was published while assets were being uploaded" >&2; exit 1; }
@@ -118,7 +135,8 @@ for path in "$archive_path" "$checksum_path"; do
 done
 
 "$script_dir/verify-release.sh" "$release_json" "$tag" "$commit" "$asset" "$expected" "$download_dir"
-"$script_dir/publish-release-draft.sh" "$tag" "$commit" "$asset"
+release_id=$(jq -r '.id' "$release_json")
+"$script_dir/publish-release-draft.sh" "$tag" "$release_id" "$commit" "$asset"
 fetch_release
 # The files fetched while this release was a draft are no longer trustworthy at
 # the immutable lock boundary. Fetch both assets again from the now-published
