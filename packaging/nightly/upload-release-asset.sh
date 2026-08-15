@@ -16,7 +16,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 [[ -f "$asset_file" ]] || { echo "asset file does not exist: $asset_file" >&2; exit 2; }
 [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || { echo "release ID must be positive: $release_id" >&2; exit 2; }
 
-if gh api --hostname uploads.github.com "repos/$repo/releases/$release_id/assets?name=$asset_name" \
+if gh api "https://uploads.github.com/repos/$repo/releases/$release_id/assets?name=$asset_name" \
   --method POST \
   -H 'Content-Type: application/octet-stream' \
   --input "$asset_file" >/dev/null; then
