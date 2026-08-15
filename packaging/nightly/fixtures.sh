@@ -75,6 +75,15 @@ case "${1:-}" in
     fi
     if [[ "${1:-}" == --paginate ]]; then
       record 'api-list'
+      list_count=$(grep -Fxc 'api-list' "$calls")
+      if [[ "$mode" == create-list-lag && "$list_count" == 2 ]]; then
+        printf '[[]]\n'
+        exit 0
+      fi
+      if [[ "$mode" == publish-list-lag && "$list_count" == 3 ]]; then
+        jq '.draft = true | .immutable = false' "$state" | jq -s '[.]'
+        exit 0
+      fi
       printf '[[%s]]\n' "$(release_exists && cat "$state" || printf '')"
       exit 0
     fi
@@ -118,7 +127,7 @@ case "${1:-}" in
           if [[ "$mode" == publish-swaps-archive ]]; then
             printf 'replaced-at-immutable-lock' > "$assets/shunt-nightly_darwin_arm64.tar.gz"
           fi
-          [[ "$mode" != publish-after-success ]] || exit 1
+          [[ "$mode" != publish-after-success && "$mode" != publish-list-lag ]] || exit 1
           cat "$state"
         else
           cat "$state"
@@ -213,6 +222,52 @@ for ambiguous in create-after-success upload-after-success publish-after-success
   run_publisher "$case_dir" "$ambiguous"
   jq -e '.draft == false and .immutable == true' "$case_dir/state.json" >/dev/null
 done
+
+# GitHub may acknowledge draft creation before its release list includes the
+# new draft. Retry selection as a whole so a successful create is resumable.
+eventual=$(prepare_case eventual-create)
+run_publisher "$eventual" create-list-lag
+jq -e '.draft == false and .immutable == true' "$eventual/state.json" >/dev/null
+[[ $(grep -Fxc 'api-list' "$eventual/calls") -ge 3 ]] || {
+  echo 'draft creation was not retried after an eventually consistent release list' >&2
+  exit 1
+}
+
+# A publish PATCH can succeed before failing locally while the release list
+# still returns its stale draft representation. Retry the state predicate, not
+# only the lookup, until the published release is visible.
+eventual_publish=$(prepare_case eventual-publish)
+run_publisher "$eventual_publish" publish-list-lag
+jq -e '.draft == false and .immutable == true' "$eventual_publish/state.json" >/dev/null
+[[ $(grep -Fxc 'api-list' "$eventual_publish/calls") -ge 4 ]] || {
+  echo 'published release state was not retried after an eventually consistent release list' >&2
+  exit 1
+}
+
+# A malformed release response is a hard failure, not a delayed list entry.
+invalid_published=$(prepare_case invalid-published)
+write_release "$invalid_published" false true "$commit" "$asset"
+jq '.assets = "invalid"' "$invalid_published/state.json" > "$invalid_published/state.tmp"
+mv "$invalid_published/state.tmp" "$invalid_published/state.json"
+if PATH="$invalid_published/bin:$PATH" \
+  MOCK_RELEASE_STATE="$invalid_published/state.json" \
+  MOCK_RELEASE_ASSETS="$invalid_published/remote-assets" \
+  MOCK_RELEASE_CALLS="$invalid_published/calls" \
+  MOCK_RELEASE_TAG="$tag" MOCK_RELEASE_COMMIT="$commit" GITHUB_REPOSITORY=GordonBeeming/shunt \
+  "$root/packaging/nightly/retry-not-found.sh" 4 "$root/packaging/nightly/find-published-release.sh" "$invalid_published/release.json" "$tag" "$commit" "$asset"; then
+  echo 'malformed published release response unexpectedly succeeded' >&2
+  exit 1
+else
+  invalid_status=$?
+fi
+[[ "$invalid_status" != 4 ]] || {
+  echo 'malformed published release response was treated as not found' >&2
+  exit 1
+}
+[[ $(grep -Fxc 'api-list' "$invalid_published/calls") == 1 ]] || {
+  echo 'malformed published release response was retried' >&2
+  exit 1
+}
 
 # A release can be replaced while reconciliation is running. A 404 for the
 # cached ID must trigger one fresh tag lookup, rather than trapping later
@@ -403,6 +458,7 @@ PATH="$not_found/bin:$PATH" MOCK_RELEASE_STATE="$not_found/state.json" MOCK_RELE
   "$root/packaging/nightly/read-release.sh" "$tmp/not-found.response" "repos/GordonBeeming/shunt/releases/tags/$tag"
 grep -Fqx 'HTTP/2 404' "$tmp/not-found.response"
 expect_failure "$root/packaging/nightly/retry.sh" 1 false
+expect_failure "$root/packaging/nightly/retry-not-found.sh" 4 false
 
 release_list=$(prepare_case release-list)
 write_release "$release_list" true false "$commit"
