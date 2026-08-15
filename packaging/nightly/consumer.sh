@@ -293,6 +293,10 @@ case "$mode" in
   tap)
     command -v brew >/dev/null || { echo "brew is required on the macOS consumer runner" >&2; exit 1; }
     anonymous_release_probe
+    # Refresh core before any prior or current formula install. Hosted runners
+    # can otherwise resolve the public tap correctly while still installing a
+    # stale go@1.25 dependency from their image snapshot.
+    brew update
     seed_prior_formula_if_clean
     refresh_named_tap
     receipt=$(installed_receipt)
@@ -300,7 +304,6 @@ case "$mode" in
       brew install "$tap/$formula_name"
       brew test "$tap/$formula_name"
     elif has_distinct_prior_release && [[ "$receipt" == "$formula_name $previous_version" ]]; then
-      brew update
       brew upgrade "$tap/$formula_name"
     elif [[ "$receipt" == "$formula_name $version" ]]; then
       echo "named consumer found the exact current receipt; re-verifying it"
