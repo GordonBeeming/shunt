@@ -84,6 +84,10 @@ case "${1:-}" in
         jq '.draft = true | .immutable = false' "$state" | jq -s '[.]'
         exit 0
       fi
+      if [[ "$mode" == publish-success-list-lag && "$list_count" == 5 ]]; then
+        jq '.tag_name = "" | .target_commitish = "" | .prerelease = null' "$state" | jq -s '[.]'
+        exit 0
+      fi
       if [[ "$mode" == upload-tag-lag && -e "$calls.upload-tag-lag" ]]; then
         jq -s '[.]' "$state"
         jq --arg tag "$tag" '.tag_name = $tag' "$state" > "$state.tmp"
@@ -310,6 +314,16 @@ run_publisher "$eventual_publish" publish-list-lag
 jq -e '.draft == false and .immutable == true' "$eventual_publish/state.json" >/dev/null
 [[ $(grep -Fxc 'api-list' "$eventual_publish/calls") -ge 4 ]] || {
   echo 'published release state was not retried after an eventually consistent release list' >&2
+  exit 1
+}
+
+# A successful publish PATCH can still precede the release list's final tag and
+# metadata. The success path must wait for the same complete published state.
+successful_publish_lag=$(prepare_case successful-publish-lag)
+run_publisher "$successful_publish_lag" publish-success-list-lag
+jq -e '.draft == false and .immutable == true' "$successful_publish_lag/state.json" >/dev/null
+[[ $(grep -Fxc 'api-list' "$successful_publish_lag/calls") -ge 6 ]] || {
+  echo 'successful publish did not retry delayed release metadata' >&2
   exit 1
 }
 

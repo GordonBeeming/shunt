@@ -143,7 +143,10 @@ done
 "$script_dir/verify-release.sh" "$release_json" "$tag" "$commit" "$asset" "$expected" "$download_dir"
 release_id=$(jq -r '.id' "$release_json")
 "$script_dir/publish-release-draft.sh" "$tag" "$release_id" "$commit" "$asset"
-fetch_release
+# A successful publish response can arrive before the release list exposes the
+# final tag and metadata. Reuse the published-state lookup that reconciles an
+# ambiguous PATCH so both success paths wait for the same complete state.
+"$script_dir/retry-not-found.sh" 4 "$script_dir/find-published-release.sh" "$release_json" "$tag" "$commit" "$asset"
 # The files fetched while this release was a draft are no longer trustworthy at
 # the immutable lock boundary. Fetch both assets again from the now-published
 # release before accepting the locked state.
