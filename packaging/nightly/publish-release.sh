@@ -43,7 +43,14 @@ fetch_release() {
       sed '1,/^$/d' "$response" > "$release_json"
       return 0
     fi
-    [[ "$status" == 404 ]] && return 4
+    if [[ "$status" == 404 ]]; then
+      # A release can be deleted and recreated while reconciliation is in
+      # flight. Discard the stale ID so the next lookup re-authenticates by
+      # tag instead of repeatedly querying the missing release.
+      rm -f "$release_json"
+      "$script_dir/find-release.sh" "$release_json" "$tag"
+      return
+    fi
     echo "unexpected release lookup state: $status" >&2
     return 1
   fi

@@ -61,6 +61,11 @@ case "${1:-}" in
       shift
       endpoint=$1
       record "api-read $endpoint"
+      if [[ "$mode" == stale-id && "$endpoint" == */releases/12345 && ! -e "$calls.stale-id" ]]; then
+        : > "$calls.stale-id"
+        response 404
+        exit 1
+      fi
       if release_exists && { [[ "$endpoint" != */releases/tags/* ]] || [[ $(jq -r '.draft' "$state") == false ]]; }; then
         response 200
         exit 0
@@ -212,6 +217,18 @@ for ambiguous in create-after-success upload-after-success publish-after-success
   run_publisher "$case_dir" "$ambiguous"
   jq -e '.draft == false and .immutable == true' "$case_dir/state.json" >/dev/null
 done
+
+# A release can be replaced while reconciliation is running. A 404 for the
+# cached ID must trigger one fresh tag lookup, rather than trapping later
+# reads on the missing ID.
+stale_id=$(prepare_case stale-id)
+write_release "$stale_id" true false "$commit"
+run_publisher "$stale_id" stale-id
+jq -e '.draft == false and .immutable == true' "$stale_id/state.json" >/dev/null
+[[ $(grep -Fxc 'api-list' "$stale_id/calls") == 2 ]] || {
+  echo 'stale release ID did not trigger exactly one fresh tag lookup' >&2
+  exit 1
+}
 
 # The draft bytes can match before publication and still be replaced at the
 # immutable lock boundary. The reconciler must re-download the locked asset,
