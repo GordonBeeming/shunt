@@ -84,6 +84,18 @@ case "${1:-}" in
         jq '.draft = true | .immutable = false' "$state" | jq -s '[.]'
         exit 0
       fi
+      if [[ "$mode" == upload-tag-lag && -e "$calls.upload-tag-lag" ]]; then
+        jq -s '[.]' "$state"
+        jq --arg tag "$tag" '.tag_name = $tag' "$state" > "$state.tmp"
+        mv "$state.tmp" "$state"
+        rm -f "$calls.upload-tag-lag"
+        exit 0
+      fi
+      if [[ "$mode" == upload-asset-lag && -e "$state.asset-lag" ]]; then
+        jq -s '[.]' "$state.asset-lag"
+        rm -f "$state.asset-lag"
+        exit 0
+      fi
       printf '[[%s]]\n' "$(release_exists && cat "$state" || printf '')"
       exit 0
     fi
@@ -110,8 +122,16 @@ case "${1:-}" in
         done
         [[ -f "$input" ]] || exit 2
         record "release upload $name"
+        if [[ "$mode" == upload-asset-lag ]]; then
+          cp "$state" "$state.asset-lag"
+        fi
         cp "$input" "$assets/$name"
         add_asset "$name"
+        if [[ "$mode" == upload-tag-lag ]]; then
+          jq '.tag_name = "untagged-eventually-consistent"' "$state" > "$state.tmp"
+          mv "$state.tmp" "$state"
+          : > "$calls.upload-tag-lag"
+        fi
         [[ "$mode" != upload-after-success ]] || exit 1
         printf '{}\n'
         ;;
@@ -223,6 +243,55 @@ for ambiguous in create-after-success upload-after-success publish-after-success
   jq -e '.draft == false and .immutable == true' "$case_dir/state.json" >/dev/null
 done
 
+# GitHub may temporarily expose an uploaded draft under its internal
+# untagged-* name. Retry the complete expected-tag selection after every asset
+# mutation rather than rejecting the eventual release as an invariant breach.
+eventual_upload=$(prepare_case eventual-upload)
+run_publisher "$eventual_upload" upload-tag-lag
+jq -e '.draft == false and .immutable == true' "$eventual_upload/state.json" >/dev/null
+[[ $(grep -Fxc 'api-list' "$eventual_upload/calls") -ge 4 ]] || {
+  echo 'draft tag metadata was not retried after an eventually consistent asset upload' >&2
+  exit 1
+}
+
+# The expected tag can return before the upload itself is visible in the
+# release list. Keep retrying until the asset just uploaded is present rather
+# than carrying a valid-but-stale partial release into final verification.
+eventual_asset=$(prepare_case eventual-asset)
+run_publisher "$eventual_asset" upload-asset-lag
+jq -e '.draft == false and .immutable == true' "$eventual_asset/state.json" >/dev/null
+[[ $(grep -Fxc 'api-list' "$eventual_asset/calls") -ge 4 ]] || {
+  echo 'draft asset metadata was not retried after an eventually consistent asset upload' >&2
+  exit 1
+}
+
+# Only a missing required asset is retryable. Malformed release metadata must
+# fail immediately rather than becoming a misleading eventual-consistency wait.
+invalid_required_asset=$(prepare_case invalid-required-asset)
+write_release "$invalid_required_asset" true false "$commit" "$asset"
+jq '.assets = "invalid"' "$invalid_required_asset/state.json" > "$invalid_required_asset/state.tmp"
+mv "$invalid_required_asset/state.tmp" "$invalid_required_asset/state.json"
+if PATH="$invalid_required_asset/bin:$PATH" \
+  MOCK_RELEASE_STATE="$invalid_required_asset/state.json" \
+  MOCK_RELEASE_ASSETS="$invalid_required_asset/remote-assets" \
+  MOCK_RELEASE_CALLS="$invalid_required_asset/calls" \
+  MOCK_RELEASE_TAG="$tag" MOCK_RELEASE_COMMIT="$commit" \
+  "$root/packaging/nightly/retry-not-found.sh" 4 "$root/packaging/nightly/find-release.sh" \
+  "$invalid_required_asset/release.json" "$tag" "$asset"; then
+  echo 'malformed required asset metadata unexpectedly succeeded' >&2
+  exit 1
+else
+  invalid_required_asset_status=$?
+fi
+[[ "$invalid_required_asset_status" != 4 ]] || {
+  echo 'malformed required asset metadata was incorrectly retried as not found' >&2
+  exit 1
+}
+[[ $(grep -Fxc 'api-list' "$invalid_required_asset/calls") == 1 ]] || {
+  echo 'malformed required asset metadata unexpectedly retried' >&2
+  exit 1
+}
+
 # GitHub may acknowledge draft creation before its release list includes the
 # new draft. Retry selection as a whole so a successful create is resumable.
 eventual=$(prepare_case eventual-create)
@@ -276,8 +345,8 @@ stale_id=$(prepare_case stale-id)
 write_release "$stale_id" true false "$commit"
 run_publisher "$stale_id" stale-id
 jq -e '.draft == false and .immutable == true' "$stale_id/state.json" >/dev/null
-[[ $(grep -Fxc 'api-list' "$stale_id/calls") == 2 ]] || {
-  echo 'stale release ID did not trigger exactly one fresh tag lookup' >&2
+[[ $(grep -Fxc 'api-list' "$stale_id/calls") == 4 ]] || {
+  echo 'stale release ID did not trigger one fresh tag lookup beyond the mutation reconciliations' >&2
   exit 1
 }
 

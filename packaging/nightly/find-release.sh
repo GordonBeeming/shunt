@@ -2,13 +2,14 @@
 # Find exactly one published or draft release by tag.
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "usage: $0 OUTPUT_FILE TAG" >&2
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: $0 OUTPUT_FILE TAG [REQUIRED_ASSET]" >&2
   exit 2
 fi
 
 output=$1
 tag=$2
+required_asset=${3:-}
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 temporary="${output}.tmp.$$"
 releases="${output}.releases.$$"
@@ -21,4 +22,13 @@ case "$count" in
   1) jq --arg tag "$tag" '.[] | select(.tag_name == $tag)' "$releases" > "$temporary" ;;
   *) echo "multiple releases exist for tag $tag" >&2; exit 1 ;;
 esac
+if [[ -n "$required_asset" ]]; then
+  asset_count=$(jq -er --arg name "$required_asset" \
+    '[.assets[] | select(.name == $name)] | length' "$temporary") || exit $?
+  case "$asset_count" in
+    0) exit 4 ;;
+    1) ;;
+    *) echo "release lists $asset_count copies of required asset $required_asset" >&2; exit 1 ;;
+  esac
+fi
 mv "$temporary" "$output"

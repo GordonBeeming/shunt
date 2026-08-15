@@ -125,7 +125,11 @@ for path in "$archive_path" "$checksum_path"; do
   if ! jq -e --arg name "$name" '.assets[] | select(.name == $name)' "$release_json" >/dev/null; then
     release_id=$(jq -r '.id' "$release_json")
     "$script_dir/upload-release-asset.sh" "$tag" "$release_id" "$path"
-    fetch_release
+    # GitHub can briefly expose a successfully mutated draft under an internal
+    # untagged-* name, or restore its tag before its uploaded asset appears.
+    # Re-select through the expected tag and asset until the release list
+    # converges instead of trusting the stale by-ID representation.
+    "$script_dir/retry-not-found.sh" 4 "$script_dir/find-release.sh" "$release_json" "$tag" "$name"
     assert_metadata
     [[ $(jq -r '.draft // false' "$release_json") == true ]] || { echo "release was published while assets were being uploaded" >&2; exit 1; }
     # Re-authenticate after each remote mutation. A race cannot turn a valid
