@@ -3,6 +3,7 @@
 set -euo pipefail
 
 tap=gordonbeeming/tap
+staging_tap=shunt/nightly-candidate
 formula_name=shunt-nightly
 homebrew_go_formula=go@1.25
 asset=shunt-nightly_darwin_arm64.tar.gz
@@ -86,6 +87,7 @@ fi
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 tmp=$(mktemp -d)
 cleanup_candidate_install=false
+cleanup_staging_tap=false
 
 cleanup() {
   local status=$?
@@ -99,6 +101,12 @@ cleanup() {
       [[ "$status" -ne 0 ]] || status=1
     fi
   fi
+  if [[ "$cleanup_staging_tap" == true ]]; then
+    if ! brew untap --force "$staging_tap"; then
+      echo "failed to clean up the candidate Homebrew tap" >&2
+      [[ "$status" -ne 0 ]] || status=1
+    fi
+  fi
   rm -rf "$tmp"
   exit "$status"
 }
@@ -107,6 +115,20 @@ trap cleanup EXIT
 candidate_formula="$tmp/shunt-nightly.rb"
 "$root/packaging/homebrew/render.sh" "$version" "$tag" "$sha256" "$candidate_formula"
 previous_formula="$tmp/previous-shunt-nightly.rb"
+staged_formula="$staging_tap/$formula_name"
+
+stage_formula() {
+  local source=$1 tap_dir tapped
+  tapped=$(brew tap)
+  if grep -Fxq "$staging_tap" <<<"$tapped"; then
+    brew untap --force "$staging_tap"
+  fi
+  brew tap-new --no-git "$staging_tap"
+  cleanup_staging_tap=true
+  tap_dir=$(brew --repository "$staging_tap")
+  mkdir -p "$tap_dir/Formula"
+  cp "$source" "$tap_dir/Formula/$formula_name.rb"
+}
 
 assert_candidate_formula() {
   grep -Fqx "  version \"$version\"" "$candidate_formula"
@@ -210,7 +232,9 @@ assert_installed_consumer() {
 }
 
 refresh_named_tap() {
-  if brew tap | grep -Fxq "$tap"; then
+  local tapped
+  tapped=$(brew tap)
+  if grep -Fxq "$tap" <<<"$tapped"; then
     brew untap --force "$tap"
   fi
   brew tap "$tap"
@@ -230,8 +254,9 @@ seed_prior_formula_if_clean() {
   receipt=$(installed_receipt)
   if [[ -z "$receipt" ]]; then
     echo "installing exact prior public nightly before named-tap upgrade"
-    brew install "$previous_formula"
-    brew test "$previous_formula"
+    stage_formula "$previous_formula"
+    brew install "$staged_formula"
+    brew test "$staged_formula"
     receipt=$(installed_receipt)
     [[ "$receipt" == "$formula_name $previous_version" ]] || {
       printf 'prior formula install produced unexpected receipt: expected=%s actual=%s\n' "$formula_name $previous_version" "$receipt" >&2
@@ -255,9 +280,10 @@ case "$mode" in
     download_anonymous_release
     uninstall_existing
     cleanup_candidate_install=true
-    brew install "$candidate_formula"
+    stage_formula "$candidate_formula"
+    brew install "$staged_formula"
     assert_supported_homebrew_go
-    brew test "$candidate_formula"
+    brew test "$staged_formula"
     assert_installed_consumer
     ;;
   tap)
