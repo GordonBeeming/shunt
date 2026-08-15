@@ -80,6 +80,10 @@ case "${1:-}" in
         printf '[[]]\n'
         exit 0
       fi
+      if [[ "$mode" == publish-list-lag && "$list_count" == 3 ]]; then
+        jq '.draft = true | .immutable = false' "$state" | jq -s .
+        exit 0
+      fi
       printf '[[%s]]\n' "$(release_exists && cat "$state" || printf '')"
       exit 0
     fi
@@ -123,7 +127,7 @@ case "${1:-}" in
           if [[ "$mode" == publish-swaps-archive ]]; then
             printf 'replaced-at-immutable-lock' > "$assets/shunt-nightly_darwin_arm64.tar.gz"
           fi
-          [[ "$mode" != publish-after-success ]] || exit 1
+          [[ "$mode" != publish-after-success && "$mode" != publish-list-lag ]] || exit 1
           cat "$state"
         else
           cat "$state"
@@ -226,6 +230,17 @@ run_publisher "$eventual" create-list-lag
 jq -e '.draft == false and .immutable == true' "$eventual/state.json" >/dev/null
 [[ $(grep -Fxc 'api-list' "$eventual/calls") -ge 3 ]] || {
   echo 'draft creation was not retried after an eventually consistent release list' >&2
+  exit 1
+}
+
+# A publish PATCH can succeed before failing locally while the release list
+# still returns its stale draft representation. Retry the state predicate, not
+# only the lookup, until the published release is visible.
+eventual_publish=$(prepare_case eventual-publish)
+run_publisher "$eventual_publish" publish-list-lag
+jq -e '.draft == false and .immutable == true' "$eventual_publish/state.json" >/dev/null
+[[ $(grep -Fxc 'api-list' "$eventual_publish/calls") -ge 4 ]] || {
+  echo 'published release state was not retried after an eventually consistent release list' >&2
   exit 1
 }
 

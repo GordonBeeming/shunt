@@ -22,11 +22,9 @@ fi
 
 response=$(mktemp)
 trap 'rm -f "$response"' EXIT
-if "$script_dir/retry.sh" 4 "$script_dir/find-release.sh" "$response" "$tag"; then
-  if jq -e --arg tag "$tag" --arg commit "$commit" --arg asset "$asset" '(.tag_name == $tag) and (.target_commitish == $commit) and (.draft == false) and (.prerelease == true) and ([.assets[] | select(.name == $asset)] | length == 1)' "$response" >/dev/null; then
-    echo "release publish request failed after $tag was published; resuming" >&2
-    exit 0
-  fi
+if "$script_dir/retry.sh" 4 "$script_dir/find-published-release.sh" "$response" "$tag" "$commit" "$asset"; then
+  echo "release publish request failed after $tag was published; resuming" >&2
+  exit 0
 fi
 echo "release publish failed and $tag was not published with the expected state" >&2
 exit 1
