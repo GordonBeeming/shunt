@@ -232,10 +232,19 @@ grep -Fqx "$hostile_gopath/first/bin/xcaddy" <<<"$hostile_result"
 
 first=$(make_mock_tools first)
 run_consumer "$first" tap "$version" "$tag" "$sha256"
+grep -Fxq 'brew update' "$first/calls"
 grep -Fxq "brew install gordonbeeming/tap/shunt-nightly" "$first/calls"
 grep -Fq 'curl --fail' "$first/calls"
 grep -Fxq 'brew --prefix go@1.25' "$first/calls"
 grep -Fxq 'go version' "$first/calls"
+first_curl_line=$(grep -n -m1 '^curl ' "$first/calls" | cut -d: -f1)
+first_update_line=$(grep -n -m1 -Fx 'brew update' "$first/calls" | cut -d: -f1)
+first_install_line=$(grep -n -m1 -Fx 'brew install gordonbeeming/tap/shunt-nightly' "$first/calls" | cut -d: -f1)
+[[ -n "$first_curl_line" && -n "$first_update_line" && -n "$first_install_line" && \
+  "$first_curl_line" -lt "$first_update_line" && "$first_update_line" -lt "$first_install_line" ]] || {
+  echo 'named consumer refresh and install did not follow the anonymous release probe' >&2
+  exit 1
+}
 
 accepted_125=$(make_mock_tools accepted-125)
 MOCK_GO_VERSION='go version go1.25.13 darwin/arm64' run_consumer "$accepted_125" candidate "$version" "$tag" "$sha256"
@@ -312,7 +321,8 @@ grep -Fxq "brew upgrade gordonbeeming/tap/shunt-nightly" "$persistent/calls"
 rerun=$(make_mock_tools rerun "$version")
 run_consumer "$rerun" tap "$version" "$tag" "$sha256" "$version" "$tag" "$sha256"
 grep -Fxq 'brew untap --force gordonbeeming/tap' "$rerun/calls"
-if grep -Eq '^brew (install|upgrade|update)' "$rerun/calls"; then
+grep -Fxq 'brew update' "$rerun/calls"
+if grep -Eq '^brew (install|upgrade) ' "$rerun/calls"; then
   echo 'named rerun unexpectedly installed or upgraded the current nightly' >&2
   exit 1
 fi
