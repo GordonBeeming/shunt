@@ -84,6 +84,13 @@ case "${1:-}" in
         jq '.draft = true | .immutable = false' "$state" | jq -s '[.]'
         exit 0
       fi
+      if [[ "$mode" == upload-tag-lag && -e "$calls.upload-tag-lag" ]]; then
+        cat "$state" | jq -s '[.]'
+        jq --arg tag "$tag" '.tag_name = $tag' "$state" > "$state.tmp"
+        mv "$state.tmp" "$state"
+        rm -f "$calls.upload-tag-lag"
+        exit 0
+      fi
       printf '[[%s]]\n' "$(release_exists && cat "$state" || printf '')"
       exit 0
     fi
@@ -112,6 +119,11 @@ case "${1:-}" in
         record "release upload $name"
         cp "$input" "$assets/$name"
         add_asset "$name"
+        if [[ "$mode" == upload-tag-lag ]]; then
+          jq '.tag_name = "untagged-eventually-consistent"' "$state" > "$state.tmp"
+          mv "$state.tmp" "$state"
+          : > "$calls.upload-tag-lag"
+        fi
         [[ "$mode" != upload-after-success ]] || exit 1
         printf '{}\n'
         ;;
@@ -223,6 +235,17 @@ for ambiguous in create-after-success upload-after-success publish-after-success
   jq -e '.draft == false and .immutable == true' "$case_dir/state.json" >/dev/null
 done
 
+# GitHub may temporarily expose an uploaded draft under its internal
+# untagged-* name. Retry the complete expected-tag selection after every asset
+# mutation rather than rejecting the eventual release as an invariant breach.
+eventual_upload=$(prepare_case eventual-upload)
+run_publisher "$eventual_upload" upload-tag-lag
+jq -e '.draft == false and .immutable == true' "$eventual_upload/state.json" >/dev/null
+[[ $(grep -Fxc 'api-list' "$eventual_upload/calls") -ge 4 ]] || {
+  echo 'draft tag metadata was not retried after an eventually consistent asset upload' >&2
+  exit 1
+}
+
 # GitHub may acknowledge draft creation before its release list includes the
 # new draft. Retry selection as a whole so a successful create is resumable.
 eventual=$(prepare_case eventual-create)
@@ -276,8 +299,8 @@ stale_id=$(prepare_case stale-id)
 write_release "$stale_id" true false "$commit"
 run_publisher "$stale_id" stale-id
 jq -e '.draft == false and .immutable == true' "$stale_id/state.json" >/dev/null
-[[ $(grep -Fxc 'api-list' "$stale_id/calls") == 2 ]] || {
-  echo 'stale release ID did not trigger exactly one fresh tag lookup' >&2
+[[ $(grep -Fxc 'api-list' "$stale_id/calls") == 4 ]] || {
+  echo 'stale release ID did not trigger one fresh tag lookup beyond the mutation reconciliations' >&2
   exit 1
 }
 
