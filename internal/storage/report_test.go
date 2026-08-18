@@ -105,6 +105,29 @@ func TestInspectGitFailureAndBaselineStateFailureRemainObservable(t *testing.T) 
 	}
 }
 
+func TestCollectProjectReportsRecordedAndObservedTargetsConservatively(t *testing.T) {
+	repo := newTestRepo(t)
+	writeTestFile(t, filepath.Join(repo, "tracked.txt"), "base")
+	gitTest(t, repo, "add", "tracked.txt")
+	gitTestCommit(t, repo, "base")
+	gitTest(t, repo, "branch", "recorded")
+	config := filepath.Join(t.TempDir(), "config")
+	src := filepath.Join(config, "one", "src")
+	gitTest(t, repo, "worktree", "add", "-b", "observed", src, "HEAD")
+	app := state.App{Name: "repo", RepoPath: repo, ConfigDir: config, Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "recorded", WorktreeRepoPath: repo}}}
+	project := collectProject(context.Background(), app)
+	evidence := project.Sidings[0].Source.Git
+	if evidence.Preservation == nil || len(evidence.Preservation.Targets) != 2 {
+		t.Fatalf("preservation = %#v", evidence.Preservation)
+	}
+	if evidence.Preservation.MatchingRef != "" || evidence.Preservation.MatchingCommit != "" {
+		t.Fatalf("multi-target aggregate exposed one witness: %#v", evidence.Preservation)
+	}
+	if evidence.UniqueCommits != InspectGit(context.Background(), src).UniqueCommits {
+		t.Fatalf("unique commits changed: %d", evidence.UniqueCommits)
+	}
+}
+
 func TestInspectGitMarksMalformedDivergenceAsError(t *testing.T) {
 	worktree := t.TempDir()
 	evidence := inspectGit(context.Background(), worktree, func(_ context.Context, _ string, args ...string) (proc.Result, error) {

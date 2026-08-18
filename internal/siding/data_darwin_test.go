@@ -61,7 +61,7 @@ func TestAppleContainerDataPromotionLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := container.Run(ctx, container.RunOpts{
-		Name: guest, Image: baseTag, Init: true, CapAddAll: true,
+		Name: guest, Image: baseTag, Init: true, CapAddAll: true, WritableProcSys: true,
 		Mounts: []container.Mount{{Host: srcRoot, Guest: "/workspace"}, {Host: volumeRoot, Guest: "/mnt/dvol"}},
 		Cmd:    []string{"sleep", "1200"},
 	}); err != nil {
