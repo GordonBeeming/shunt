@@ -115,9 +115,16 @@ func CompleteRemovalRecoveryHandoff(ctx context.Context, repoPath, archiveRef, a
 	lines := []string{"start"}
 	present := 0
 	for _, ref := range recoveryRefs {
+		exists, err := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", ref)
+		if err != nil {
+			if exists.ExitCode == 1 {
+				continue
+			}
+			return fmt.Errorf("inspect recovery ref %q: %w", ref, err)
+		}
 		result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", ref+"^{commit}")
 		if err != nil {
-			continue
+			return fmt.Errorf("resolve recovery ref %q: %w", ref, err)
 		}
 		oid := strings.TrimSpace(result.Stdout)
 		seen[oid]++

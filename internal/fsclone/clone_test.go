@@ -171,6 +171,19 @@ func TestCompleteRemovalRecoveryHandoffStates(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 	})
+	t.Run("recovery lookup failure rejects", func(t *testing.T) {
+		err := CompleteRemovalRecoveryHandoff(
+			context.Background(),
+			filepath.Join(t.TempDir(), "missing-repo"),
+			"",
+			"",
+			[]state.RemovalTarget{{Ref: "refs/heads/main", ExpectedOID: "0123456789012345678901234567890123456789"}},
+			[]string{"refs/shunt/recovery/missing"},
+		)
+		if err == nil || !strings.Contains(err.Error(), "inspect recovery ref") {
+			t.Fatalf("error = %v", err)
+		}
+	})
 	t.Run("moved archive retains recoveries", func(t *testing.T) {
 		repo, mainCommit, workspaceCommit := newWorktreeTestRepo(t)
 		targets := []state.RemovalTarget{{Ref: "refs/heads/main", ExpectedOID: mainCommit, Preserved: true, MatchingCommit: mainCommit}}
