@@ -161,7 +161,21 @@ func inspectErrorNamesAbsentGuest(err error, name string) bool {
 	if err == nil || strings.TrimSpace(name) == "" {
 		return false
 	}
-	message, target := strings.ToLower(err.Error()), strings.ToLower(name)
+	message, target := strings.TrimSpace(err.Error()), strings.TrimSpace(name)
+	// Apple container currently reports absence as either
+	// `container not found: <name>` or `Error: container not found: <name>`.
+	// This form is deliberately parsed as a complete message so a similarly
+	// named guest (for example, target-older) cannot prove target absent.
+	normalized := message
+	if len(normalized) >= len("Error:") && strings.EqualFold(normalized[:len("Error:")], "Error:") {
+		normalized = strings.TrimSpace(normalized[len("Error:"):])
+	}
+	const notFoundPrefix = "container not found:"
+	if len(normalized) >= len(notFoundPrefix) && strings.EqualFold(normalized[:len(notFoundPrefix)], notFoundPrefix) {
+		return strings.EqualFold(strings.TrimSpace(normalized[len(notFoundPrefix):]), target)
+	}
+
+	message, target = strings.ToLower(message), strings.ToLower(target)
 	patterns := []string{
 		"container " + target + " not found",
 		"container \"" + target + "\" not found",

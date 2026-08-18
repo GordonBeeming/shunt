@@ -88,12 +88,32 @@ exit 0
 }
 
 func TestInspectErrorNamesOnlyRequestedAbsentGuest(t *testing.T) {
-	if !inspectErrorNamesAbsentGuest(errors.New("container target not found"), "target") {
-		t.Fatal("target-specific not-found error was not recognized")
+	for _, message := range []string{
+		"container not found: target",
+		"Error: container not found: target",
+		"error: CONTAINER NOT FOUND: TARGET",
+		"container target not found",
+		`container "target" not found`,
+		"no such container: target",
+		"no such container target",
+		"container target does not exist",
+		`container "target" does not exist`,
+	} {
+		if !inspectErrorNamesAbsentGuest(errors.New(message), "target") {
+			t.Fatalf("target-specific not-found error %q was not recognized", message)
+		}
 	}
-	for _, message := range []string{"XPC service not found", "apiserver does not exist", "container other not found"} {
+	for _, message := range []string{
+		"container not found: other",
+		"Error: container not found: target-other",
+		"Error: container not found: target and more",
+		"Error: container not found: target: detail",
+		"XPC service not found",
+		"apiserver does not exist",
+		"container other not found",
+	} {
 		if inspectErrorNamesAbsentGuest(errors.New(message), "target") {
-			t.Fatalf("unrelated error %q proved target absence", message)
+			t.Fatalf("unrelated or ambiguous error %q proved target absence", message)
 		}
 	}
 }
