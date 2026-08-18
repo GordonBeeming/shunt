@@ -94,12 +94,14 @@ type Options struct {
 // safe for concurrent use; callers should create a fresh Analyzer after refs
 // may have changed.
 type Analyzer struct {
-	repo    string
-	options Options
-	git     runner
-	mu      sync.Mutex
-	refs    map[string][]refInfo
-	patches map[string]integrationEvidence
+	repo       string
+	options    Options
+	git        runner
+	mu         sync.Mutex
+	refs       map[string][]refInfo
+	patches    map[string]integrationEvidence
+	refFills   map[string]*refFill
+	patchFills map[string]*patchFill
 }
 
 func NewAnalyzer(repo string, options Options) *Analyzer {
@@ -110,10 +112,13 @@ func NewAnalyzer(repo string, options Options) *Analyzer {
 		options.Timeout = DefaultTimeout
 	}
 	return &Analyzer{
-		repo: repo, options: options,
-		git:     gitRunner{repo: repo, maxPatchBytes: options.MaxPatchBytes},
-		refs:    make(map[string][]refInfo),
-		patches: make(map[string]integrationEvidence),
+		repo:       repo,
+		options:    options,
+		git:        gitRunner{repo: repo, maxPatchBytes: options.MaxPatchBytes},
+		refs:       make(map[string][]refInfo),
+		patches:    make(map[string]integrationEvidence),
+		refFills:   make(map[string]*refFill),
+		patchFills: make(map[string]*patchFill),
 	}
 }
 
@@ -134,7 +139,14 @@ func (a *Analyzer) Analyze(ctx context.Context, targetRef string, deletionRefs [
 }
 
 func analyze(ctx context.Context, git runner, req Request) Result {
-	a := &Analyzer{repo: req.Repo, git: git, refs: make(map[string][]refInfo), patches: make(map[string]integrationEvidence)}
+	a := &Analyzer{
+		repo:       req.Repo,
+		git:        git,
+		refs:       make(map[string][]refInfo),
+		patches:    make(map[string]integrationEvidence),
+		refFills:   make(map[string]*refFill),
+		patchFills: make(map[string]*patchFill),
+	}
 	return a.analyze(ctx, req)
 }
 
@@ -236,6 +248,12 @@ func (a *Analyzer) analyze(ctx context.Context, req Request) Result {
 
 type refInfo struct{ name, oid string }
 
+type refFill struct {
+	done chan struct{}
+	refs []refInfo
+	err  error
+}
+
 func deletionKey(deleted map[string]bool) string {
 	refs := make([]string, 0, len(deleted))
 	for ref := range deleted {
@@ -248,24 +266,44 @@ func deletionKey(deleted map[string]bool) string {
 func (a *Analyzer) survivingRefs(ctx context.Context, deleted map[string]bool) ([]refInfo, error) {
 	key := deletionKey(deleted)
 	a.mu.Lock()
+	if a.refs == nil {
+		a.refs = make(map[string][]refInfo)
+	}
+	if a.refFills == nil {
+		a.refFills = make(map[string]*refFill)
+	}
 	if refs, ok := a.refs[key]; ok {
 		copyOfRefs := append([]refInfo(nil), refs...)
 		a.mu.Unlock()
 		return copyOfRefs, nil
 	}
+	if fill, ok := a.refFills[key]; ok {
+		a.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-fill.done:
+			return append([]refInfo(nil), fill.refs...), fill.err
+		}
+	}
+	fill := &refFill{done: make(chan struct{})}
+	a.refFills[key] = fill
 	a.mu.Unlock()
 	out, err := a.git.run(ctx, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", "refs/heads", "refs/remotes", "refs/tags")
-	if err != nil {
-		return nil, err
-	}
-	refs, err := parseRefs(out, deleted)
-	if err != nil {
-		return nil, err
+	var refs []refInfo
+	if err == nil {
+		refs, err = parseRefs(out, deleted)
 	}
 	a.mu.Lock()
-	a.refs[key] = append([]refInfo(nil), refs...)
+	if err == nil {
+		a.refs[key] = append([]refInfo(nil), refs...)
+	}
+	fill.refs = append([]refInfo(nil), refs...)
+	fill.err = err
+	delete(a.refFills, key)
+	close(fill.done)
 	a.mu.Unlock()
-	return refs, nil
+	return refs, err
 }
 
 func parseRefs(out string, deleted map[string]bool) ([]refInfo, error) {
@@ -315,6 +353,12 @@ type integrationEvidence struct {
 	patches []commitPatch
 }
 
+type patchFill struct {
+	done    chan struct{}
+	patches []commitPatch
+	err     error
+}
+
 type stageError struct {
 	stage string
 	err   error
@@ -326,28 +370,57 @@ func (e stageError) Unwrap() error { return e.err }
 func (a *Analyzer) integrationPatches(ctx context.Context, base, integrationCommit string) ([]commitPatch, error) {
 	key := base + "\x00" + integrationCommit
 	a.mu.Lock()
+	if a.patches == nil {
+		a.patches = make(map[string]integrationEvidence)
+	}
+	if a.patchFills == nil {
+		a.patchFills = make(map[string]*patchFill)
+	}
 	if evidence, ok := a.patches[key]; ok {
 		patches := append([]commitPatch(nil), evidence.patches...)
 		a.mu.Unlock()
 		return patches, nil
 	}
+	if fill, ok := a.patchFills[key]; ok {
+		a.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-fill.done:
+			return append([]commitPatch(nil), fill.patches...), fill.err
+		}
+	}
+	fill := &patchFill{done: make(chan struct{})}
+	a.patchFills[key] = fill
 	a.mu.Unlock()
 	revision := base + ".." + integrationCommit
 	commits, overflow, err := commits(a.git, ctx, MaxIntegrationCommits, revision)
 	if err != nil {
-		return nil, stageError{stage: "integration history scan", err: err}
+		err = stageError{stage: "integration history scan", err: err}
+		return a.finishPatchFill(key, fill, nil, err)
 	}
 	if overflow {
-		return nil, errIntegrationOverflow
+		return a.finishPatchFill(key, fill, nil, errIntegrationOverflow)
 	}
 	patches, err := historyPatchIDs(ctx, a.git, revision, commits)
 	if err != nil {
-		return nil, stageError{stage: "integration patch parsing", err: err}
+		err = stageError{stage: "integration patch parsing", err: err}
+		return a.finishPatchFill(key, fill, nil, err)
 	}
+	return a.finishPatchFill(key, fill, patches, nil)
+}
+
+func (a *Analyzer) finishPatchFill(key string, fill *patchFill, patches []commitPatch, err error) ([]commitPatch, error) {
 	a.mu.Lock()
-	a.patches[key] = integrationEvidence{patches: append([]commitPatch(nil), patches...)}
+	if err == nil {
+		a.patches[key] = integrationEvidence{patches: append([]commitPatch(nil), patches...)}
+	}
+	fill.patches = append([]commitPatch(nil), patches...)
+	fill.err = err
+	delete(a.patchFills, key)
+	close(fill.done)
 	a.mu.Unlock()
-	return patches, nil
+	return patches, err
 }
 
 func historyPatchIDs(ctx context.Context, git runner, revision string, commits []string) ([]commitPatch, error) {
