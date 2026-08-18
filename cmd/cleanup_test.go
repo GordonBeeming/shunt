@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gordonbeeming/shunt/internal/gitpreservation"
+	"github.com/gordonbeeming/shunt/internal/resolve"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
@@ -66,6 +70,127 @@ func TestConfiguredBaseRemovalStillRequiresSuccessor(t *testing.T) {
 	_, err := prepareBaseRemoval(app, []string{"one"}, "", bufio.NewReader(strings.NewReader("")))
 	if err == nil || !strings.Contains(err.Error(), "requires --next-base") {
 		t.Fatalf("base removal error = %v", err)
+	}
+}
+
+func TestRmCommandLegacyNoBaseDoesNotPromptForBase(t *testing.T) {
+	app := persistedLegacyNoBaseApp(t)
+	withRemovalCommandSeams(t, app, func(removed *[]string) error {
+		command := newRmCmd()
+		command.SetArgs([]string{"one", "--force"})
+		return command.ExecuteContext(context.Background())
+	}, "")
+}
+
+func TestCleanupCommandLegacyNoBaseConsumesOnlySidingSelection(t *testing.T) {
+	app := persistedLegacyNoBaseApp(t)
+	withRemovalCommandSeams(t, app, func(removed *[]string) error {
+		command := newCleanupCmd()
+		command.SetArgs([]string{"--force"})
+		return command.ExecuteContext(context.Background())
+	}, "1\n")
+}
+
+func TestAnalyzerFactoryCreatesOnePerOwnerPerObservationPhase(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "tracked"), []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "tracked")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "base")
+	config := t.TempDir()
+	app := state.App{ConfigDir: config, RepoPath: repo, Sidings: map[string]state.Siding{}}
+	for _, name := range []string{"one", "two"} {
+		src := filepath.Join(config, name, "src")
+		if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, repo, "worktree", "add", "-b", name, src, "main")
+		app.Sidings[name] = state.Siding{Name: name, Branch: name, WorktreeRepoPath: repo}
+	}
+	old := newCommandAnalyzer
+	t.Cleanup(func() { newCommandAnalyzer = old })
+	calls := 0
+	newCommandAnalyzer = func(owner string) *gitpreservation.Analyzer {
+		calls++
+		return gitpreservation.NewAnalyzer(owner, gitpreservation.Options{})
+	}
+	if _, err := buildCleanupCandidates(context.Background(), app, true); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("candidate analyzer creations = %d", calls)
+	}
+	calls = 0
+	selected := []string{"one", "two"}
+	refs, err := resolveSelectedRemovalRefs(context.Background(), app, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureSelectedRemovalSafety(context.Background(), app, selected, refs); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("snapshot analyzer creations = %d", calls)
+	}
+}
+
+func persistedLegacyNoBaseApp(t *testing.T) state.App {
+	t.Helper()
+	dir := t.TempDir()
+	app := state.App{Name: "legacy", ConfigDir: dir, Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "one"}, "two": {Name: "two", Branch: "two"}}}
+	if err := state.SaveApp(app); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := state.LoadApp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.BaseSiding = ""
+	return loaded
+}
+
+func withRemovalCommandSeams(t *testing.T, app state.App, run func(*[]string) error, input string) {
+	t.Helper()
+	oldLoad, oldRemove, oldStdin, oldStdout := commandLoadCurrentApp, commandRemoveSiding, os.Stdin, os.Stdout
+	t.Cleanup(func() {
+		commandLoadCurrentApp, commandRemoveSiding, os.Stdin, os.Stdout = oldLoad, oldRemove, oldStdin, oldStdout
+	})
+	commandLoadCurrentApp = func() (state.App, resolve.Location, error) { return app, resolve.Location{}, nil }
+	removed := []string{}
+	commandRemoveSiding = func(_ context.Context, _ *state.App, name string, _ bool, successor string, _ ...*removalSafety) error {
+		if successor != "" {
+			return fmt.Errorf("unexpected base successor %q", successor)
+		}
+		removed = append(removed, name)
+		return nil
+	}
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inW.WriteString(input); err != nil {
+		t.Fatal(err)
+	}
+	inW.Close()
+	os.Stdin = inR
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = outW
+	err = run(&removed)
+	outW.Close()
+	output, _ := io.ReadAll(outR)
+	if err != nil {
+		t.Fatalf("command: %v; output=%s", err, output)
+	}
+	if len(removed) != 1 || removed[0] != "one" {
+		t.Fatalf("removed = %v; output=%s", removed, output)
+	}
+	if strings.Contains(string(output), "Select a siding") || strings.Contains(string(output), "successor source base") {
+		t.Fatalf("unexpected base/siding prompt: %s", output)
 	}
 }
 
@@ -201,6 +326,15 @@ func TestTruncateTerminalRowTinyAndNormalWidths(t *testing.T) {
 	}
 	if got := truncateTerminalRow("short", 10); got != "short" {
 		t.Fatalf("normal = %q", got)
+	}
+	if got := truncateTerminalRow("e\u0301x", 2); got != "e\u0301x" {
+		t.Fatalf("combining width = %q", got)
+	}
+	if got := truncateTerminalRow("界x", 2); got != "…" {
+		t.Fatalf("wide width = %q", got)
+	}
+	if got := terminalRuneWidth('界'); got != 2 {
+		t.Fatalf("wide rune cells = %d", got)
 	}
 }
 

@@ -57,8 +57,10 @@ const (
 )
 
 // RemovalOperation journals the one project-exclusive destructive operation
-// that may be resumed. GenerationID is filled once the data baseline reports a
-// committed generation for ID.
+// that may be resumed. Target witnesses and recovery refs are immutable once
+// destructive stages begin. Recovery refs become permanent archives after
+// success; clearing this journal never deletes them. GenerationID is filled
+// once the data baseline reports a committed generation for ID.
 type RemovalOperation struct {
 	ID                      string          `json:"id"`
 	Siding                  string          `json:"siding"`

@@ -82,6 +82,16 @@ type GitEvidence struct {
 }
 
 type PreservationEvidence struct {
+	Preserved      bool                         `json:"preserved"`
+	Kind           string                       `json:"kind"`
+	MatchingRef    string                       `json:"matchingRef,omitempty"`
+	MatchingCommit string                       `json:"matchingCommit,omitempty"`
+	Reason         string                       `json:"reason"`
+	Targets        []PreservationTargetEvidence `json:"targets,omitempty"`
+}
+
+type PreservationTargetEvidence struct {
+	Ref            string `json:"ref"`
 	Preserved      bool   `json:"preserved"`
 	Kind           string `json:"kind"`
 	MatchingRef    string `json:"matchingRef,omitempty"`
@@ -314,8 +324,10 @@ func collectSidingReport(ctx context.Context, app state.App, name string, analyz
 		kind := ""
 		reasons := make([]string, 0, len(refs))
 		matchingRef, matchingCommit := "", ""
+		targetEvidence := make([]PreservationTargetEvidence, 0, len(refs))
 		for _, ref := range refs {
 			result := analyzer.Analyze(ctx, ref, refs)
+			targetEvidence = append(targetEvidence, PreservationTargetEvidence{Ref: ref, Preserved: result.Preserved, Kind: string(result.Kind), MatchingRef: result.MatchingRef, MatchingCommit: result.MatchingCommit, Reason: result.Reason})
 			preserved = preserved && result.Preserved
 			if kind == "" {
 				kind = string(result.Kind)
@@ -326,7 +338,10 @@ func collectSidingReport(ctx context.Context, app state.App, name string, analyz
 			}
 			reasons = append(reasons, ref+": "+result.Reason)
 		}
-		gitEvidence.Preservation = &PreservationEvidence{Preserved: preserved, Kind: kind, MatchingRef: matchingRef, MatchingCommit: matchingCommit, Reason: strings.Join(reasons, "; ")}
+		if len(refs) > 1 {
+			matchingRef, matchingCommit = "", ""
+		}
+		gitEvidence.Preservation = &PreservationEvidence{Preserved: preserved, Kind: kind, MatchingRef: matchingRef, MatchingCommit: matchingCommit, Reason: strings.Join(reasons, "; "), Targets: targetEvidence}
 	}
 	return SidingReport{
 		Name:      name,

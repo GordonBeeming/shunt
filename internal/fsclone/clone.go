@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -279,6 +280,7 @@ type WorktreeQuarantine struct {
 	OriginalPath string
 	RecoveryPath string
 	Branch       string
+	RetainBranch bool
 }
 
 // WorktreeQuarantineFor returns the deterministic recovery location for an
@@ -396,7 +398,7 @@ func retireQuarantinedWorktree(ctx context.Context, quarantine WorktreeQuarantin
 	if err := syncDirectory(metadataRoot); err != nil {
 		return fmt.Errorf("durably retire exact worktree registration %q: %w", adminPath, err)
 	}
-	if quarantine.Branch != "" {
+	if quarantine.Branch != "" && !quarantine.RetainBranch {
 		result, err := proc.Run(ctx, "git", "-C", quarantine.OwnerPath, "show-ref", "--verify", "--quiet", "refs/heads/"+quarantine.Branch)
 		if err != nil && result.ExitCode != 1 {
 			return fmt.Errorf("inspect branch %q after deleting its worktree: %w", quarantine.Branch, err)
@@ -406,6 +408,59 @@ func retireQuarantinedWorktree(ctx context.Context, quarantine WorktreeQuarantin
 				return fmt.Errorf("delete branch %q after deleting its worktree: %w", quarantine.Branch, err)
 			}
 		}
+	}
+	return nil
+}
+
+// RetireRemovalTargetRefs verifies every durable recovery archive and deletes
+// all existing target refs at their exact witnessed OIDs in one transaction.
+func RetireRemovalTargetRefs(ctx context.Context, repoPath string, targets []state.RemovalTarget, recoveryRefs []string) error {
+	expected := map[string]int{}
+	for _, target := range targets {
+		if target.ExpectedOID != "" {
+			expected[target.ExpectedOID]++
+		}
+	}
+	lines := []string{"start"}
+	seen := map[string]int{}
+	for _, ref := range recoveryRefs {
+		if !strings.HasPrefix(ref, "refs/shunt/recovery/") {
+			return fmt.Errorf("invalid recovery ref %q", ref)
+		}
+		result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", ref+"^{commit}")
+		if err != nil {
+			return fmt.Errorf("resolve recovery ref %q: %w", ref, err)
+		}
+		oid := strings.TrimSpace(result.Stdout)
+		seen[oid]++
+		lines = append(lines, "verify "+ref+" "+oid)
+	}
+	if !maps.Equal(expected, seen) {
+		return fmt.Errorf("recovery refs do not retain the exact target OIDs")
+	}
+	for _, target := range targets {
+		if target.ExpectedOID == "" {
+			lines = append(lines, "verify "+target.Ref+" 0000000000000000000000000000000000000000")
+			continue
+		}
+		lines = append(lines, "delete "+target.Ref+" "+target.ExpectedOID)
+	}
+	lines = append(lines, "prepare", "commit")
+	tmp, err := os.CreateTemp("", "shunt-retire-refs-*.stdin")
+	if err != nil {
+		return err
+	}
+	path := tmp.Name()
+	defer os.Remove(path)
+	if _, err := tmp.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := proc.RunStdin(ctx, path, "git", "-C", repoPath, "update-ref", "--stdin"); err != nil {
+		return fmt.Errorf("retire removal target refs: %w", err)
 	}
 	return nil
 }
