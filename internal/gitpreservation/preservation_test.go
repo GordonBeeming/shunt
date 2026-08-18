@@ -1,8 +1,11 @@
 package gitpreservation
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -94,6 +97,21 @@ func TestAnalyzeReachableFromTag(t *testing.T) {
 	}
 }
 
+func TestAnalyzeReachableFromAnnotatedTagReturnsPeeledCommit(t *testing.T) {
+	r := newRepo(t)
+	r.git("switch", "-c", "topic")
+	topicCommit := r.commit("topic.txt", "work\n", "work")
+	r.git("tag", "-a", "saved-annotated", "-m", "saved")
+	tagObject := r.git("rev-parse", "refs/tags/saved-annotated")
+	if tagObject == topicCommit {
+		t.Fatal("test tag is not annotated")
+	}
+	got := analyzeRef(r, "refs/heads/topic", "refs/heads/topic")
+	if !got.Preserved || got.Kind != KindReachable || got.MatchingRef != "refs/tags/saved-annotated" || got.MatchingCommit != topicCommit {
+		t.Fatalf("result = %+v, topic=%s tag=%s", got, topicCommit, tagObject)
+	}
+}
+
 func TestAnalyzeExcludesEveryDeletionRef(t *testing.T) {
 	r := newRepo(t)
 	r.git("switch", "-c", "topic")
@@ -136,6 +154,53 @@ func TestAnalyzeEquivalentRebase(t *testing.T) {
 	got := analyzeRef(r, "refs/heads/topic", "refs/heads/topic", "refs/heads/integrated")
 	if !got.Preserved || got.Kind != KindEquivalent {
 		t.Fatalf("result = %+v", got)
+	}
+}
+
+func TestAnalyzeEquivalentAcrossSiblingBranchesReturnsCommonIntegrationTip(t *testing.T) {
+	r := newRepo(t)
+	base := r.git("rev-parse", "HEAD")
+	r.git("switch", "-c", "topic")
+	topicA := r.commit("path-a.txt", "A\n", "topic A")
+	topicB := r.commit("path-b.txt", "B\n", "topic B")
+	r.git("switch", "-c", "sibling-a", base)
+	r.git("cherry-pick", topicA)
+	matchedA := r.git("rev-parse", "HEAD")
+	r.git("switch", "-c", "sibling-b", base)
+	r.git("cherry-pick", topicB)
+	matchedB := r.git("rev-parse", "HEAD")
+	r.git("switch", "main")
+	r.git("merge", "--no-ff", "sibling-a", "-m", "merge A")
+	r.git("merge", "--no-ff", "sibling-b", "-m", "merge B")
+	r.integrationRef()
+	integrationTip := r.git("rev-parse", "refs/remotes/origin/main")
+	got := analyzeRef(r, "refs/heads/topic", "refs/heads/topic", "refs/heads/sibling-a", "refs/heads/sibling-b")
+	if !got.Preserved || got.Kind != KindEquivalent || got.MatchingCommit != integrationTip {
+		t.Fatalf("result = %+v, integration tip=%s", got, integrationTip)
+	}
+	for _, matched := range []string{matchedA, matchedB} {
+		r.git("merge-base", "--is-ancestor", matched, got.MatchingCommit)
+	}
+	cmd := exec.Command("git", "archive", "--format=tar", got.MatchingCommit)
+	cmd.Dir = r.dir
+	archiveBytes, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := make(map[string]bool)
+	reader := tar.NewReader(bytes.NewReader(archiveBytes))
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths[header.Name] = true
+	}
+	if !paths["path-a.txt"] || !paths["path-b.txt"] {
+		t.Fatalf("archive paths = %v", paths)
 	}
 }
 

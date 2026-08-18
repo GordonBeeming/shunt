@@ -184,7 +184,11 @@ func (a *Analyzer) analyze(ctx context.Context, req Request) Result {
 	}
 	if len(containing) > 0 {
 		ref := containing[0]
-		return Result{Preserved: true, Kind: KindReachable, MatchingRef: ref.name, MatchingCommit: ref.oid, Reason: "target commit is reachable from " + ref.name}
+		peeled, err := oneLine(git.run(ctx, "rev-parse", "--verify", ref.name+"^{commit}"))
+		if err != nil || peeled == "" {
+			return stageFailure(ctx, "reachable ref peeling", err)
+		}
+		return Result{Preserved: true, Kind: KindReachable, MatchingRef: ref.name, MatchingCommit: peeled, Reason: "target commit is reachable from " + ref.name}
 	}
 
 	integrationRef, integrationCommit := integration(refs)
@@ -231,9 +235,9 @@ func (a *Analyzer) analyze(ctx context.Context, req Request) Result {
 		}
 		return stageFailure(ctx, "integration patch analysis", err)
 	}
-	match, matchCommit := equivalentCommits(topicPatches, integrationPatches)
+	match := equivalentCommits(topicPatches, integrationPatches)
 	if match {
-		return Result{Preserved: true, Kind: KindEquivalent, MatchingRef: integrationRef, MatchingCommit: matchCommit, Reason: "every topic commit has an equivalent patch on " + integrationRef}
+		return Result{Preserved: true, Kind: KindEquivalent, MatchingRef: integrationRef, MatchingCommit: integrationCommit, Reason: "every topic commit has an equivalent patch on " + integrationRef}
 	}
 
 	aggregate, err := git.patchID(ctx, base, target)
@@ -524,16 +528,14 @@ func objectID(value string) bool {
 	return true
 }
 
-func equivalentCommits(topic, integration []commitPatch) (bool, string) {
+func equivalentCommits(topic, integration []commitPatch) bool {
 	next := 0
-	last := ""
 	for _, patch := range integration {
 		if next < len(topic) && patch.id == topic[next].id {
 			next++
-			last = patch.commit
 		}
 	}
-	return next == len(topic), last
+	return next == len(topic)
 }
 
 func oneLine(out string, err error) (string, error) {
