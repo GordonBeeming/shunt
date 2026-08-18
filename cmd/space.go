@@ -97,6 +97,9 @@ func printSpace(out io.Writer, report storage.Report) error {
 			}
 			fmt.Fprintf(out, "  %s %s (logical; not reclaimable): %s\n", protection, managed.Name, formatMeasurement(managed))
 		}
+		if project.GitArchives.Observation == "observed" {
+			fmt.Fprintf(out, "  managed Git refs: %d recovery, %d preservation witnesses\n", project.GitArchives.RecoveryRefs, project.GitArchives.WitnessRefs)
+		}
 		for _, unknown := range project.Unclassified {
 			fmt.Fprintf(out, "  unclassified %s (logical; ownership/reclaimability unverified): %s\n", unknown.Name, formatMeasurement(unknown))
 		}

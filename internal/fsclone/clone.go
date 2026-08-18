@@ -56,6 +56,46 @@ func EnsureRemovalRecoveryRefs(ctx context.Context, repoPath, operationID string
 	return refs, nil
 }
 
+func EnsureRemovalWitnessRefs(ctx context.Context, repoPath string, targets []state.RemovalTarget) ([]string, error) {
+	byCommit := map[string]bool{}
+	for _, target := range targets {
+		if target.Preserved && target.MatchingCommit != "" {
+			byCommit[target.MatchingCommit] = true
+		}
+	}
+	commits := make([]string, 0, len(byCommit))
+	for oid := range byCommit {
+		commits = append(commits, oid)
+	}
+	sort.Strings(commits)
+	refs := make([]string, 0, len(commits))
+	for _, oid := range commits {
+		ref := "refs/shunt/witness/" + oid
+		if _, err := proc.Run(ctx, "git", "-C", repoPath, "update-ref", ref, oid); err != nil {
+			return nil, fmt.Errorf("create preservation witness %q: %w", ref, err)
+		}
+		refs = append(refs, ref)
+	}
+	return refs, nil
+}
+
+func GCOrphanRecoveryRefs(ctx context.Context, repoPath, activeOperationID string) error {
+	result, err := proc.Run(ctx, "git", "-C", repoPath, "for-each-ref", "--format=%(refname)", "refs/shunt/recovery")
+	if err != nil {
+		return err
+	}
+	keep := "refs/shunt/recovery/" + safeOperationID(activeOperationID) + "/"
+	for _, ref := range strings.Fields(result.Stdout) {
+		if strings.HasPrefix(ref, keep) {
+			continue
+		}
+		if _, err := proc.Run(ctx, "git", "-C", repoPath, "update-ref", "-d", ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func RemoveRecoveryRefs(ctx context.Context, repoPath string, refs []string) error {
 	for _, ref := range refs {
 		if !strings.HasPrefix(ref, "refs/shunt/recovery/") {
@@ -101,6 +141,34 @@ func ValidateRemovalTargets(ctx context.Context, repoPath string, targets []stat
 		}
 	}
 	return nil
+}
+
+func RemovalTargetsAbsent(ctx context.Context, repoPath string, targets []state.RemovalTarget) (bool, error) {
+	absent := 0
+	for _, target := range targets {
+		result, err := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", target.Ref)
+		if err != nil {
+			if result.ExitCode != 1 {
+				return false, err
+			}
+			absent++
+			continue
+		}
+		if target.ExpectedOID == "" {
+			return false, fmt.Errorf("expected-absent target %q appeared", target.Ref)
+		}
+		oid, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", target.Ref+"^{commit}")
+		if err != nil || strings.TrimSpace(oid.Stdout) != target.ExpectedOID {
+			return false, fmt.Errorf("target %q moved", target.Ref)
+		}
+	}
+	if absent == 0 {
+		return false, nil
+	}
+	if absent != len(targets) {
+		return false, fmt.Errorf("removal targets are in a mixed present/absent state")
+	}
+	return true, nil
 }
 
 func safeOperationID(value string) string {
@@ -438,9 +506,13 @@ func RetireRemovalTargetRefs(ctx context.Context, repoPath string, targets []sta
 	if !maps.Equal(expected, seen) {
 		return fmt.Errorf("recovery refs do not retain the exact target OIDs")
 	}
+	zeroOID, err := repositoryZeroOID(ctx, repoPath)
+	if err != nil {
+		return err
+	}
 	for _, target := range targets {
 		if target.ExpectedOID == "" {
-			lines = append(lines, "verify "+target.Ref+" 0000000000000000000000000000000000000000")
+			lines = append(lines, "verify "+target.Ref+" "+zeroOID)
 			continue
 		}
 		lines = append(lines, "delete "+target.Ref+" "+target.ExpectedOID)
@@ -463,6 +535,21 @@ func RetireRemovalTargetRefs(ctx context.Context, repoPath string, targets []sta
 		return fmt.Errorf("retire removal target refs: %w", err)
 	}
 	return nil
+}
+
+func repositoryZeroOID(ctx context.Context, repoPath string) (string, error) {
+	result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--show-object-format")
+	if err != nil {
+		return "", err
+	}
+	switch strings.TrimSpace(result.Stdout) {
+	case "sha1":
+		return strings.Repeat("0", 40), nil
+	case "sha256":
+		return strings.Repeat("0", 64), nil
+	default:
+		return "", fmt.Errorf("unsupported Git object format %q", strings.TrimSpace(result.Stdout))
+	}
 }
 
 // repairQuarantinedWorktreeRegistration updates only the named linked
