@@ -136,6 +136,73 @@ func TestRemovalWitnessArchiveDeduplicatesPreservedTargets(t *testing.T) {
 	}
 }
 
+func TestCompleteRemovalRecoveryHandoffStates(t *testing.T) {
+	t.Run("all present and already complete", func(t *testing.T) {
+		repo, mainCommit, _ := newWorktreeTestRepo(t)
+		targets := []state.RemovalTarget{{Ref: "refs/heads/main", ExpectedOID: mainCommit, Preserved: true, MatchingCommit: mainCommit}}
+		recoveries, err := EnsureRemovalRecoveryRefs(context.Background(), repo, "all-present", targets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		archiveRef, archiveOID, err := EnsureRemovalWitnessArchive(context.Background(), repo, targets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := CompleteRemovalRecoveryHandoff(context.Background(), repo, archiveRef, archiveOID, targets, recoveries); err != nil {
+			t.Fatal(err)
+		}
+		if err := CompleteRemovalRecoveryHandoff(context.Background(), repo, archiveRef, archiveOID, targets, recoveries); err != nil {
+			t.Fatalf("idempotent handoff: %v", err)
+		}
+		if err := ValidateRecoveryRefs(context.Background(), repo, recoveries); err == nil {
+			t.Fatal("recovery refs remain")
+		}
+	})
+	t.Run("mixed rejects", func(t *testing.T) {
+		repo, mainCommit, _ := newWorktreeTestRepo(t)
+		targets := []state.RemovalTarget{{Ref: "refs/heads/main", ExpectedOID: mainCommit}, {Ref: "refs/heads/second", ExpectedOID: mainCommit}}
+		gitOutput(t, repo, "branch", "second", mainCommit)
+		recoveries, err := EnsureRemovalRecoveryRefs(context.Background(), repo, "mixed", targets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gitOutput(t, repo, "update-ref", "-d", recoveries[0])
+		if err := CompleteRemovalRecoveryHandoff(context.Background(), repo, "", "", targets, recoveries); err == nil || !strings.Contains(err.Error(), "mixed") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("moved archive retains recoveries", func(t *testing.T) {
+		repo, mainCommit, workspaceCommit := newWorktreeTestRepo(t)
+		targets := []state.RemovalTarget{{Ref: "refs/heads/main", ExpectedOID: mainCommit, Preserved: true, MatchingCommit: mainCommit}}
+		recoveries, err := EnsureRemovalRecoveryRefs(context.Background(), repo, "moved-archive", targets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		archiveRef, archiveOID, err := EnsureRemovalWitnessArchive(context.Background(), repo, targets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gitOutput(t, repo, "update-ref", archiveRef, workspaceCommit)
+		if err := CompleteRemovalRecoveryHandoff(context.Background(), repo, archiveRef, archiveOID, targets, recoveries); err == nil {
+			t.Fatal("moved archive accepted")
+		}
+		if err := ValidateRecoveryRefs(context.Background(), repo, recoveries); err != nil {
+			t.Fatalf("recoveries lost: %v", err)
+		}
+	})
+	t.Run("explicit discard needs no archive", func(t *testing.T) {
+		repo, mainCommit, _ := newWorktreeTestRepo(t)
+		targets := []state.RemovalTarget{{Ref: "refs/heads/main", ExpectedOID: mainCommit, Preserved: false}}
+		recoveries, err := EnsureRemovalRecoveryRefs(context.Background(), repo, "discard", targets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := CompleteRemovalRecoveryHandoff(context.Background(), repo, "", "", targets, recoveries); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestAddWorktreeGitButlerHeadFallsBackToOriginMain(t *testing.T) {
 	repo, mainCommit, _ := newWorktreeTestRepo(t)
 	gitOutput(t, repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
