@@ -275,6 +275,115 @@ func TestTerminalPreservationFailureKeepsRecoveryAuthorizationRequired(t *testin
 	}
 }
 
+func TestSuccessfulNonForceRemovalClearsTargetsRecoveriesAndArchivesWitness(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	safety, err := captureRemovalSafety(context.Background(), fixture.app, "one", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matching := ""
+	for _, target := range safety.Targets {
+		if target.Preserved {
+			matching = target.MatchingCommit
+			break
+		}
+	}
+	if matching == "" {
+		t.Fatal("fixture target was not preserved")
+	}
+	app := fixture.app
+	if err := runRemovalWithPolicy(context.Background(), &app, "one", "", false, &safety, removalTestOperations()); err != nil {
+		t.Fatal(err)
+	}
+	if app.Removal != nil {
+		t.Fatalf("journal remains: %#v", app.Removal)
+	}
+	assertRefAbsent(t, fixture.control, "refs/heads/shunt/one")
+	if refs := removalRefsWithPrefix(t, fixture.control, "refs/shunt/recovery"); len(refs) != 0 {
+		t.Fatalf("recoveries remain: %v", refs)
+	}
+	archive := removalGitOutput(t, fixture.control, "rev-parse", "refs/shunt/witness/archive^{commit}")
+	runGit(t, fixture.control, "merge-base", "--is-ancestor", matching, archive)
+}
+
+func TestSuccessfulForceRemovalClearsWithoutArchiveParent(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	before := removalOptionalRef(t, fixture.control, "refs/shunt/witness/archive")
+	app := fixture.app
+	if err := removeSiding(context.Background(), &app, "one", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if app.Removal != nil {
+		t.Fatalf("journal remains: %#v", app.Removal)
+	}
+	assertRefAbsent(t, fixture.control, "refs/heads/shunt/one")
+	if refs := removalRefsWithPrefix(t, fixture.control, "refs/shunt/recovery"); len(refs) != 0 {
+		t.Fatalf("recoveries remain: %v", refs)
+	}
+	if after := removalOptionalRef(t, fixture.control, "refs/shunt/witness/archive"); after != before {
+		t.Fatalf("discard advanced archive: before=%q after=%q", before, after)
+	}
+}
+
+func TestRemovalRetryAfterHandoffBeforeJournalClearIsIdempotent(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	safety, err := captureRemovalSafety(context.Background(), fixture.app, "one", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations := removalTestOperations()
+	original := operations.updateApp
+	injected := errors.New("injected clear publication failure")
+	failed := false
+	operations.updateApp = func(ctx context.Context, dir string, update func(*state.App) error) (state.App, error) {
+		current, err := state.LoadApp(dir)
+		if err != nil {
+			return state.App{}, err
+		}
+		if !failed && current.Removal != nil && current.Removal.Stage == state.RemovalOperationForgotten {
+			failed = true
+			return current, injected
+		}
+		return original(ctx, dir, update)
+	}
+	app := fixture.app
+	if err := runRemovalWithPolicy(context.Background(), &app, "one", "", false, &safety, operations); !errors.Is(err, injected) {
+		t.Fatalf("first removal = %v", err)
+	}
+	if refs := removalRefsWithPrefix(t, fixture.control, "refs/shunt/recovery"); len(refs) != 0 {
+		t.Fatalf("handoff did not remove recoveries: %v", refs)
+	}
+	operations.updateApp = original
+	if err := runRemovalWithPolicy(context.Background(), &app, "one", "", false, nil, operations); err != nil {
+		t.Fatalf("retry = %v", err)
+	}
+	if app.Removal != nil {
+		t.Fatalf("journal remains: %#v", app.Removal)
+	}
+}
+
+func assertRefAbsent(t *testing.T, repo, ref string) {
+	t.Helper()
+	command := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", ref)
+	if err := command.Run(); err == nil {
+		t.Fatalf("ref %q remains", ref)
+	}
+}
+func removalOptionalRef(t *testing.T, repo, ref string) string {
+	t.Helper()
+	command := exec.Command("git", "-C", repo, "rev-parse", "--verify", ref+"^{commit}")
+	output, err := command.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+func removalRefsWithPrefix(t *testing.T, repo, prefix string) []string {
+	t.Helper()
+	output := removalGitOutput(t, repo, "for-each-ref", "--format=%(refname)", prefix)
+	return strings.Fields(output)
+}
+
 func TestLegacyUpgradeDoesNotInferDiscardWhenWitnessIsLost(t *testing.T) {
 	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
 	fixture.app.Removal = &state.RemovalOperation{ID: "legacy", Siding: "one", Stage: state.RemovalBaselinePromoted, StartedAt: time.Now().UTC().Format(time.RFC3339Nano), Safety: "old-safe"}
