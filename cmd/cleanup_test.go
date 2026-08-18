@@ -53,6 +53,22 @@ func TestOrderBaseLast(t *testing.T) {
 	}
 }
 
+func TestUnrelatedRemovalDoesNotRequireLegacyBaseSelection(t *testing.T) {
+	app := state.App{Sidings: map[string]state.Siding{"one": {Name: "one"}, "two": {Name: "two"}}}
+	got, err := prepareBaseRemoval(app, []string{"one"}, "", bufio.NewReader(strings.NewReader("")))
+	if err != nil || got != "" {
+		t.Fatalf("unrelated removal = %q, %v", got, err)
+	}
+}
+
+func TestConfiguredBaseRemovalStillRequiresSuccessor(t *testing.T) {
+	app := state.App{BaseSiding: "one", Sidings: map[string]state.Siding{"one": {Name: "one"}, "two": {Name: "two"}}}
+	_, err := prepareBaseRemoval(app, []string{"one"}, "", bufio.NewReader(strings.NewReader("")))
+	if err == nil || !strings.Contains(err.Error(), "requires --next-base") {
+		t.Fatalf("base removal error = %v", err)
+	}
+}
+
 func TestValidateFinalVolumeSet(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "vol")
 	worktree := state.Siding{Name: "one", MaterializationPhase: state.PhaseWorktree}
@@ -118,6 +134,73 @@ func TestConfirmDirtyCleanupAcceptsYes(t *testing.T) {
 	}
 	if !confirmed {
 		t.Fatal("yes confirmation was rejected")
+	}
+}
+
+func TestProtectionReasonsNameDirtyOwnershipAndUnprovenWork(t *testing.T) {
+	t.Run("dirty untracked", func(t *testing.T) {
+		config := t.TempDir()
+		src := filepath.Join(config, "one", "src")
+		if err := os.MkdirAll(src, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, src, "init", "-b", "main")
+		if err := os.WriteFile(filepath.Join(src, "new.txt"), []byte("new\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		app := state.App{ConfigDir: config, Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "main"}}}
+		protected, reason, err := sidingWorktreeProtection(context.Background(), app, "one", []string{"one"})
+		if err != nil || !protected || !strings.Contains(reason, "untracked") {
+			t.Fatalf("protection = %t, %q, %v", protected, reason, err)
+		}
+	})
+	t.Run("surviving owner", func(t *testing.T) {
+		config := t.TempDir()
+		src := filepath.Join(config, "one", "src")
+		if err := os.MkdirAll(src, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, src, "init", "-b", "shared")
+		app := state.App{ConfigDir: config, Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "recorded"}, "two": {Name: "two", Branch: "shared"}}}
+		protected, reason, err := sidingWorktreeProtection(context.Background(), app, "one", []string{"one"})
+		if err != nil || !protected || !strings.Contains(reason, "owned by surviving siding") {
+			t.Fatalf("protection = %t, %q, %v", protected, reason, err)
+		}
+	})
+	t.Run("unproven commit", func(t *testing.T) {
+		config := t.TempDir()
+		src := filepath.Join(config, "one", "src")
+		if err := os.MkdirAll(src, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, src, "init", "-b", "topic")
+		if err := os.WriteFile(filepath.Join(src, "tracked.txt"), []byte("topic\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, src, "add", "tracked.txt")
+		runGit(t, src, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "topic")
+		app := state.App{ConfigDir: config, Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "topic"}}}
+		protected, reason, err := sidingWorktreeProtection(context.Background(), app, "one", []string{"one"})
+		if err != nil || !protected || !strings.Contains(reason, "not proven preserved") || !strings.Contains(reason, "no surviving origin/HEAD") {
+			t.Fatalf("protection = %t, %q, %v", protected, reason, err)
+		}
+	})
+}
+
+func TestTruncateTerminalRowTinyAndNormalWidths(t *testing.T) {
+	for _, width := range []int{0, 1} {
+		if got := truncateTerminalRow("long reason", width); got != "…" {
+			t.Fatalf("width %d = %q", width, got)
+		}
+	}
+	if got := truncateTerminalRow("long", 2); got != "l…" {
+		t.Fatalf("width 2 = %q", got)
+	}
+	if got := truncateTerminalRow("long", 4); got != "long" {
+		t.Fatalf("width 4 = %q", got)
+	}
+	if got := truncateTerminalRow("short", 10); got != "short" {
+		t.Fatalf("normal = %q", got)
 	}
 }
 
@@ -190,6 +273,60 @@ func TestWorktreeHasChangesDetectsOnlyReachableFromSidingBranch(t *testing.T) {
 	}
 	if !dirty {
 		t.Fatal("commits reachable only from the siding branch must be protected")
+	}
+}
+
+func TestWorktreeHasChangesAcceptsWholeBranchSquash(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "tracked.txt")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "initial")
+	runGit(t, repo, "checkout", "-b", "siding")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("squashed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "tracked.txt")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "topic")
+	runGit(t, repo, "checkout", "main")
+	runGit(t, repo, "merge", "--squash", "siding")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "squash")
+	runGit(t, repo, "update-ref", "refs/remotes/origin/main", "main")
+	runGit(t, repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	runGit(t, repo, "checkout", "siding")
+	protected, err := worktreeHasChanges(context.Background(), repo, "siding", []string{"siding"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protected {
+		t.Fatal("squash-preserved branch was marked protected")
+	}
+}
+
+func TestSidingWorktreeChecksRecordedAndObservedBranches(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "tracked.txt")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "initial")
+	runGit(t, repo, "branch", "recorded")
+	configDir := filepath.Join(t.TempDir(), "config")
+	src := filepath.Join(configDir, "one", "src")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "worktree", "add", "-b", "observed", src, "main")
+	app := state.App{ConfigDir: configDir, RepoPath: repo, Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "recorded", WorktreeRepoPath: repo}}}
+	protected, err := sidingWorktreeHasChanges(context.Background(), app, "one", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protected {
+		t.Fatal("independently preserved recorded and observed branches were marked protected")
 	}
 }
 

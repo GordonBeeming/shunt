@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gordonbeeming/shunt/internal/container"
+	"github.com/gordonbeeming/shunt/internal/gitpreservation"
 	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
@@ -66,17 +67,26 @@ type SidingReport struct {
 }
 
 type GitEvidence struct {
-	Observation   string `json:"observation"`
-	Branch        string `json:"branch,omitempty"`
-	Head          string `json:"head,omitempty"`
-	Upstream      string `json:"upstream,omitempty"`
-	Ahead         int    `json:"ahead"`
-	Behind        int    `json:"behind"`
-	Dirty         bool   `json:"dirty"`
-	Untracked     int    `json:"untracked"`
-	UniqueCommits int    `json:"uniqueCommits"`
-	LastCommit    string `json:"lastCommit,omitempty"`
-	Detail        string `json:"detail,omitempty"`
+	Observation   string                `json:"observation"`
+	Branch        string                `json:"branch,omitempty"`
+	Head          string                `json:"head,omitempty"`
+	Upstream      string                `json:"upstream,omitempty"`
+	Ahead         int                   `json:"ahead"`
+	Behind        int                   `json:"behind"`
+	Dirty         bool                  `json:"dirty"`
+	Untracked     int                   `json:"untracked"`
+	UniqueCommits int                   `json:"uniqueCommits"`
+	LastCommit    string                `json:"lastCommit,omitempty"`
+	Detail        string                `json:"detail,omitempty"`
+	Preservation  *PreservationEvidence `json:"preservation,omitempty"`
+}
+
+type PreservationEvidence struct {
+	Preserved      bool   `json:"preserved"`
+	Kind           string `json:"kind"`
+	MatchingRef    string `json:"matchingRef,omitempty"`
+	MatchingCommit string `json:"matchingCommit,omitempty"`
+	Reason         string `json:"reason"`
 }
 
 const projectSidingScanLimit = 4
@@ -180,9 +190,38 @@ func collectProject(ctx context.Context, app state.App) ProjectReport {
 
 func buildSidingReports(ctx context.Context, app state.App, names []string) []SidingReport {
 	reports := make([]SidingReport, len(names))
-	for index, name := range names {
-		reports[index] = collectSidingReport(ctx, app, name)
+	analyzers := map[string]*gitpreservation.Analyzer{}
+	for _, name := range names {
+		owner := state.WorktreeOwner(app, app.Sidings[name])
+		if analyzers[owner] == nil {
+			analyzers[owner] = gitpreservation.NewAnalyzer(owner, gitpreservation.Options{})
+		}
 	}
+	workers := projectSidingScanLimit
+	if workers > len(names) {
+		workers = len(names)
+	}
+	if workers == 0 {
+		return reports
+	}
+	jobs := make(chan int)
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for range workers {
+		go func() {
+			defer wait.Done()
+			for index := range jobs {
+				name := names[index]
+				owner := state.WorktreeOwner(app, app.Sidings[name])
+				reports[index] = collectSidingReport(ctx, app, name, analyzers[owner])
+			}
+		}()
+	}
+	for index := range names {
+		jobs <- index
+	}
+	close(jobs)
+	wait.Wait()
 	return reports
 }
 
@@ -254,7 +293,7 @@ func collectSidingCandidates(ctx context.Context, reports []SidingReport, genera
 	}
 }
 
-func collectSidingReport(ctx context.Context, app state.App, name string) SidingReport {
+func collectSidingReport(ctx context.Context, app state.App, name string, analyzer *gitpreservation.Analyzer) SidingReport {
 	base, err := siding.SidingBase(app, name)
 	if err != nil {
 		return SidingReport{Name: name, Logical: errorMeasurement(name, app.ConfigDir, err)}
@@ -264,10 +303,35 @@ func collectSidingReport(ctx context.Context, app state.App, name string) Siding
 	// The classified project walk also records generated-directory identity and
 	// logical size. Git eligibility is checked afterward, so source entries are
 	// visited once while candidates still retain their safety checks.
+	gitEvidence := InspectGit(ctx, src)
+	if gitEvidence.Observation == "observed" && gitEvidence.Branch != "" && gitEvidence.Branch != "(detached)" {
+		recorded := app.Sidings[name].Branch
+		refs := []string{"refs/heads/" + recorded}
+		if gitEvidence.Branch != recorded {
+			refs = append(refs, "refs/heads/"+gitEvidence.Branch)
+		}
+		preserved := true
+		kind := ""
+		reasons := make([]string, 0, len(refs))
+		matchingRef, matchingCommit := "", ""
+		for _, ref := range refs {
+			result := analyzer.Analyze(ctx, ref, refs)
+			preserved = preserved && result.Preserved
+			if kind == "" {
+				kind = string(result.Kind)
+				matchingRef, matchingCommit = result.MatchingRef, result.MatchingCommit
+			} else if kind != string(result.Kind) {
+				kind = "mixed"
+				matchingRef, matchingCommit = "", ""
+			}
+			reasons = append(reasons, ref+": "+result.Reason)
+		}
+		gitEvidence.Preservation = &PreservationEvidence{Preserved: preserved, Kind: kind, MatchingRef: matchingRef, MatchingCommit: matchingCommit, Reason: strings.Join(reasons, "; ")}
+	}
 	return SidingReport{
 		Name:      name,
 		Logical:   newMeasurement(name, base, true, false, ""),
-		Source:    SourceReport{Measurement: newMeasurement("source", src, false, false, ""), Git: InspectGit(ctx, src)},
+		Source:    SourceReport{Measurement: newMeasurement("source", src, false, false, ""), Git: gitEvidence},
 		Generated: generated,
 		Output:    newMeasurement("out", filepath.Join(base, "out"), false, false, ""),
 		Data:      newMeasurement("data", filepath.Join(base, "vol"), true, false, ""),

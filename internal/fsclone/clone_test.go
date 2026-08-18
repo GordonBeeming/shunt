@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
+	"github.com/gordonbeeming/shunt/internal/state"
 )
 
 func TestAddWorktreeGitButlerHeadUsesOriginDefault(t *testing.T) {
@@ -22,6 +23,50 @@ func TestAddWorktreeGitButlerHeadUsesOriginDefault(t *testing.T) {
 
 	if got := gitOutput(t, dest, "rev-parse", "HEAD"); got != mainCommit {
 		t.Fatalf("siding HEAD = %s, want origin default %s", got, mainCommit)
+	}
+}
+
+func TestRemoveLocalBranchRefIsExactAndIdempotent(t *testing.T) {
+	repo, _, _ := newWorktreeTestRepo(t)
+	gitOutput(t, repo, "branch", "retire-me")
+	gitOutput(t, repo, "branch", "keep-me")
+	if err := RemoveLocalBranchRef(context.Background(), repo, "refs/heads/retire-me"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveLocalBranchRef(context.Background(), repo, "refs/heads/retire-me"); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", "refs/heads/retire-me").Run(); err == nil {
+		t.Fatal("retired branch still exists")
+	}
+	gitOutput(t, repo, "show-ref", "--verify", "refs/heads/keep-me")
+	if err := RemoveLocalBranchRef(context.Background(), repo, "refs/tags/nope"); err == nil {
+		t.Fatal("non-local ref accepted")
+	}
+}
+
+func TestRemovalRecoveryRefsPreserveExactWitnessAndRetire(t *testing.T) {
+	repo, mainCommit, _ := newWorktreeTestRepo(t)
+	targets := []state.RemovalTarget{{Ref: "refs/heads/main", ExpectedOID: mainCommit}}
+	refs, err := EnsureRemovalRecoveryRefs(context.Background(), repo, "remove-one", targets)
+	if err != nil || len(refs) != 1 {
+		t.Fatalf("recovery refs = %v, %v", refs, err)
+	}
+	if err := ValidateRecoveryRefs(context.Background(), repo, refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveRecoveryRefs(context.Background(), repo, refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateRecoveryRefs(context.Background(), repo, refs); err == nil {
+		t.Fatal("retired recovery ref still validates")
+	}
+}
+
+func TestValidateExpectedAbsentTargetRejectsRepositoryError(t *testing.T) {
+	err := ValidateRemovalTargets(context.Background(), filepath.Join(t.TempDir(), "missing-repo"), []state.RemovalTarget{{Ref: "refs/heads/missing"}})
+	if err == nil || !strings.Contains(err.Error(), "inspect expected-absent") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

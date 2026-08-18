@@ -4,6 +4,7 @@ package fsclone
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -12,7 +13,109 @@ import (
 	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
+	"github.com/gordonbeeming/shunt/internal/state"
 )
+
+// EnsureRemovalRecoveryRefs creates deterministic Shunt-owned refs at the exact
+// witnessed OIDs in one update-ref transaction. Explicitly absent targets need
+// no recovery ref.
+func EnsureRemovalRecoveryRefs(ctx context.Context, repoPath, operationID string, targets []state.RemovalTarget) ([]string, error) {
+	lines := []string{"start"}
+	refs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target.ExpectedOID == "" {
+			continue
+		}
+		digest := sha256.Sum256([]byte(target.Ref))
+		ref := fmt.Sprintf("refs/shunt/recovery/%s/%x", safeOperationID(operationID), digest[:8])
+		refs = append(refs, ref)
+		lines = append(lines, "update "+ref+" "+target.ExpectedOID)
+	}
+	if len(refs) == 0 {
+		return refs, nil
+	}
+	lines = append(lines, "prepare", "commit")
+	tmp, err := os.CreateTemp("", "shunt-update-ref-*.stdin")
+	if err != nil {
+		return nil, err
+	}
+	path := tmp.Name()
+	defer os.Remove(path)
+	if _, err := tmp.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	if err := proc.RunStdin(ctx, path, "git", "-C", repoPath, "update-ref", "--stdin"); err != nil {
+		return nil, fmt.Errorf("create removal recovery refs: %w", err)
+	}
+	sort.Strings(refs)
+	return refs, nil
+}
+
+func RemoveRecoveryRefs(ctx context.Context, repoPath string, refs []string) error {
+	for _, ref := range refs {
+		if !strings.HasPrefix(ref, "refs/shunt/recovery/") {
+			return fmt.Errorf("refuse to remove non-recovery ref %q", ref)
+		}
+		if _, err := proc.Run(ctx, "git", "-C", repoPath, "update-ref", "-d", ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ValidateRecoveryRefs(ctx context.Context, repoPath string, refs []string) error {
+	for _, ref := range refs {
+		if !strings.HasPrefix(ref, "refs/shunt/recovery/") {
+			return fmt.Errorf("invalid recovery ref %q", ref)
+		}
+		if _, err := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", ref); err != nil {
+			return fmt.Errorf("recovery ref %q is missing: %w", ref, err)
+		}
+	}
+	return nil
+}
+
+func ValidateRemovalTargets(ctx context.Context, repoPath string, targets []state.RemovalTarget) error {
+	for _, target := range targets {
+		present, presentErr := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", target.Ref)
+		if target.ExpectedOID == "" {
+			if presentErr == nil {
+				return fmt.Errorf("removal target %q appeared after confirmation", target.Ref)
+			}
+			if present.ExitCode != 1 {
+				return fmt.Errorf("inspect expected-absent removal target %q: %w", target.Ref, presentErr)
+			}
+			continue
+		}
+		if presentErr != nil {
+			return fmt.Errorf("removal target %q disappeared after confirmation: %w", target.Ref, presentErr)
+		}
+		result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", target.Ref+"^{commit}")
+		if err != nil || strings.TrimSpace(result.Stdout) != target.ExpectedOID {
+			return fmt.Errorf("removal target %q moved after confirmation", target.Ref)
+		}
+	}
+	return nil
+}
+
+func safeOperationID(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	if b.Len() == 0 {
+		return "operation"
+	}
+	return b.String()
+}
 
 // AddWorktree creates a git worktree of repoPath at dest, on a fresh branch
 // (newBranch) based on baseBranch. An explicit baseBranch is always honoured.
@@ -144,6 +247,27 @@ func RemoveWorktree(ctx context.Context, repoPath, dest, branch string) error {
 				return fmt.Errorf("delete branch %q in owner %q: %w", branch, repoPath, err)
 			}
 		}
+	}
+	return nil
+}
+
+// RemoveLocalBranchRef retires one exact local branch ref after its preservation
+// evidence has been validated by the caller. Missing refs are idempotent.
+func RemoveLocalBranchRef(ctx context.Context, repoPath, ref string) error {
+	const prefix = "refs/heads/"
+	if !strings.HasPrefix(ref, prefix) || strings.TrimPrefix(ref, prefix) == "" {
+		return fmt.Errorf("refuse to remove non-local-branch ref %q", ref)
+	}
+	branch := strings.TrimPrefix(ref, prefix)
+	result, err := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", ref)
+	if err != nil && result.ExitCode != 1 {
+		return fmt.Errorf("inspect branch %q: %w", branch, err)
+	}
+	if err != nil {
+		return nil
+	}
+	if _, err := proc.Run(ctx, "git", "-C", repoPath, "branch", "-D", branch); err != nil {
+		return fmt.Errorf("delete branch %q: %w", branch, err)
 	}
 	return nil
 }

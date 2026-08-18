@@ -168,6 +168,13 @@ func printGitEvidence(out io.Writer, label string, evidence storage.GitEvidence)
 	}
 	fmt.Fprintf(out, "  git %-12s branch %s; HEAD %s; upstream %s (+%d/-%d); %s; unique %d; last %s\n",
 		label+":", evidence.Branch, head, upstream, evidence.Ahead, evidence.Behind, dirty, evidence.UniqueCommits, last)
+	if evidence.Preservation != nil {
+		status := "protected"
+		if evidence.Preservation.Preserved {
+			status = "preserved"
+		}
+		fmt.Fprintf(out, "    committed work: %s (%s)\n", status, evidence.Preservation.Reason)
+	}
 }
 
 func formatBytes(bytes int64) string {

@@ -65,6 +65,7 @@ func TestPrintSpaceLabelsCloneScansAndOfficialContainerData(t *testing.T) {
 				Name: "feature",
 				Source: storage.SourceReport{Measurement: storage.Measurement{Observation: "observed"}, Git: storage.GitEvidence{
 					Observation: "observed", Branch: "shunt/feature", Head: "abcdef0123456789", UniqueCommits: 1,
+					Preservation: &storage.PreservationEvidence{Preserved: true, Kind: "squash", MatchingRef: "refs/remotes/origin/main", Reason: "aggregate patch matches squash"},
 				}}, Generated: storage.Measurement{Observation: "observed"}, Output: storage.Measurement{Observation: "observed"}, Data: storage.Measurement{Observation: "observed"},
 			}},
 		}},
@@ -81,12 +82,28 @@ func TestPrintSpaceLabelsCloneScansAndOfficialContainerData(t *testing.T) {
 		"legacy checkout reference only; never a runtime host",
 		"branch main; HEAD 0123456789ab; upstream origin/main (+1/-2); dirty, 3 untracked; unique 4; last 2026-08-07",
 		"branch shunt/feature; HEAD abcdef012345; upstream (none) (+0/-0); clean; unique 1",
+		"committed work: preserved (aggregate patch matches squash)",
 		"the only reclaimable figures",
 		"reclaimableBytes",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("output missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestSpaceJSONKeepsLiteralUniqueCommitsAndAddsPreservation(t *testing.T) {
+	report := storage.Report{Projects: []storage.ProjectReport{{Sidings: []storage.SidingReport{{
+		Name: "one", Source: storage.SourceReport{Git: storage.GitEvidence{Observation: "observed", UniqueCommits: 5,
+			Preservation: &storage.PreservationEvidence{Preserved: true, Kind: "squash", Reason: "matched squash"}}},
+	}}}}}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	if !strings.Contains(text, `"uniqueCommits":5`) || !strings.Contains(text, `"preservation":{"preserved":true,"kind":"squash"`) {
+		t.Fatalf("space JSON lost additive evidence: %s", text)
 	}
 }
 
