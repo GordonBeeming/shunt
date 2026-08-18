@@ -165,6 +165,29 @@ func TestCaptureRemovalSafetyJournalsUnprovenCommittedWork(t *testing.T) {
 	}
 }
 
+func TestCaptureRemovalSafetyTreatsDetachedHEADAsExplicitDiscardWork(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	sourceRoot, _, err := siding.Paths(fixture.app, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, sourceRoot, "switch", "--detach", "HEAD")
+
+	safety, err := captureRemovalSafety(context.Background(), fixture.app, "one", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if safety.ObservedBranch != "" {
+		t.Fatalf("observed branch = %q, want empty for detached HEAD", safety.ObservedBranch)
+	}
+	if !hasUnpreservedTargets(safety.Targets) {
+		t.Fatalf("detached HEAD targets = %+v, want explicit discard confirmation", safety.Targets)
+	}
+	if len(safety.Targets) != 1 || !strings.Contains(safety.Targets[0].Reason, "HEAD is detached") {
+		t.Fatalf("detached HEAD targets = %+v", safety.Targets)
+	}
+}
+
 func TestConfirmedUnprovenRemovalJournalsExactEvidence(t *testing.T) {
 	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
 	sourceRoot, _, err := siding.Paths(fixture.app, "one")

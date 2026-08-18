@@ -197,11 +197,25 @@ func validateCleanBase(ctx context.Context, app *state.App) (string, error) {
 }
 
 func currentWorktreeBranch(ctx context.Context, src string) (string, error) {
-	ref, err := gitText(ctx, src, "symbolic-ref", "--quiet", "HEAD")
+	branch, detached, err := currentWorktreeBranchState(ctx, src)
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimPrefix(ref, "refs/heads/"), nil
+	if detached {
+		return "", fmt.Errorf("HEAD is detached")
+	}
+	return branch, nil
+}
+
+func currentWorktreeBranchState(ctx context.Context, src string) (branch string, detached bool, err error) {
+	result, err := proc.Run(ctx, "git", "-C", src, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		if result.ExitCode == 1 {
+			return "", true, nil
+		}
+		return "", false, err
+	}
+	return strings.TrimPrefix(strings.TrimSpace(result.Stdout), "refs/heads/"), false, nil
 }
 
 func ensureControlRepository(ctx context.Context, app *state.App, source, seed string) error {
