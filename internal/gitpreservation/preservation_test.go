@@ -612,6 +612,7 @@ func TestAnalyzerSingleFlightsConcurrentSameKeyCacheFills(t *testing.T) {
 	r.git("commit", "-m", "squash")
 	r.integrationRef()
 	integrationTip := r.git("rev-parse", "refs/remotes/origin/main")
+	topicTip := r.git("rev-parse", "refs/heads/topic")
 	c := &countingRunner{inner: gitRunner{repo: r.dir}}
 	a := NewAnalyzer(r.dir, Options{})
 	a.git = delayingRunner{inner: c}
@@ -643,13 +644,17 @@ func TestAnalyzerSingleFlightsConcurrentSameKeyCacheFills(t *testing.T) {
 		}
 	}
 	integrationBatches := 0
+	topicBatches := 0
 	for _, revision := range batchArgs {
 		if strings.HasSuffix(revision, integrationTip) {
 			integrationBatches++
 		}
+		if strings.HasSuffix(revision, topicTip) {
+			topicBatches++
+		}
 	}
-	if enumerations != 1 || integrationBatches != 1 {
-		t.Fatalf("same-key fills: ref enumerations=%d integration pipelines=%d", enumerations, integrationBatches)
+	if enumerations != 1 || integrationBatches != 1 || topicBatches != 1 {
+		t.Fatalf("same-key fills: ref enumerations=%d integration pipelines=%d topic pipelines=%d", enumerations, integrationBatches, topicBatches)
 	}
 }
 

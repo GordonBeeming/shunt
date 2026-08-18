@@ -99,14 +99,16 @@ type Options struct {
 // safe for concurrent use; callers should create a fresh Analyzer after refs
 // may have changed.
 type Analyzer struct {
-	repo       string
-	options    Options
-	git        runner
-	mu         sync.Mutex
-	refs       map[string][]refInfo
-	patches    map[string]integrationEvidence
-	refFills   map[string]*refFill
-	patchFills map[string]*patchFill
+	repo        string
+	options     Options
+	git         runner
+	mu          sync.Mutex
+	refs        map[string][]refInfo
+	patches     map[string]integrationEvidence
+	results     map[string]Result
+	refFills    map[string]*refFill
+	patchFills  map[string]*patchFill
+	resultFills map[string]*resultFill
 }
 
 func NewAnalyzer(repo string, options Options) *Analyzer {
@@ -117,13 +119,15 @@ func NewAnalyzer(repo string, options Options) *Analyzer {
 		options.Timeout = DefaultTimeout
 	}
 	return &Analyzer{
-		repo:       repo,
-		options:    options,
-		git:        gitRunner{repo: repo, maxPatchBytes: options.MaxPatchBytes},
-		refs:       make(map[string][]refInfo),
-		patches:    make(map[string]integrationEvidence),
-		refFills:   make(map[string]*refFill),
-		patchFills: make(map[string]*patchFill),
+		repo:        repo,
+		options:     options,
+		git:         gitRunner{repo: repo, maxPatchBytes: options.MaxPatchBytes},
+		refs:        make(map[string][]refInfo),
+		patches:     make(map[string]integrationEvidence),
+		results:     make(map[string]Result),
+		refFills:    make(map[string]*refFill),
+		patchFills:  make(map[string]*patchFill),
+		resultFills: make(map[string]*resultFill),
 	}
 }
 
@@ -145,17 +149,69 @@ func (a *Analyzer) Analyze(ctx context.Context, targetRef string, deletionRefs [
 
 func analyze(ctx context.Context, git runner, req Request) Result {
 	a := &Analyzer{
-		repo:       req.Repo,
-		git:        git,
-		refs:       make(map[string][]refInfo),
-		patches:    make(map[string]integrationEvidence),
-		refFills:   make(map[string]*refFill),
-		patchFills: make(map[string]*patchFill),
+		repo:        req.Repo,
+		git:         git,
+		refs:        make(map[string][]refInfo),
+		patches:     make(map[string]integrationEvidence),
+		results:     make(map[string]Result),
+		refFills:    make(map[string]*refFill),
+		patchFills:  make(map[string]*patchFill),
+		resultFills: make(map[string]*resultFill),
 	}
 	return a.analyze(ctx, req)
 }
 
 func (a *Analyzer) analyze(ctx context.Context, req Request) Result {
+	key := analysisKey(req.TargetRef, req.DeletionRefs)
+	a.mu.Lock()
+	if a.results == nil {
+		a.results = make(map[string]Result)
+	}
+	if a.resultFills == nil {
+		a.resultFills = make(map[string]*resultFill)
+	}
+	if result, ok := a.results[key]; ok {
+		a.mu.Unlock()
+		return result
+	}
+	if fill, ok := a.resultFills[key]; ok {
+		a.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return stageFailure(ctx, "analysis wait", ctx.Err())
+		case <-fill.done:
+			return fill.result
+		}
+	}
+	fill := &resultFill{done: make(chan struct{})}
+	a.resultFills[key] = fill
+	a.mu.Unlock()
+
+	result := a.analyzeUncached(ctx, req)
+	a.mu.Lock()
+	a.results[key] = result
+	fill.result = result
+	delete(a.resultFills, key)
+	close(fill.done)
+	a.mu.Unlock()
+	return result
+}
+
+type resultFill struct {
+	done   chan struct{}
+	result Result
+}
+
+func analysisKey(targetRef string, deletionRefs []string) string {
+	deleted := make(map[string]bool, len(deletionRefs)+1)
+	for _, ref := range deletionRefs {
+		deleted[ref] = true
+	}
+	deleted[targetRef] = true
+	return targetRef + "\x00" + deletionKey(deleted)
+}
+
+func (a *Analyzer) analyzeUncached(ctx context.Context, req Request) Result {
 	git := a.git
 	if err := ctx.Err(); err != nil {
 		return stageFailure(ctx, "start", err)
