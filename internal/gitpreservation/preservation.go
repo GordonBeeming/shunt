@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -47,7 +48,7 @@ type Result struct {
 type runner interface {
 	run(context.Context, ...string) (string, error)
 	patchID(context.Context, ...string) (string, error)
-	patchIDs(context.Context, string) (string, error)
+	patchIDs(context.Context, string, int) (string, error)
 }
 
 type gitRunner struct {
@@ -76,8 +77,12 @@ func (g gitRunner) patchID(ctx context.Context, diffArgs ...string) (string, err
 	return fields[0], nil
 }
 
-func (g gitRunner) patchIDs(ctx context.Context, revision string) (string, error) {
-	args := []string{"log", "--reverse", "--topo-order", "--format=commit %H", "-p", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-renames", revision}
+func (g gitRunner) patchIDs(ctx context.Context, revision string, maxCount int) (string, error) {
+	args := []string{"log", "--reverse", "--topo-order", "--format=commit %H", "-p", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-renames"}
+	if maxCount > 0 {
+		args = append(args, fmt.Sprintf("--max-count=%d", maxCount))
+	}
+	args = append(args, revision)
 	r, err := proc.RunPipelineInDirLimited(ctx, g.repo, g.maxPatchBytes, "git", args, "git", []string{"patch-id", "--verbatim"})
 	if err != nil {
 		return "", err
@@ -350,11 +355,13 @@ type commitPatch struct{ commit, id string }
 var errIntegrationOverflow = errors.New("integration history exceeds scan limit")
 
 type integrationEvidence struct {
+	commits []string
 	patches []commitPatch
 }
 
 type patchFill struct {
 	done    chan struct{}
+	commits []string
 	patches []commitPatch
 	err     error
 }
@@ -368,7 +375,43 @@ func (e stageError) Error() string { return e.stage + ": " + e.err.Error() }
 func (e stageError) Unwrap() error { return e.err }
 
 func (a *Analyzer) integrationPatches(ctx context.Context, base, integrationCommit string) ([]commitPatch, error) {
-	key := base + "\x00" + integrationCommit
+	evidence, err := a.integrationWindow(ctx, integrationCommit)
+	if err != nil {
+		return nil, err
+	}
+	baseIndex := slices.Index(evidence.commits, base)
+	if baseIndex < 0 {
+		return nil, errIntegrationOverflow
+	}
+	rangeCommits, overflow, err := commits(a.git, ctx, MaxIntegrationCommits, base+".."+integrationCommit)
+	if err != nil {
+		return nil, stageError{stage: "integration range scan", err: err}
+	}
+	if overflow {
+		return nil, errIntegrationOverflow
+	}
+	windowCommits := make(map[string]bool, len(evidence.commits)-baseIndex)
+	for _, commit := range evidence.commits[baseIndex:] {
+		windowCommits[commit] = true
+	}
+	patchByCommit := make(map[string]commitPatch, len(evidence.patches))
+	for _, patch := range evidence.patches {
+		patchByCommit[patch.commit] = patch
+	}
+	patches := make([]commitPatch, 0, len(rangeCommits))
+	for _, commit := range rangeCommits {
+		if !windowCommits[commit] {
+			return nil, errIntegrationOverflow
+		}
+		if patch, ok := patchByCommit[commit]; ok {
+			patches = append(patches, patch)
+		}
+	}
+	return patches, nil
+}
+
+func (a *Analyzer) integrationWindow(ctx context.Context, integrationCommit string) (integrationEvidence, error) {
+	key := integrationCommit
 	a.mu.Lock()
 	if a.patches == nil {
 		a.patches = make(map[string]integrationEvidence)
@@ -377,54 +420,65 @@ func (a *Analyzer) integrationPatches(ctx context.Context, base, integrationComm
 		a.patchFills = make(map[string]*patchFill)
 	}
 	if evidence, ok := a.patches[key]; ok {
-		patches := append([]commitPatch(nil), evidence.patches...)
+		copyOfEvidence := copyIntegrationEvidence(evidence)
 		a.mu.Unlock()
-		return patches, nil
+		return copyOfEvidence, nil
 	}
 	if fill, ok := a.patchFills[key]; ok {
 		a.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return integrationEvidence{}, ctx.Err()
 		case <-fill.done:
-			return append([]commitPatch(nil), fill.patches...), fill.err
+			return integrationEvidence{commits: append([]string(nil), fill.commits...), patches: append([]commitPatch(nil), fill.patches...)}, fill.err
 		}
 	}
 	fill := &patchFill{done: make(chan struct{})}
 	a.patchFills[key] = fill
 	a.mu.Unlock()
-	revision := base + ".." + integrationCommit
-	commits, overflow, err := commits(a.git, ctx, MaxIntegrationCommits, revision)
+	windowSize := MaxIntegrationCommits + 1
+	out, err := a.git.run(ctx, "rev-list", "--topo-order", fmt.Sprintf("--max-count=%d", windowSize), integrationCommit)
 	if err != nil {
 		err = stageError{stage: "integration history scan", err: err}
-		return a.finishPatchFill(key, fill, nil, err)
+		return a.finishPatchFill(key, fill, integrationEvidence{}, err)
 	}
-	if overflow {
-		return a.finishPatchFill(key, fill, nil, errIntegrationOverflow)
+	commits := strings.Fields(out)
+	slices.Reverse(commits)
+	if len(commits) == 0 {
+		return a.finishPatchFill(key, fill, integrationEvidence{}, stageError{stage: "integration history scan", err: fmt.Errorf("empty integration history")})
 	}
-	patches, err := historyPatchIDs(ctx, a.git, revision, commits)
+	patches, err := historyPatchIDsLimited(ctx, a.git, integrationCommit, windowSize, commits)
 	if err != nil {
 		err = stageError{stage: "integration patch parsing", err: err}
-		return a.finishPatchFill(key, fill, nil, err)
+		return a.finishPatchFill(key, fill, integrationEvidence{}, err)
 	}
-	return a.finishPatchFill(key, fill, patches, nil)
+	return a.finishPatchFill(key, fill, integrationEvidence{commits: commits, patches: patches}, nil)
 }
 
-func (a *Analyzer) finishPatchFill(key string, fill *patchFill, patches []commitPatch, err error) ([]commitPatch, error) {
+func (a *Analyzer) finishPatchFill(key string, fill *patchFill, evidence integrationEvidence, err error) (integrationEvidence, error) {
 	a.mu.Lock()
 	if err == nil {
-		a.patches[key] = integrationEvidence{patches: append([]commitPatch(nil), patches...)}
+		a.patches[key] = copyIntegrationEvidence(evidence)
 	}
-	fill.patches = append([]commitPatch(nil), patches...)
+	fill.commits = append([]string(nil), evidence.commits...)
+	fill.patches = append([]commitPatch(nil), evidence.patches...)
 	fill.err = err
 	delete(a.patchFills, key)
 	close(fill.done)
 	a.mu.Unlock()
-	return patches, err
+	return evidence, err
+}
+
+func copyIntegrationEvidence(evidence integrationEvidence) integrationEvidence {
+	return integrationEvidence{commits: append([]string(nil), evidence.commits...), patches: append([]commitPatch(nil), evidence.patches...)}
 }
 
 func historyPatchIDs(ctx context.Context, git runner, revision string, commits []string) ([]commitPatch, error) {
-	out, err := git.patchIDs(ctx, revision)
+	return historyPatchIDsLimited(ctx, git, revision, 0, commits)
+}
+
+func historyPatchIDsLimited(ctx context.Context, git runner, revision string, maxCount int, commits []string) ([]commitPatch, error) {
+	out, err := git.patchIDs(ctx, revision, maxCount)
 	if err != nil {
 		return nil, err
 	}

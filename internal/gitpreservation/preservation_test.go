@@ -322,7 +322,7 @@ func (f fakeRunner) run(_ context.Context, args ...string) (string, error) { ret
 func (f fakeRunner) patchID(_ context.Context, args ...string) (string, error) {
 	return f.patchFn(args...)
 }
-func (f fakeRunner) patchIDs(_ context.Context, revision string) (string, error) {
+func (f fakeRunner) patchIDs(_ context.Context, revision string, _ int) (string, error) {
 	if f.batchFn == nil {
 		return "", fmt.Errorf("unexpected patchIDs(%s)", revision)
 	}
@@ -442,12 +442,12 @@ func (c *countingRunner) patchID(ctx context.Context, args ...string) (string, e
 	c.mu.Unlock()
 	return c.inner.patchID(ctx, args...)
 }
-func (c *countingRunner) patchIDs(ctx context.Context, revision string) (string, error) {
+func (c *countingRunner) patchIDs(ctx context.Context, revision string, maxCount int) (string, error) {
 	c.mu.Lock()
 	c.batchCalls++
 	c.batchArgs = append(c.batchArgs, revision)
 	c.mu.Unlock()
-	return c.inner.patchIDs(ctx, revision)
+	return c.inner.patchIDs(ctx, revision, maxCount)
 }
 
 func (c *countingRunner) snapshot() (int, int, int, [][]string, []string) {
@@ -532,9 +532,9 @@ func (d delayingRunner) run(ctx context.Context, args ...string) (string, error)
 func (d delayingRunner) patchID(ctx context.Context, args ...string) (string, error) {
 	return d.inner.patchID(ctx, args...)
 }
-func (d delayingRunner) patchIDs(ctx context.Context, revision string) (string, error) {
+func (d delayingRunner) patchIDs(ctx context.Context, revision string, maxCount int) (string, error) {
 	time.Sleep(50 * time.Millisecond)
-	return d.inner.patchIDs(ctx, revision)
+	return d.inner.patchIDs(ctx, revision, maxCount)
 }
 
 func TestAnalyzerSingleFlightsConcurrentSameKeyCacheFills(t *testing.T) {
@@ -585,6 +585,60 @@ func TestAnalyzerSingleFlightsConcurrentSameKeyCacheFills(t *testing.T) {
 	}
 	if enumerations != 1 || integrationBatches != 1 {
 		t.Fatalf("same-key fills: ref enumerations=%d integration pipelines=%d", enumerations, integrationBatches)
+	}
+}
+
+func TestAnalyzerSharesIntegrationWindowAcrossConcurrentDistinctMergeBases(t *testing.T) {
+	r := newRepo(t)
+	r.commit("anchor-one", "anchor one\n", "anchor one")
+	r.git("switch", "-c", "topic-one")
+	r.commit("topic-one-a", "one a\n", "topic one a")
+	r.commit("topic-one-b", "one b\n", "topic one b")
+	r.git("switch", "main")
+	r.commit("anchor-two", "anchor two\n", "anchor two")
+	r.git("switch", "-c", "topic-two")
+	r.commit("topic-two-a", "two a\n", "topic two a")
+	r.commit("topic-two-b", "two b\n", "topic two b")
+	r.git("switch", "main")
+	for _, branch := range []string{"topic-one", "topic-two"} {
+		r.git("merge", "--squash", branch)
+		r.git("commit", "-m", "squash "+branch)
+	}
+	r.integrationRef()
+	integrationTip := r.git("rev-parse", "refs/remotes/origin/main")
+	c := &countingRunner{inner: gitRunner{repo: r.dir}}
+	a := NewAnalyzer(r.dir, Options{})
+	a.git = delayingRunner{inner: c}
+	deleted := []string{"refs/heads/topic-one", "refs/heads/topic-two"}
+	start := make(chan struct{})
+	results := make(chan Result, len(deleted))
+	var wg sync.WaitGroup
+	for _, target := range deleted {
+		target := target
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- a.Analyze(context.Background(), target, deleted)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for got := range results {
+		if !got.Preserved || got.Kind != KindSquash {
+			t.Fatalf("result = %+v", got)
+		}
+	}
+	_, _, _, _, batchArgs := c.snapshot()
+	integrationBatches := 0
+	for _, revision := range batchArgs {
+		if revision == integrationTip {
+			integrationBatches++
+		}
+	}
+	if integrationBatches != 1 {
+		t.Fatalf("integration pipelines = %d, want 1 for distinct merge bases", integrationBatches)
 	}
 }
 
@@ -661,6 +715,10 @@ func scriptedAnalysisRunner(topicCount, integrationCount int, failure string) fa
 	for i := range integrationCommits {
 		integrationCommits[i] = testOID(10000 + i)
 	}
+	integrationWindow := append([]string{base}, integrationCommits...)
+	if len(integrationWindow) > MaxIntegrationCommits+1 {
+		integrationWindow = integrationWindow[len(integrationWindow)-(MaxIntegrationCommits+1):]
+	}
 	failed := func(stage string) (string, error) {
 		if failure == stage {
 			return "", fmt.Errorf("injected %s failure", stage)
@@ -704,12 +762,17 @@ func scriptedAnalysisRunner(topicCount, integrationCount int, failure string) fa
 				if out, err := failed("integration-history"); err != nil {
 					return out, err
 				}
-				return strings.Join(integrationCommits, "\n"), nil
+				if strings.Contains(args[len(args)-1], "..") {
+					return strings.Join(integrationCommits, "\n"), nil
+				}
+				newestFirst := append([]string(nil), integrationWindow...)
+				slices.Reverse(newestFirst)
+				return strings.Join(newestFirst, "\n"), nil
 			}
 			return "", fmt.Errorf("unexpected git command %v", args)
 		},
 		batchFn: func(revision string) (string, error) {
-			commits := integrationCommits
+			commits := integrationWindow
 			patch := testOID(22)
 			stage := "integration-patch"
 			if strings.HasSuffix(revision, target) {
