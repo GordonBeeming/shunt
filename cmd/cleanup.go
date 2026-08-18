@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/gordonbeeming/shunt/internal/gitpreservation"
 	"github.com/gordonbeeming/shunt/internal/proc"
@@ -28,6 +29,14 @@ type cleanupCandidate struct {
 
 type protectedSiding struct{ Name, Reason string }
 
+var (
+	commandLoadCurrentApp = loadCurrentApp
+	commandRemoveSiding   = removeSiding
+	newCommandAnalyzer    = func(repo string) *gitpreservation.Analyzer {
+		return gitpreservation.NewAnalyzer(repo, gitpreservation.Options{})
+	}
+)
+
 func newCleanupCmd() *cobra.Command {
 	var force bool
 	var nextBase string
@@ -38,12 +47,12 @@ func newCleanupCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			in := bufio.NewReader(os.Stdin)
-			app, _, err := loadCurrentApp()
+			app, _, err := commandLoadCurrentApp()
 			if err != nil {
 				return err
 			}
 			if app.Removal != nil {
-				return removeSiding(ctx, &app, app.Removal.Siding, force, "")
+				return commandRemoveSiding(ctx, &app, app.Removal.Siding, force, "")
 			}
 			if len(app.Sidings) == 0 {
 				fmt.Println("no sidings to clean up")
@@ -72,13 +81,9 @@ func newCleanupCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				safety = make(map[string]*removalSafety, len(selected))
-				for _, name := range selected {
-					snapshot, err := captureRemovalSafety(ctx, app, name, deletionRefs)
-					if err != nil {
-						return err
-					}
-					safety[name] = &snapshot
+				safety, err = captureSelectedRemovalSafety(ctx, app, selected, deletionRefs)
+				if err != nil {
+					return err
 				}
 				dirty, err := protectedSelectedSidings(ctx, app, selected, safety)
 				if err != nil {
@@ -115,7 +120,7 @@ func newCleanupCmd() *cobra.Command {
 				if safety != nil {
 					expected = safety[name]
 				}
-				if err := removeSiding(ctx, &app, name, force, next, expected); err != nil {
+				if err := commandRemoveSiding(ctx, &app, name, force, next, expected); err != nil {
 					return fmt.Errorf("clean up siding %q: %w", name, err)
 				}
 			}
@@ -160,6 +165,25 @@ func resolveSelectedRemovalRefs(ctx context.Context, app state.App, selected []s
 	return result, nil
 }
 
+func captureSelectedRemovalSafety(ctx context.Context, app state.App, selected, deletionRefs []string) (map[string]*removalSafety, error) {
+	result := make(map[string]*removalSafety, len(selected))
+	analyzers := map[string]*gitpreservation.Analyzer{}
+	for _, name := range selected {
+		owner := state.WorktreeOwner(app, app.Sidings[name])
+		analyzer := analyzers[owner]
+		if analyzer == nil {
+			analyzer = newCommandAnalyzer(owner)
+			analyzers[owner] = analyzer
+		}
+		snapshot, err := captureRemovalSafetyWithAnalyzer(ctx, app, name, deletionRefs, analyzer)
+		if err != nil {
+			return nil, err
+		}
+		result[name] = &snapshot
+	}
+	return result, nil
+}
+
 func buildCleanupCandidates(ctx context.Context, app state.App, checkDirty bool) ([]cleanupCandidate, error) {
 	names := make([]string, 0, len(app.Sidings))
 	for name := range app.Sidings {
@@ -167,11 +191,23 @@ func buildCleanupCandidates(ctx context.Context, app state.App, checkDirty bool)
 	}
 	sort.Strings(names)
 	statuses := sidingStatuses(ctx, app, names)
+	analyzers := map[string]*gitpreservation.Analyzer{}
 	candidates := make([]cleanupCandidate, 0, len(names))
 	for _, name := range names {
 		candidate := cleanupCandidate{Name: name, Status: statuses[name]}
 		if checkDirty {
-			dirty, reason, err := sidingWorktreeProtection(ctx, app, name, []string{name})
+			owner := state.WorktreeOwner(app, app.Sidings[name])
+			if owner == "" {
+				if src, _, pathErr := siding.Paths(app, name); pathErr == nil {
+					owner = src
+				}
+			}
+			analyzer := analyzers[owner]
+			if analyzer == nil {
+				analyzer = newCommandAnalyzer(owner)
+				analyzers[owner] = analyzer
+			}
+			dirty, reason, err := sidingWorktreeProtectionWithAnalyzer(ctx, app, name, []string{name}, analyzer)
 			if err != nil {
 				return nil, err
 			}
@@ -189,6 +225,10 @@ func sidingWorktreeHasChanges(ctx context.Context, app state.App, name string, r
 }
 
 func sidingWorktreeProtection(ctx context.Context, app state.App, name string, removing []string) (bool, string, error) {
+	return sidingWorktreeProtectionWithAnalyzer(ctx, app, name, removing, nil)
+}
+
+func sidingWorktreeProtectionWithAnalyzer(ctx context.Context, app state.App, name string, removing []string, analyzer *gitpreservation.Analyzer) (bool, string, error) {
 	src, _, err := siding.Paths(app, name)
 	if err != nil {
 		return false, "", err
@@ -227,7 +267,13 @@ func sidingWorktreeProtection(ctx context.Context, app state.App, name string, r
 		branches = append(branches, checkedOut)
 	}
 	deletions := plannedBranchRefs(branches)
-	analyzer := gitpreservation.NewAnalyzer(src, gitpreservation.Options{})
+	if analyzer == nil {
+		owner := state.WorktreeOwner(app, app.Sidings[name])
+		if owner == "" {
+			owner = src
+		}
+		analyzer = newCommandAnalyzer(owner)
+	}
 	observedResult := analyzer.Analyze(ctx, "refs/heads/"+checkedOut, deletions)
 	var recordedResult gitpreservation.Result
 	if checkedOut != app.Sidings[name].Branch {
@@ -293,6 +339,9 @@ func pickCleanupCandidates(candidates []cleanupCandidate, in *bufio.Reader) ([]s
 }
 
 func pickCleanupInteractive(candidates []cleanupCandidate, fd int, in *bufio.Reader) ([]string, error) {
+	if width, _, err := term.GetSize(fd); err != nil || width <= 0 {
+		return pickCleanupByNumber(candidates, in, os.Stdout)
+	}
 	old, err := term.MakeRaw(fd)
 	if err != nil {
 		return pickCleanupByNumber(candidates, in, os.Stdout)
@@ -301,7 +350,6 @@ func pickCleanupInteractive(candidates []cleanupCandidate, fd int, in *bufio.Rea
 
 	selected := make([]bool, len(candidates))
 	cursor := 0
-	width, _, _ := term.GetSize(fd)
 	draw := func(first bool) {
 		if !first {
 			fmt.Fprintf(os.Stdout, "\x1b[%dA", len(candidates)+1)
@@ -313,6 +361,10 @@ func pickCleanupInteractive(candidates []cleanupCandidate, fd int, in *bufio.Rea
 				check = "x"
 			}
 			row := fmt.Sprintf("[%s] %s  (%s)", check, candidate.Name, cleanupStatus(candidate))
+			width, _, sizeErr := term.GetSize(fd)
+			if sizeErr != nil || width <= 0 {
+				width = 1
+			}
 			available := width - 4
 			if available < 1 {
 				available = 1
@@ -370,11 +422,42 @@ func truncateTerminalRow(value string, width int) string {
 	if width <= 1 {
 		return "…"
 	}
+	used := 0
 	runes := []rune(value)
-	if len(runes) <= width {
+	cut := len(runes)
+	for index, r := range runes {
+		cells := terminalRuneWidth(r)
+		if used+cells > width {
+			cut = index
+			break
+		}
+		used += cells
+	}
+	if cut == len(runes) {
 		return value
 	}
-	return string(runes[:width-1]) + "…"
+	limit := width - 1
+	used = 0
+	cut = 0
+	for index, r := range runes {
+		cells := terminalRuneWidth(r)
+		if used+cells > limit {
+			break
+		}
+		used += cells
+		cut = index + 1
+	}
+	return string(runes[:cut]) + "…"
+}
+
+func terminalRuneWidth(r rune) int {
+	if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) {
+		return 0
+	}
+	if r >= 0x1100 && (r <= 0x115f || r >= 0x2e80 && r <= 0xa4cf || r >= 0xac00 && r <= 0xd7a3 || r >= 0xf900 && r <= 0xfaff || r >= 0x1f300 && r <= 0x1faff || r >= 0x20000) {
+		return 2
+	}
+	return 1
 }
 
 func pickCleanupByNumber(candidates []cleanupCandidate, in *bufio.Reader, out io.Writer) ([]string, error) {

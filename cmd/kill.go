@@ -34,7 +34,7 @@ func newKillCmd() *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			app, _, err := loadCurrentApp()
+			app, _, err := commandLoadCurrentApp()
 			if err != nil {
 				return err
 			}
@@ -104,7 +104,7 @@ func newRmCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			in := bufio.NewReader(os.Stdin)
-			app, _, err := loadCurrentApp()
+			app, _, err := commandLoadCurrentApp()
 			if err != nil {
 				return err
 			}
@@ -112,7 +112,7 @@ func newRmCmd() *cobra.Command {
 				if len(args) == 1 && args[0] != app.Removal.Siding {
 					return ensureNoRemovalInProgress(app, "remove siding "+args[0])
 				}
-				return removeSiding(ctx, &app, app.Removal.Siding, force, "")
+				return commandRemoveSiding(ctx, &app, app.Removal.Siding, force, "")
 			}
 			name, err := sidingArgWithReader(ctx, app, args, in)
 			if err != nil {
@@ -159,7 +159,7 @@ func newRmCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return removeSiding(ctx, &app, name, force, successor, safety)
+			return commandRemoveSiding(ctx, &app, name, force, successor, safety)
 		},
 	}
 	c.Flags().BoolVarP(&force, "force", "f", false, "remove even if the siding is live or its worktree has uncommitted changes")
@@ -194,14 +194,22 @@ func hasUnpreservedTargets(targets []state.RemovalTarget) bool {
 }
 
 func captureRemovalSafety(ctx context.Context, app state.App, name string, removing []string) (removalSafety, error) {
+	return captureRemovalSafetyWithAnalyzer(ctx, app, name, removing, nil)
+}
+
+func captureRemovalSafetyWithAnalyzer(ctx context.Context, app state.App, name string, removing []string, analyzer *gitpreservation.Analyzer) (removalSafety, error) {
 	src, _, err := siding.Paths(app, name)
 	if err != nil {
 		return removalSafety{}, err
 	}
-	return captureRemovalSafetyAt(ctx, app, name, removing, src)
+	return captureRemovalSafetyAtWithAnalyzer(ctx, app, name, removing, src, analyzer)
 }
 
 func captureRemovalSafetyAt(ctx context.Context, app state.App, name string, removing []string, src string) (removalSafety, error) {
+	return captureRemovalSafetyAtWithAnalyzer(ctx, app, name, removing, src, nil)
+}
+
+func captureRemovalSafetyAtWithAnalyzer(ctx context.Context, app state.App, name string, removing []string, src string, analyzer *gitpreservation.Analyzer) (removalSafety, error) {
 	if err := ctx.Err(); err != nil {
 		return removalSafety{}, err
 	}
@@ -210,7 +218,7 @@ func captureRemovalSafetyAt(ctx context.Context, app state.App, name string, rem
 		return removalSafety{}, fmt.Errorf("no siding %q", name)
 	}
 	if _, statErr := os.Stat(src); errors.Is(statErr, os.ErrNotExist) {
-		return captureMissingRemovalSafety(ctx, app, sd, removing)
+		return captureMissingRemovalSafety(ctx, app, sd, removing, analyzer)
 	} else if statErr != nil {
 		return removalSafety{}, fmt.Errorf("inspect worktree for %q: %w", name, statErr)
 	}
@@ -294,7 +302,9 @@ func captureRemovalSafetyAt(ctx context.Context, app state.App, name string, rem
 		targetRefs = append(targetRefs, observedRef)
 	}
 	targets := make([]state.RemovalTarget, 0, len(targetRefs))
-	analyzer := gitpreservation.NewAnalyzer(src, gitpreservation.Options{})
+	if analyzer == nil {
+		analyzer = gitpreservation.NewAnalyzer(state.WorktreeOwner(app, sd), gitpreservation.Options{})
+	}
 	for _, ref := range targetRefs {
 		result := analyzer.Analyze(ctx, ref, removingRefs)
 		commit, err := gitText(ctx, src, "rev-parse", "--verify", ref+"^{commit}")
@@ -310,7 +320,7 @@ func captureRemovalSafetyAt(ctx context.Context, app state.App, name string, rem
 	return removalSafety{Removing: removingRefs, Fingerprint: legacyFingerprint, ObservedBranch: observedBranch, PreservationFingerprint: fmt.Sprintf("%x", preservationDigest.Sum(nil)), Targets: targets}, nil
 }
 
-func captureMissingRemovalSafety(ctx context.Context, app state.App, sd state.Siding, removing []string) (removalSafety, error) {
+func captureMissingRemovalSafety(ctx context.Context, app state.App, sd state.Siding, removing []string, analyzer *gitpreservation.Analyzer) (removalSafety, error) {
 	owner := state.WorktreeOwner(app, sd)
 	removingRefs := plannedRemovalRefs(app, removing)
 	digest := sha256.New()
@@ -320,7 +330,9 @@ func captureMissingRemovalSafety(ctx context.Context, app state.App, sd state.Si
 		writeFingerprintField(digest, "removing-ref", ref)
 	}
 	ref := "refs/heads/" + sd.Branch
-	analyzer := gitpreservation.NewAnalyzer(owner, gitpreservation.Options{})
+	if analyzer == nil {
+		analyzer = gitpreservation.NewAnalyzer(owner, gitpreservation.Options{})
+	}
 	result := analyzer.Analyze(ctx, ref, removingRefs)
 	oid := ""
 	if value, err := gitText(ctx, owner, "rev-parse", "--verify", ref+"^{commit}"); err == nil {
@@ -547,6 +559,7 @@ func removeSiding(ctx context.Context, app *state.App, name string, force bool, 
 						return errors.New("removal journal changed while upgrading force policy")
 					}
 					latest.Removal.Force = true
+					latest.Removal.ExplicitDiscard = true
 					return nil
 				})
 				if err != nil {
@@ -602,6 +615,13 @@ func removeSiding(ctx context.Context, app *state.App, name string, force bool, 
 			}
 		}
 		var lockedSafety *removalSafety
+		if force && app.Removal == nil {
+			forceSafety, err := captureForceRemovalSafety(ctx, current, name)
+			if err != nil {
+				return err
+			}
+			lockedSafety = &forceSafety
+		}
 		if !force && app.Removal == nil {
 			removing := []string{name}
 			if len(expected) > 0 && expected[0] != nil {
@@ -629,6 +649,34 @@ func removeSiding(ctx context.Context, app *state.App, name string, force bool, 
 		}
 		return removeSidingLocked(ctx, app, name, successor, force, lockedSafety, defaultRemovalOperations())
 	})
+}
+
+func captureForceRemovalSafety(ctx context.Context, app state.App, name string) (removalSafety, error) {
+	sd, ok := app.Sidings[name]
+	if !ok {
+		return removalSafety{}, fmt.Errorf("no siding %q", name)
+	}
+	refs := []string{"refs/heads/" + sd.Branch}
+	observed := ""
+	if src, _, err := siding.Paths(app, name); err == nil {
+		if branch, branchErr := currentWorktreeBranch(ctx, src); branchErr == nil {
+			observed = branch
+			if branch != sd.Branch {
+				refs = append(refs, "refs/heads/"+branch)
+			}
+		}
+	}
+	sort.Strings(refs)
+	owner := state.WorktreeOwner(app, sd)
+	targets := make([]state.RemovalTarget, 0, len(refs))
+	for _, ref := range refs {
+		oid, err := gitText(ctx, owner, "rev-parse", "--verify", ref+"^{commit}")
+		if err != nil {
+			oid = ""
+		}
+		targets = append(targets, state.RemovalTarget{Ref: ref, ExpectedOID: oid, Kind: string(gitpreservation.KindUnproven), Reason: "force removal explicitly authorized"})
+	}
+	return removalSafety{Removing: refs, ObservedBranch: observed, Targets: targets, ExplicitDiscard: true}, nil
 }
 
 func upgradeRemovalPreservation(ctx context.Context, app state.App, safety removalSafety) (state.App, error) {
@@ -979,6 +1027,7 @@ func removeWorktreeStage(ctx context.Context, app *state.App, operations removal
 		worktreeBranch = journal.ObservedWorktreeBranch
 	}
 	quarantine := fsclone.WorktreeQuarantineFor(owner, sourceRoot, worktreeBranch, journal.ID)
+	quarantine.RetainBranch = true
 	if journal.Force {
 		if _, recoveryErr := os.Lstat(quarantine.RecoveryPath); recoveryErr == nil {
 			// A previous non-force retirement can fail after repairing Git's exact
@@ -990,7 +1039,7 @@ func removeWorktreeStage(ctx context.Context, app *state.App, operations removal
 			}
 		} else if !errors.Is(recoveryErr, os.ErrNotExist) {
 			return fmt.Errorf("inspect worktree recovery path %q: %w", quarantine.RecoveryPath, recoveryErr)
-		} else if err := operations.removeWorktree(ctx, owner, sourceRoot, worktreeBranch); err != nil {
+		} else if err := operations.removeWorktree(ctx, owner, sourceRoot, ""); err != nil {
 			return err
 		}
 	} else {
@@ -1004,7 +1053,7 @@ func removeWorktreeStage(ctx context.Context, app *state.App, operations removal
 				}
 			} else if !errors.Is(recoveryErr, os.ErrNotExist) {
 				return fmt.Errorf("inspect worktree recovery path %q: %w", quarantine.RecoveryPath, recoveryErr)
-			} else if err := operations.removeWorktree(ctx, owner, sourceRoot, worktreeBranch); err != nil {
+			} else if err := operations.removeWorktree(ctx, owner, sourceRoot, ""); err != nil {
 				return err
 			}
 		} else if err != nil {
@@ -1014,24 +1063,14 @@ func removeWorktreeStage(ctx context.Context, app *state.App, operations removal
 			if err != nil {
 				return err
 			}
+			quarantine.RetainBranch = true
 			if err := validateAndRetireRemovalQuarantine(ctx, *app, journal, quarantine, operations); err != nil {
 				return err
 			}
 		}
 	}
-	for _, ref := range removalJournalRefs(journal) {
-		// Legacy journals stored siding names rather than exact refs. Their recorded
-		// branch is already retired through the compatibility worktree path above.
-		if !strings.HasPrefix(ref, "refs/heads/") {
-			continue
-		}
-		if ref != "refs/heads/"+sd.Branch && ref != "refs/heads/"+worktreeBranch {
-			continue
-		}
-		if ref == "refs/heads/"+worktreeBranch {
-			continue
-		}
-		if err := fsclone.RemoveLocalBranchRef(ctx, owner, ref); err != nil {
+	if len(journal.Targets) > 0 {
+		if err := fsclone.RetireRemovalTargetRefs(ctx, owner, journal.Targets, journal.RecoveryRefs); err != nil {
 			return err
 		}
 	}
@@ -1121,17 +1160,6 @@ func clearRemovalJournal(ctx context.Context, app *state.App, operations removal
 	if err != nil {
 		return err
 	}
-	if len(journal.RecoveryRefs) > 0 {
-		if journal.RecoveryRepo == "" {
-			return errors.New("removal journal has recovery refs without their owner repository")
-		}
-		if err := validateTerminalPreservation(ctx, journal); err != nil {
-			return err
-		}
-		if err := fsclone.RemoveRecoveryRefs(ctx, journal.RecoveryRepo, journal.RecoveryRefs); err != nil {
-			return err
-		}
-	}
 	updated, err := operations.updateApp(ctx, app.ConfigDir, func(current *state.App) error {
 		if current.Removal == nil || current.Removal.ID != journal.ID || current.Removal.Stage != state.RemovalOperationForgotten {
 			return fmt.Errorf("removal journal changed before completion")
@@ -1147,10 +1175,6 @@ func clearRemovalJournal(ctx context.Context, app *state.App, operations removal
 	if errors.As(err, &committed) {
 		*app = updated
 		return err
-	}
-	if len(journal.RecoveryRefs) > 0 {
-		_, restoreErr := fsclone.EnsureRemovalRecoveryRefs(context.WithoutCancel(ctx), journal.RecoveryRepo, journal.ID, journal.Targets)
-		return errors.Join(err, restoreErr)
 	}
 	return err
 }

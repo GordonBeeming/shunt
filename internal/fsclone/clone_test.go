@@ -70,6 +70,29 @@ func TestValidateExpectedAbsentTargetRejectsRepositoryError(t *testing.T) {
 	}
 }
 
+func TestRetireRemovalTargetRefsRejectsMovedRefWithoutPartialDeletion(t *testing.T) {
+	repo, mainCommit, workspaceCommit := newWorktreeTestRepo(t)
+	gitOutput(t, repo, "branch", "second", mainCommit)
+	targets := []state.RemovalTarget{{Ref: "refs/heads/main", ExpectedOID: mainCommit}, {Ref: "refs/heads/second", ExpectedOID: mainCommit}}
+	archives, err := EnsureRemovalRecoveryRefs(context.Background(), repo, "moved", targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, repo, "update-ref", "refs/heads/main", workspaceCommit)
+	if err := RetireRemovalTargetRefs(context.Background(), repo, targets, archives); err == nil {
+		t.Fatal("moved target was retired")
+	}
+	if got := gitOutput(t, repo, "rev-parse", "refs/heads/main"); got != workspaceCommit {
+		t.Fatalf("moved ref = %s", got)
+	}
+	if got := gitOutput(t, repo, "rev-parse", "refs/heads/second"); got != mainCommit {
+		t.Fatalf("second ref was partially deleted: %s", got)
+	}
+	if err := ValidateRecoveryRefs(context.Background(), repo, archives); err != nil {
+		t.Fatalf("archives lost after failed retirement: %v", err)
+	}
+}
+
 func TestAddWorktreeGitButlerHeadFallsBackToOriginMain(t *testing.T) {
 	repo, mainCommit, _ := newWorktreeTestRepo(t)
 	gitOutput(t, repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
