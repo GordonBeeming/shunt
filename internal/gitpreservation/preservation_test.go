@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -419,25 +420,44 @@ func TestHistoryPatchIDsRejectsMalformedMissingAndDuplicateRows(t *testing.T) {
 }
 
 type countingRunner struct {
+	mu         sync.Mutex
 	inner      runner
 	runCalls   int
 	patchCalls int
 	batchCalls int
 	runArgs    [][]string
+	batchArgs  []string
 }
 
 func (c *countingRunner) run(ctx context.Context, args ...string) (string, error) {
+	c.mu.Lock()
 	c.runCalls++
 	c.runArgs = append(c.runArgs, append([]string(nil), args...))
+	c.mu.Unlock()
 	return c.inner.run(ctx, args...)
 }
 func (c *countingRunner) patchID(ctx context.Context, args ...string) (string, error) {
+	c.mu.Lock()
 	c.patchCalls++
+	c.mu.Unlock()
 	return c.inner.patchID(ctx, args...)
 }
 func (c *countingRunner) patchIDs(ctx context.Context, revision string) (string, error) {
+	c.mu.Lock()
 	c.batchCalls++
+	c.batchArgs = append(c.batchArgs, revision)
+	c.mu.Unlock()
 	return c.inner.patchIDs(ctx, revision)
+}
+
+func (c *countingRunner) snapshot() (int, int, int, [][]string, []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	runArgs := make([][]string, len(c.runArgs))
+	for i := range c.runArgs {
+		runArgs[i] = append([]string(nil), c.runArgs[i]...)
+	}
+	return c.runCalls, c.patchCalls, c.batchCalls, runArgs, append([]string(nil), c.batchArgs...)
 }
 
 func TestAnalyzeBatchesPatchProcessesIndependentOfCommitCount(t *testing.T) {
@@ -455,11 +475,12 @@ func TestAnalyzeBatchesPatchProcessesIndependentOfCommitCount(t *testing.T) {
 	if !got.Preserved || got.Kind != KindSquash {
 		t.Fatalf("result = %+v", got)
 	}
-	if c.batchCalls != 2 || c.patchCalls != 1 {
-		t.Fatalf("process calls: run=%d batch=%d aggregate=%d", c.runCalls, c.batchCalls, c.patchCalls)
+	runCalls, patchCalls, batchCalls, _, _ := c.snapshot()
+	if batchCalls != 2 || patchCalls != 1 {
+		t.Fatalf("process calls: run=%d batch=%d aggregate=%d", runCalls, batchCalls, patchCalls)
 	}
-	if c.runCalls > 8 {
-		t.Fatalf("git metadata calls grew with commit count: %d", c.runCalls)
+	if runCalls > 8 {
+		t.Fatalf("git metadata calls grew with commit count: %d", runCalls)
 	}
 }
 
@@ -485,17 +506,85 @@ func TestAnalyzerReusesRefAndIntegrationEvidenceAcrossTargets(t *testing.T) {
 			t.Fatalf("%s result = %+v", target, got)
 		}
 	}
-	if c.batchCalls != 3 {
-		t.Fatalf("batch calls = %d, want two topic histories plus one cached integration history", c.batchCalls)
+	_, _, batchCalls, runArgs, _ := c.snapshot()
+	if batchCalls != 3 {
+		t.Fatalf("batch calls = %d, want two topic histories plus one cached integration history", batchCalls)
 	}
 	enumerations := 0
-	for _, args := range c.runArgs {
+	for _, args := range runArgs {
 		if len(args) >= 1 && args[0] == "for-each-ref" && !slices.ContainsFunc(args, func(arg string) bool { return strings.HasPrefix(arg, "--contains=") }) {
 			enumerations++
 		}
 	}
 	if enumerations != 1 {
 		t.Fatalf("surviving ref enumerations = %d, want 1", enumerations)
+	}
+}
+
+type delayingRunner struct{ inner runner }
+
+func (d delayingRunner) run(ctx context.Context, args ...string) (string, error) {
+	if len(args) > 0 && args[0] == "for-each-ref" && !slices.ContainsFunc(args, func(arg string) bool { return strings.HasPrefix(arg, "--contains=") }) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	return d.inner.run(ctx, args...)
+}
+func (d delayingRunner) patchID(ctx context.Context, args ...string) (string, error) {
+	return d.inner.patchID(ctx, args...)
+}
+func (d delayingRunner) patchIDs(ctx context.Context, revision string) (string, error) {
+	time.Sleep(50 * time.Millisecond)
+	return d.inner.patchIDs(ctx, revision)
+}
+
+func TestAnalyzerSingleFlightsConcurrentSameKeyCacheFills(t *testing.T) {
+	r := newRepo(t)
+	r.git("switch", "-c", "topic")
+	r.commit("one", "one\n", "one")
+	r.commit("two", "two\n", "two")
+	r.git("switch", "main")
+	r.git("merge", "--squash", "topic")
+	r.git("commit", "-m", "squash")
+	r.integrationRef()
+	integrationTip := r.git("rev-parse", "refs/remotes/origin/main")
+	c := &countingRunner{inner: gitRunner{repo: r.dir}}
+	a := NewAnalyzer(r.dir, Options{})
+	a.git = delayingRunner{inner: c}
+	const workers = 12
+	start := make(chan struct{})
+	results := make(chan Result, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- a.Analyze(context.Background(), "refs/heads/topic", []string{"refs/heads/topic"})
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for got := range results {
+		if !got.Preserved || got.Kind != KindSquash {
+			t.Fatalf("result = %+v", got)
+		}
+	}
+	_, _, _, runArgs, batchArgs := c.snapshot()
+	enumerations := 0
+	for _, args := range runArgs {
+		if len(args) > 0 && args[0] == "for-each-ref" && !slices.ContainsFunc(args, func(arg string) bool { return strings.HasPrefix(arg, "--contains=") }) {
+			enumerations++
+		}
+	}
+	integrationBatches := 0
+	for _, revision := range batchArgs {
+		if strings.HasSuffix(revision, integrationTip) {
+			integrationBatches++
+		}
+	}
+	if enumerations != 1 || integrationBatches != 1 {
+		t.Fatalf("same-key fills: ref enumerations=%d integration pipelines=%d", enumerations, integrationBatches)
 	}
 }
 
