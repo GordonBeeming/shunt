@@ -129,6 +129,52 @@ func RunStreaming(ctx context.Context, stdout, stderr io.Writer, name string, ar
 	return res, nil
 }
 
+// RunPipelineInDir connects the stdout of producer directly to the stdin of
+// consumer and captures only the consumer's stdout. It avoids retaining large
+// intermediate values such as binary Git patches in memory.
+func RunPipelineInDir(ctx context.Context, dir string, producerName string, producerArgs []string, consumerName string, consumerArgs []string) (Result, error) {
+	producer := exec.CommandContext(ctx, producerName, producerArgs...)
+	producer.Dir = dir
+	consumer := exec.CommandContext(ctx, consumerName, consumerArgs...)
+	consumer.Dir = dir
+
+	pipe, err := producer.StdoutPipe()
+	if err != nil {
+		return Result{}, fmt.Errorf("pipe %s stdout: %w", producerName, err)
+	}
+	consumer.Stdin = pipe
+	var producerStderr, consumerStdout, consumerStderr bytes.Buffer
+	producer.Stderr = &producerStderr
+	consumer.Stdout = &consumerStdout
+	consumer.Stderr = &consumerStderr
+
+	if err := consumer.Start(); err != nil {
+		return Result{}, fmt.Errorf("start %s: %w", consumerName, err)
+	}
+	if err := producer.Start(); err != nil {
+		_ = consumer.Process.Kill()
+		_ = consumer.Wait()
+		return Result{}, fmt.Errorf("start %s: %w", producerName, err)
+	}
+	producerErr := producer.Wait()
+	consumerErr := consumer.Wait()
+	if producerErr != nil {
+		return Result{Stdout: consumerStdout.String(), Stderr: producerStderr.String(), ExitCode: exitCode(producer)}, fmt.Errorf("%s exited %d: %s", producerName, exitCode(producer), strings.TrimSpace(producerStderr.String()))
+	}
+	result := Result{Stdout: consumerStdout.String(), Stderr: consumerStderr.String(), ExitCode: exitCode(consumer)}
+	if consumerErr != nil {
+		return result, fmt.Errorf("%s exited %d: %s", consumerName, result.ExitCode, strings.TrimSpace(result.Stderr))
+	}
+	return result, nil
+}
+
+func exitCode(cmd *exec.Cmd) int {
+	if cmd.ProcessState == nil {
+		return -1
+	}
+	return cmd.ProcessState.ExitCode()
+}
+
 // RunPassthrough runs a command with stdio wired straight to the user's
 // terminal — for long/interactive operations (image builds, dotnet run) where
 // streaming output matters more than capturing it.
