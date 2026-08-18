@@ -642,6 +642,64 @@ func TestAnalyzerSharesIntegrationWindowAcrossConcurrentDistinctMergeBases(t *te
 	}
 }
 
+func TestAnalyzerSharesIntegrationWindowAcrossDistinctBasesWithNonLinearMerge(t *testing.T) {
+	r := newRepo(t)
+	r.git("switch", "-c", "old-side")
+	r.commit("old-side", "side\n", "old side work")
+	r.git("switch", "main")
+	r.commit("anchor-one", "anchor one\n", "anchor one")
+	r.git("switch", "-c", "topic-one")
+	r.commit("topic-one-a", "one a\n", "topic one a")
+	r.commit("topic-one-b", "one b\n", "topic one b")
+	r.git("switch", "main")
+	r.commit("anchor-two", "anchor two\n", "anchor two")
+	r.git("switch", "-c", "topic-two")
+	r.commit("topic-two-a", "two a\n", "topic two a")
+	r.commit("topic-two-b", "two b\n", "topic two b")
+	r.git("switch", "main")
+	r.git("merge", "--no-ff", "old-side", "-m", "merge old side")
+	for _, branch := range []string{"topic-one", "topic-two"} {
+		r.git("merge", "--squash", branch)
+		r.git("commit", "-m", "squash "+branch)
+	}
+	r.integrationRef()
+	integrationTip := r.git("rev-parse", "refs/remotes/origin/main")
+	c := &countingRunner{inner: gitRunner{repo: r.dir}}
+	a := NewAnalyzer(r.dir, Options{})
+	a.git = delayingRunner{inner: c}
+	deleted := []string{"refs/heads/topic-one", "refs/heads/topic-two", "refs/heads/old-side"}
+	start := make(chan struct{})
+	results := make(chan Result, 2)
+	var wg sync.WaitGroup
+	for _, target := range deleted[:2] {
+		target := target
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- a.Analyze(context.Background(), target, deleted)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for got := range results {
+		if !got.Preserved || got.Kind != KindSquash {
+			t.Fatalf("result = %+v", got)
+		}
+	}
+	_, _, _, _, batchArgs := c.snapshot()
+	integrationBatches := 0
+	for _, revision := range batchArgs {
+		if revision == integrationTip {
+			integrationBatches++
+		}
+	}
+	if integrationBatches != 1 {
+		t.Fatalf("integration pipelines = %d, want 1 for non-linear distinct bases", integrationBatches)
+	}
+}
+
 func TestAnalyzeReportsPatchSizeAndTimeoutDistinctly(t *testing.T) {
 	r := newRepo(t)
 	r.git("switch", "-c", "topic")
@@ -688,6 +746,7 @@ func TestAnalyzePerStageFailureMatrix(t *testing.T) {
 		{failure: "topic-merge", want: "topic merge scan"},
 		{failure: "topic-patch", want: "topic patch analysis"},
 		{failure: "integration-history", want: "integration history scan"},
+		{failure: "integration-range", want: "integration range scan"},
 		{failure: "integration-patch", want: "integration patch parsing"},
 		{failure: "aggregate", want: "aggregate patch analysis"},
 	}
@@ -759,11 +818,14 @@ func scriptedAnalysisRunner(topicCount, integrationCount int, failure string) fa
 					}
 					return strings.Join(topicCommits, "\n"), nil
 				}
+				if strings.Contains(args[len(args)-1], "..") {
+					if out, err := failed("integration-range"); err != nil {
+						return out, err
+					}
+					return strings.Join(integrationCommits, "\n"), nil
+				}
 				if out, err := failed("integration-history"); err != nil {
 					return out, err
-				}
-				if strings.Contains(args[len(args)-1], "..") {
-					return strings.Join(integrationCommits, "\n"), nil
 				}
 				newestFirst := append([]string(nil), integrationWindow...)
 				slices.Reverse(newestFirst)

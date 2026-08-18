@@ -379,8 +379,7 @@ func (a *Analyzer) integrationPatches(ctx context.Context, base, integrationComm
 	if err != nil {
 		return nil, err
 	}
-	baseIndex := slices.Index(evidence.commits, base)
-	if baseIndex < 0 {
+	if !slices.Contains(evidence.commits, base) {
 		return nil, errIntegrationOverflow
 	}
 	rangeCommits, overflow, err := commits(a.git, ctx, MaxIntegrationCommits, base+".."+integrationCommit)
@@ -390,8 +389,8 @@ func (a *Analyzer) integrationPatches(ctx context.Context, base, integrationComm
 	if overflow {
 		return nil, errIntegrationOverflow
 	}
-	windowCommits := make(map[string]bool, len(evidence.commits)-baseIndex)
-	for _, commit := range evidence.commits[baseIndex:] {
+	windowCommits := make(map[string]bool, len(evidence.commits))
+	for _, commit := range evidence.commits {
 		windowCommits[commit] = true
 	}
 	patchByCommit := make(map[string]commitPatch, len(evidence.patches))
