@@ -208,9 +208,14 @@ func RunPipelineInDirLimited(ctx context.Context, dir string, maxInputBytes int6
 		}
 	case consumerErr = <-consumerDone:
 		consumerReceived = true
-		// A consumer that exits before the producer/copy side is done can leave a
-		// producer blocked on a full pipe. Cancellation makes that lifecycle finite.
-		cancel()
+		// A successful consumer may be observed before the producer waiter runs
+		// even after the producer has closed stdout. Cancelling here races that
+		// normal completion and turns a valid pipeline into context cancellation.
+		// Failed consumers still need to stop a producer that could be blocked on
+		// a full pipe.
+		if consumerErr != nil {
+			cancel()
+		}
 	}
 	if !producerReceived {
 		producerResult = <-producerDone
