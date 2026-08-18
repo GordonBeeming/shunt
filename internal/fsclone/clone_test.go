@@ -119,18 +119,20 @@ func TestRetireRemovalTargetRefsUsesSHA256ZeroOID(t *testing.T) {
 	}
 }
 
-func TestRemovalWitnessRefsDeduplicatePreservedTargets(t *testing.T) {
+func TestRemovalWitnessArchiveDeduplicatesPreservedTargets(t *testing.T) {
 	repo, mainCommit, _ := newWorktreeTestRepo(t)
 	targets := []state.RemovalTarget{{Ref: "refs/heads/one", Preserved: true, MatchingCommit: mainCommit}, {Ref: "refs/heads/two", Preserved: true, MatchingCommit: mainCommit}, {Ref: "refs/heads/discard", Preserved: false, MatchingCommit: mainCommit}}
-	refs, err := EnsureRemovalWitnessRefs(context.Background(), repo, targets)
+	ref, oid, err := EnsureRemovalWitnessArchive(context.Background(), repo, targets)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(refs) != 1 {
-		t.Fatalf("witness refs = %v", refs)
+	if ref != "refs/shunt/witness/archive" || oid == "" {
+		t.Fatalf("archive = %q %q", ref, oid)
 	}
-	if got := gitOutput(t, repo, "rev-parse", refs[0]+"^{commit}"); got != mainCommit {
-		t.Fatalf("witness OID = %s", got)
+	gitOutput(t, repo, "merge-base", "--is-ancestor", mainCommit, oid)
+	emptyRef, emptyOID, err := EnsureRemovalWitnessArchive(context.Background(), repo, []state.RemovalTarget{{Preserved: false, MatchingCommit: mainCommit}})
+	if err != nil || emptyRef != "" || emptyOID != "" {
+		t.Fatalf("discard archive = %q %q %v", emptyRef, emptyOID, err)
 	}
 }
 

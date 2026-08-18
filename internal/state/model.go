@@ -61,7 +61,8 @@ const (
 // separately records permission to lose unpreserved Git work. Removing may hold
 // legacy siding names, while Targets/RecoveryRefs are canonical exact refs and
 // immutable once destructive stages begin. Recovery refs are short-lived crash
-// guards; WitnessRefs are deduplicated durable proof for preserved targets.
+// guards; ArchiveRef/ArchiveOID identify the one synthetic ancestry archive
+// that durably retains all preserved matching commits for the worktree owner.
 type RemovalOperation struct {
 	ID                      string          `json:"id"`
 	Siding                  string          `json:"siding"`
@@ -76,7 +77,8 @@ type RemovalOperation struct {
 	Targets                 []RemovalTarget `json:"targets,omitempty"`
 	RecoveryRefs            []string        `json:"recoveryRefs,omitempty"`
 	RecoveryRepo            string          `json:"recoveryRepo,omitempty"`
-	WitnessRefs             []string        `json:"witnessRefs,omitempty"`
+	ArchiveRef              string          `json:"archiveRef,omitempty"`
+	ArchiveOID              string          `json:"archiveOid,omitempty"`
 	ExplicitDiscard         bool            `json:"explicitDiscard,omitempty"`
 }
 
