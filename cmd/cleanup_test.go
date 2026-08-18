@@ -336,6 +336,9 @@ func TestTruncateTerminalRowTinyAndNormalWidths(t *testing.T) {
 	if got := terminalRuneWidth('界'); got != 2 {
 		t.Fatalf("wide rune cells = %d", got)
 	}
+	if got := terminalRuneWidth('Ａ'); got != 2 {
+		t.Fatalf("fullwidth form cells = %d", got)
+	}
 }
 
 func TestNumberedCleanupPreservesPipedConfirmation(t *testing.T) {

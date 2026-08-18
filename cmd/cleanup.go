@@ -18,6 +18,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
+	"golang.org/x/text/width"
 )
 
 type cleanupCandidate struct {
@@ -454,7 +455,8 @@ func terminalRuneWidth(r rune) int {
 	if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) {
 		return 0
 	}
-	if r >= 0x1100 && (r <= 0x115f || r >= 0x2e80 && r <= 0xa4cf || r >= 0xac00 && r <= 0xd7a3 || r >= 0xf900 && r <= 0xfaff || r >= 0x1f300 && r <= 0x1faff || r >= 0x20000) {
+	kind := width.LookupRune(r).Kind()
+	if kind == width.EastAsianWide || kind == width.EastAsianFullwidth || r >= 0x1f300 && r <= 0x1faff {
 		return 2
 	}
 	return 1

@@ -739,11 +739,19 @@ func ensureRemovalRecoveryRefs(ctx context.Context, app *state.App, operations r
 		return fmt.Errorf("removal %q lost siding state before recovery refs", journal.ID)
 	}
 	owner := state.WorktreeOwner(*app, sd)
+	if err := fsclone.GCOrphanRecoveryRefs(ctx, owner, journal.ID); err != nil {
+		return fmt.Errorf("collect orphan recovery refs: %w", err)
+	}
 	if err := fsclone.ValidateRemovalTargets(ctx, owner, journal.Targets); err != nil {
 		return err
 	}
 	refs, err := fsclone.EnsureRemovalRecoveryRefs(ctx, owner, journal.ID, journal.Targets)
 	if err != nil {
+		return err
+	}
+	witnesses, err := fsclone.EnsureRemovalWitnessRefs(ctx, owner, journal.Targets)
+	if err != nil {
+		_ = fsclone.RemoveRecoveryRefs(context.WithoutCancel(ctx), owner, refs)
 		return err
 	}
 	updated, err := operations.updateApp(ctx, app.ConfigDir, func(current *state.App) error {
@@ -752,6 +760,7 @@ func ensureRemovalRecoveryRefs(ctx context.Context, app *state.App, operations r
 		}
 		current.Removal.RecoveryRefs = append([]string(nil), refs...)
 		current.Removal.RecoveryRepo = owner
+		current.Removal.WitnessRefs = append([]string(nil), witnesses...)
 		return nil
 	})
 	if err != nil {
@@ -1015,6 +1024,19 @@ func removeWorktreeStage(ctx context.Context, app *state.App, operations removal
 	fmt.Println("• removing the worktree…")
 	owner := state.WorktreeOwner(*app, sd)
 	if len(journal.Targets) > 0 {
+		allAbsent, absentErr := fsclone.RemovalTargetsAbsent(ctx, owner, journal.Targets)
+		if absentErr != nil {
+			return absentErr
+		}
+		if allAbsent {
+			if err := fsclone.ValidateRecoveryRefs(ctx, owner, journal.RecoveryRefs); err != nil {
+				return err
+			}
+			if _, err := os.Lstat(sourceRoot); !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("targets are retired but worktree bytes still exist at %q", sourceRoot)
+			}
+			return checkpointRemoval(ctx, app, operations, state.RemovalGuestRemoved, state.RemovalWorktreeRemoved, nil)
+		}
 		if err := fsclone.ValidateRemovalTargets(ctx, owner, journal.Targets); err != nil {
 			return err
 		}
@@ -1169,6 +1191,9 @@ func clearRemovalJournal(ctx context.Context, app *state.App, operations removal
 	})
 	if err == nil {
 		*app = updated
+		if cleanupErr := fsclone.RemoveRecoveryRefs(context.WithoutCancel(ctx), journal.RecoveryRepo, journal.RecoveryRefs); cleanupErr != nil {
+			fmt.Printf("warning: removal completed but recovery-ref cleanup failed: %v\n", cleanupErr)
+		}
 		return nil
 	}
 	var committed *state.CommittedDurabilityError

@@ -57,10 +57,11 @@ const (
 )
 
 // RemovalOperation journals the one project-exclusive destructive operation
-// that may be resumed. Target witnesses and recovery refs are immutable once
-// destructive stages begin. Recovery refs become permanent archives after
-// success; clearing this journal never deletes them. GenerationID is filled
-// once the data baseline reports a committed generation for ID.
+// that may be resumed. Force authorizes lifecycle overrides; ExplicitDiscard
+// separately records permission to lose unpreserved Git work. Removing may hold
+// legacy siding names, while Targets/RecoveryRefs are canonical exact refs and
+// immutable once destructive stages begin. Recovery refs are short-lived crash
+// guards; WitnessRefs are deduplicated durable proof for preserved targets.
 type RemovalOperation struct {
 	ID                      string          `json:"id"`
 	Siding                  string          `json:"siding"`
@@ -75,6 +76,7 @@ type RemovalOperation struct {
 	Targets                 []RemovalTarget `json:"targets,omitempty"`
 	RecoveryRefs            []string        `json:"recoveryRefs,omitempty"`
 	RecoveryRepo            string          `json:"recoveryRepo,omitempty"`
+	WitnessRefs             []string        `json:"witnessRefs,omitempty"`
 	ExplicitDiscard         bool            `json:"explicitDiscard,omitempty"`
 }
 

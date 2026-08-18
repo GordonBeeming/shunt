@@ -27,16 +27,24 @@ type Report struct {
 }
 
 type ProjectReport struct {
-	Name         string         `json:"name"`
-	ConfigDir    string         `json:"configDir"`
-	Filesystem   FilesystemView `json:"filesystem"`
-	Logical      Measurement    `json:"logical"`
-	Source       SourceReport   `json:"source"`
-	Managed      []Measurement  `json:"managed"`
-	Unclassified []Measurement  `json:"unclassified"`
-	Baselines    []Measurement  `json:"baselines"`
-	Sidings      []SidingReport `json:"sidings"`
+	Name         string             `json:"name"`
+	ConfigDir    string             `json:"configDir"`
+	Filesystem   FilesystemView     `json:"filesystem"`
+	Logical      Measurement        `json:"logical"`
+	Source       SourceReport       `json:"source"`
+	Managed      []Measurement      `json:"managed"`
+	Unclassified []Measurement      `json:"unclassified"`
+	Baselines    []Measurement      `json:"baselines"`
+	Sidings      []SidingReport     `json:"sidings"`
+	GitArchives  GitArchiveEvidence `json:"gitArchives"`
 	fatalErr     error
+}
+
+type GitArchiveEvidence struct {
+	Observation  string `json:"observation"`
+	RecoveryRefs int    `json:"recoveryRefs"`
+	WitnessRefs  int    `json:"witnessRefs"`
+	Detail       string `json:"detail,omitempty"`
 }
 
 type Measurement struct {
@@ -139,6 +147,7 @@ func collectProject(ctx context.Context, app state.App) ProjectReport {
 		Managed:      []Measurement{},
 		Unclassified: []Measurement{},
 	}
+	project.GitArchives = collectGitArchives(ctx, app.ControlRepoPath)
 	if project.Source.Measurement.Observation == "error" {
 		project.fatalErr = fmt.Errorf("scan registered source %s: %s", project.Source.Measurement.Path, project.Source.Measurement.Detail)
 	}
@@ -196,6 +205,26 @@ func collectProject(ctx context.Context, app state.App) ProjectReport {
 		project.fatalErr = err
 	}
 	return project
+}
+
+func collectGitArchives(ctx context.Context, repo string) GitArchiveEvidence {
+	if repo == "" {
+		return GitArchiveEvidence{Observation: "missing"}
+	}
+	result, err := proc.Run(ctx, "git", "-C", repo, "for-each-ref", "--format=%(refname)", "refs/shunt/recovery", "refs/shunt/witness")
+	if err != nil {
+		return GitArchiveEvidence{Observation: "error", Detail: err.Error()}
+	}
+	evidence := GitArchiveEvidence{Observation: "observed"}
+	for _, ref := range strings.Fields(result.Stdout) {
+		if strings.HasPrefix(ref, "refs/shunt/recovery/") {
+			evidence.RecoveryRefs++
+		}
+		if strings.HasPrefix(ref, "refs/shunt/witness/") {
+			evidence.WitnessRefs++
+		}
+	}
+	return evidence
 }
 
 func buildSidingReports(ctx context.Context, app state.App, names []string) []SidingReport {

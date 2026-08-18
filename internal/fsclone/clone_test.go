@@ -93,6 +93,47 @@ func TestRetireRemovalTargetRefsRejectsMovedRefWithoutPartialDeletion(t *testing
 	}
 }
 
+func TestRetireRemovalTargetRefsUsesSHA256ZeroOID(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "sha256")
+	command := exec.Command("git", "init", "--object-format=sha256", "-b", "main", repo)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Skipf("Git SHA-256 repositories unavailable: %v: %s", err, output)
+	}
+	gitOutput(t, repo, "config", "user.name", "Test")
+	gitOutput(t, repo, "config", "user.email", "test@example.com")
+	writeTestFile(t, repo, "file", "value")
+	gitOutput(t, repo, "add", "file")
+	gitOutput(t, repo, "commit", "-m", "base")
+	oid := gitOutput(t, repo, "rev-parse", "HEAD")
+	targets := []state.RemovalTarget{{Ref: "refs/heads/main", ExpectedOID: oid}, {Ref: "refs/heads/absent"}}
+	archives, err := EnsureRemovalRecoveryRefs(context.Background(), repo, "sha256", targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RetireRemovalTargetRefs(context.Background(), repo, targets, archives); err != nil {
+		t.Fatal(err)
+	}
+	result := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", "refs/heads/main")
+	if err := result.Run(); err == nil {
+		t.Fatal("SHA-256 target ref remains")
+	}
+}
+
+func TestRemovalWitnessRefsDeduplicatePreservedTargets(t *testing.T) {
+	repo, mainCommit, _ := newWorktreeTestRepo(t)
+	targets := []state.RemovalTarget{{Ref: "refs/heads/one", Preserved: true, MatchingCommit: mainCommit}, {Ref: "refs/heads/two", Preserved: true, MatchingCommit: mainCommit}, {Ref: "refs/heads/discard", Preserved: false, MatchingCommit: mainCommit}}
+	refs, err := EnsureRemovalWitnessRefs(context.Background(), repo, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("witness refs = %v", refs)
+	}
+	if got := gitOutput(t, repo, "rev-parse", refs[0]+"^{commit}"); got != mainCommit {
+		t.Fatalf("witness OID = %s", got)
+	}
+}
+
 func TestAddWorktreeGitButlerHeadFallsBackToOriginMain(t *testing.T) {
 	repo, mainCommit, _ := newWorktreeTestRepo(t)
 	gitOutput(t, repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
