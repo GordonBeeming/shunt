@@ -229,31 +229,45 @@ func captureRemovalSafetyAtWithAnalyzer(ctx context.Context, app state.App, name
 	if dirtySubmodule {
 		return removalSafety{}, fmt.Errorf("siding %q contains dirty populated submodule work; inspect it or rerun with --force only if it may be discarded", name)
 	}
-	observedBranch, err := currentWorktreeBranch(ctx, src)
+	observedBranch, detachedHEAD, err := currentWorktreeBranchState(ctx, src)
 	if err != nil {
 		return removalSafety{}, fmt.Errorf("inspect checked-out branch for %q: %w", name, err)
 	}
 
 	digest := sha256.New()
 	writeFingerprintField(digest, "branch", sd.Branch)
+	if detachedHEAD {
+		writeFingerprintField(digest, "head", "detached")
+	} else {
+		writeFingerprintField(digest, "head", "branch", observedBranch)
+	}
 	removingRefs := plannedRemovalRefs(app, removing)
 	fingerprintRemovingRefs := make([]string, 0, len(removingRefs))
 	for _, ref := range removingRefs {
-		if observedBranch != sd.Branch && ref == "refs/heads/"+observedBranch {
+		if !detachedHEAD && observedBranch != sd.Branch && ref == "refs/heads/"+observedBranch {
 			continue
 		}
 		fingerprintRemovingRefs = append(fingerprintRemovingRefs, ref)
 		writeFingerprintField(digest, "removing-ref", ref)
 	}
-	for _, command := range []struct {
+	commands := []struct {
 		label string
 		args  []string
 	}{
 		{"status", []string{"status", "--porcelain=v1", "--untracked-files=normal", "--ignore-submodules=none"}},
 		{"head", []string{"rev-parse", "--verify", "HEAD^{commit}"}},
-		{"symbolic-head", []string{"symbolic-ref", "--quiet", "HEAD"}},
-		{"diff", []string{"diff", "--binary", "HEAD", "--"}},
-	} {
+	}
+	if !detachedHEAD {
+		commands = append(commands, struct {
+			label string
+			args  []string
+		}{"symbolic-head", []string{"symbolic-ref", "--quiet", "HEAD"}})
+	}
+	commands = append(commands, struct {
+		label string
+		args  []string
+	}{"diff", []string{"diff", "--binary", "HEAD", "--"}})
+	for _, command := range commands {
 		writeFingerprintField(digest, "command", command.label)
 		if _, err := proc.RunStreaming(ctx, &contextWriter{ctx: ctx, writer: digest}, io.Discard, "git", append([]string{"-C", src}, command.args...)...); err != nil {
 			return removalSafety{}, fmt.Errorf("fingerprint %s for %q: %w", command.label, name, err)
@@ -286,19 +300,24 @@ func captureRemovalSafetyAtWithAnalyzer(ctx context.Context, app state.App, name
 		return removalSafety{}, fmt.Errorf("list untracked files for %q: %w", name, err)
 	}
 	legacyFingerprint := fmt.Sprintf("%x", digest.Sum(nil))
-	observedRef := "refs/heads/" + observedBranch
-	if !containsName(removingRefs, observedRef) {
+	observedRef := ""
+	if !detachedHEAD {
+		observedRef = "refs/heads/" + observedBranch
+	}
+	if observedRef != "" && !containsName(removingRefs, observedRef) {
 		removingRefs = append(removingRefs, observedRef)
 		sort.Strings(removingRefs)
 	}
-	for survivor, survivorSiding := range app.Sidings {
-		if survivor != name && !containsName(removing, survivor) && !containsName(removing, "refs/heads/"+survivorSiding.Branch) && survivorSiding.Branch == observedBranch {
-			return removalSafety{}, fmt.Errorf("checked-out branch %q is owned by surviving siding %q", observedBranch, survivor)
+	if !detachedHEAD {
+		for survivor, survivorSiding := range app.Sidings {
+			if survivor != name && !containsName(removing, survivor) && !containsName(removing, "refs/heads/"+survivorSiding.Branch) && survivorSiding.Branch == observedBranch {
+				return removalSafety{}, fmt.Errorf("checked-out branch %q is owned by surviving siding %q", observedBranch, survivor)
+			}
 		}
 	}
 	preservationDigest := sha256.New()
 	targetRefs := []string{"refs/heads/" + sd.Branch}
-	if observedRef != targetRefs[0] {
+	if observedRef != "" && observedRef != targetRefs[0] {
 		targetRefs = append(targetRefs, observedRef)
 	}
 	targets := make([]state.RemovalTarget, 0, len(targetRefs))
@@ -307,6 +326,9 @@ func captureRemovalSafetyAtWithAnalyzer(ctx context.Context, app state.App, name
 	}
 	for _, ref := range targetRefs {
 		result := analyzer.Analyze(ctx, ref, removingRefs)
+		if detachedHEAD {
+			result = gitpreservation.Result{Kind: gitpreservation.KindUnproven, Reason: "worktree HEAD is detached; explicit discard confirmation is required"}
+		}
 		commit, err := gitText(ctx, src, "rev-parse", "--verify", ref+"^{commit}")
 		if err != nil {
 			commit = ""
