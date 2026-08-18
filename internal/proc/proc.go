@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,11 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+// ErrPipelineInputLimit reports that a producer emitted more bytes than a
+// pipeline caller allowed. Callers can use errors.Is to distinguish it from a
+// process failure.
+var ErrPipelineInputLimit = errors.New("pipeline input exceeds configured byte limit")
 
 // When shunt runs under a launchd agent (the dashboard LaunchAgent), the process
 // inherits a minimal PATH (roughly /usr/bin:/bin:/usr/sbin:/sbin) that excludes
@@ -133,39 +139,159 @@ func RunStreaming(ctx context.Context, stdout, stderr io.Writer, name string, ar
 // consumer and captures only the consumer's stdout. It avoids retaining large
 // intermediate values such as binary Git patches in memory.
 func RunPipelineInDir(ctx context.Context, dir string, producerName string, producerArgs []string, consumerName string, consumerArgs []string) (Result, error) {
-	producer := exec.CommandContext(ctx, producerName, producerArgs...)
+	return RunPipelineInDirLimited(ctx, dir, 0, producerName, producerArgs, consumerName, consumerArgs)
+}
+
+// RunPipelineInDirLimited is RunPipelineInDir with a hard ceiling on bytes
+// copied from producer to consumer. Zero keeps the unlimited behavior.
+func RunPipelineInDirLimited(ctx context.Context, dir string, maxInputBytes int64, producerName string, producerArgs []string, consumerName string, consumerArgs []string) (Result, error) {
+	pipeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	producer := exec.CommandContext(pipeCtx, producerName, producerArgs...)
 	producer.Dir = dir
-	consumer := exec.CommandContext(ctx, consumerName, consumerArgs...)
+	consumer := exec.CommandContext(pipeCtx, consumerName, consumerArgs...)
 	consumer.Dir = dir
 
-	pipe, err := producer.StdoutPipe()
+	producerOut, err := producer.StdoutPipe()
 	if err != nil {
 		return Result{}, fmt.Errorf("pipe %s stdout: %w", producerName, err)
 	}
-	consumer.Stdin = pipe
+	consumerIn, err := consumer.StdinPipe()
+	if err != nil {
+		return Result{}, joinPipelineErrors(fmt.Errorf("pipe %s stdin: %w", consumerName, err), labelledClose("producer stdout", producerOut.Close()))
+	}
 	var producerStderr, consumerStdout, consumerStderr bytes.Buffer
 	producer.Stderr = &producerStderr
 	consumer.Stdout = &consumerStdout
 	consumer.Stderr = &consumerStderr
 
 	if err := consumer.Start(); err != nil {
-		return Result{}, fmt.Errorf("start %s: %w", consumerName, err)
+		return Result{}, errors.Join(
+			fmt.Errorf("consumer start %s: %w", consumerName, err),
+			labelledClose("producer stdout", producerOut.Close()),
+			labelledClose("consumer stdin", consumerIn.Close()),
+		)
 	}
 	if err := producer.Start(); err != nil {
-		_ = consumer.Process.Kill()
-		_ = consumer.Wait()
-		return Result{}, fmt.Errorf("start %s: %w", producerName, err)
+		cancel()
+		closeErr := consumerIn.Close()
+		producerCloseErr := producerOut.Close()
+		waitErr := consumer.Wait()
+		return Result{}, errors.Join(
+			fmt.Errorf("producer start %s: %w", producerName, err),
+			labelledClose("producer stdout", producerCloseErr),
+			labelledCleanup("consumer", closeErr, waitErr),
+		)
 	}
-	producerErr := producer.Wait()
-	consumerErr := consumer.Wait()
-	if producerErr != nil {
-		return Result{Stdout: consumerStdout.String(), Stderr: producerStderr.String(), ExitCode: exitCode(producer)}, fmt.Errorf("%s exited %d: %s", producerName, exitCode(producer), strings.TrimSpace(producerStderr.String()))
+
+	type pipelineDone struct{ copyErr, waitErr error }
+	producerDone := make(chan pipelineDone, 1)
+	consumerDone := make(chan error, 1)
+	go func() {
+		copyErr := copyPipeline(consumerIn, producerOut, maxInputBytes)
+		if copyErr != nil {
+			cancel()
+		}
+		producerDone <- pipelineDone{copyErr: copyErr, waitErr: producer.Wait()}
+	}()
+	go func() { consumerDone <- consumer.Wait() }()
+
+	var producerResult pipelineDone
+	var producerReceived bool
+	var consumerErr error
+	var consumerReceived bool
+	select {
+	case producerResult = <-producerDone:
+		producerReceived = true
+		if producerResult.copyErr != nil || producerResult.waitErr != nil {
+			cancel()
+		}
+	case consumerErr = <-consumerDone:
+		consumerReceived = true
+		// A consumer that exits before the producer/copy side is done can leave a
+		// producer blocked on a full pipe. Cancellation makes that lifecycle finite.
+		cancel()
+	}
+	if !producerReceived {
+		producerResult = <-producerDone
+	}
+	if !consumerReceived {
+		consumerErr = <-consumerDone
 	}
 	result := Result{Stdout: consumerStdout.String(), Stderr: consumerStderr.String(), ExitCode: exitCode(consumer)}
+	var errs []error
+	if producerResult.copyErr != nil {
+		errs = append(errs, fmt.Errorf("pipeline copy: %w", producerResult.copyErr))
+	}
+	if producerResult.waitErr != nil {
+		errs = append(errs, commandFailure("producer", producerName, producer, producerStderr.String(), producerResult.waitErr))
+	}
 	if consumerErr != nil {
-		return result, fmt.Errorf("%s exited %d: %s", consumerName, result.ExitCode, strings.TrimSpace(result.Stderr))
+		errs = append(errs, commandFailure("consumer", consumerName, consumer, consumerStderr.String(), consumerErr))
+	}
+	if len(errs) > 0 {
+		return result, errors.Join(errs...)
 	}
 	return result, nil
+}
+
+func copyPipeline(dst io.WriteCloser, src io.ReadCloser, maxBytes int64) (result error) {
+	defer func() {
+		result = errors.Join(result, labelledClose("consumer stdin", dst.Close()), labelledClose("producer stdout", src.Close()))
+	}()
+	buf := make([]byte, 32*1024)
+	var copied int64
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if maxBytes > 0 && copied+int64(n) > maxBytes {
+				return ErrPipelineInputLimit
+			}
+			written, writeErr := dst.Write(buf[:n])
+			copied += int64(written)
+			if writeErr != nil {
+				return fmt.Errorf("write consumer stdin: %w", writeErr)
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("read producer stdout: %w", readErr)
+		}
+	}
+}
+
+func labelledClose(name string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("close %s: %w", name, err)
+}
+
+func commandFailure(role, name string, cmd *exec.Cmd, stderr string, err error) error {
+	return fmt.Errorf("%s %s exited %d: %s: %w", role, name, exitCode(cmd), strings.TrimSpace(stderr), err)
+}
+
+func labelledCleanup(role string, closeErr, waitErr error) error {
+	var errs []error
+	if closeErr != nil {
+		errs = append(errs, fmt.Errorf("%s cleanup close: %w", role, closeErr))
+	}
+	if waitErr != nil {
+		errs = append(errs, fmt.Errorf("%s cleanup wait: %w", role, waitErr))
+	}
+	return errors.Join(errs...)
+}
+
+func joinPipelineErrors(primary error, cleanup error) error {
+	if cleanup == nil {
+		return primary
+	}
+	return errors.Join(primary, cleanup)
 }
 
 func exitCode(cmd *exec.Cmd) int {

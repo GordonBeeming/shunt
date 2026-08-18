@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 type repoFixture struct {
@@ -22,6 +24,8 @@ func newRepo(t *testing.T) *repoFixture {
 	r.git("init", "-b", "main")
 	r.git("config", "user.name", "Shunt Test")
 	r.git("config", "user.email", "shunt@example.invalid")
+	r.git("config", "commit.gpgSign", "false")
+	r.git("config", "tag.gpgSign", "false")
 	r.write("base.txt", []byte("base\n"), 0o644)
 	r.git("add", ".")
 	r.git("commit", "-m", "base")
@@ -33,6 +37,7 @@ func (r *repoFixture) git(args ...string) string {
 	r.t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = r.dir
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		r.t.Fatalf("git %v: %v\n%s", args, err, out)
@@ -236,6 +241,26 @@ func TestAnalyzeSubmoduleSquash(t *testing.T) {
 	}
 }
 
+func TestAnalyzeIntegrationHistoryAllowsMergeAndEmptyCommitRowsToBeAbsent(t *testing.T) {
+	r := newRepo(t)
+	r.git("switch", "-c", "topic")
+	r.commit("one", "1\n", "one")
+	r.commit("two", "2\n", "two")
+	r.git("switch", "main")
+	r.git("commit", "--allow-empty", "-m", "empty integration commit")
+	r.git("switch", "-c", "integration-side")
+	r.commit("side", "side\n", "side")
+	r.git("switch", "main")
+	r.git("merge", "--no-ff", "integration-side", "-m", "integration merge")
+	r.git("merge", "--squash", "topic")
+	r.git("commit", "-m", "squash topic")
+	r.integrationRef()
+	got := analyzeRef(r, "refs/heads/topic", "refs/heads/topic", "refs/heads/integration-side")
+	if !got.Preserved || got.Kind != KindSquash {
+		t.Fatalf("result = %+v", got)
+	}
+}
+
 func TestAnalyzeRejectsMergeAndPartialOrMultipleSquashes(t *testing.T) {
 	t.Run("topic merge", func(t *testing.T) {
 		r := newRepo(t)
@@ -289,11 +314,18 @@ func TestAnalyzeRejectsMergeAndPartialOrMultipleSquashes(t *testing.T) {
 type fakeRunner struct {
 	runFn   func(...string) (string, error)
 	patchFn func(...string) (string, error)
+	batchFn func(string) (string, error)
 }
 
 func (f fakeRunner) run(_ context.Context, args ...string) (string, error) { return f.runFn(args...) }
 func (f fakeRunner) patchID(_ context.Context, args ...string) (string, error) {
 	return f.patchFn(args...)
+}
+func (f fakeRunner) patchIDs(_ context.Context, revision string) (string, error) {
+	if f.batchFn == nil {
+		return "", fmt.Errorf("unexpected patchIDs(%s)", revision)
+	}
+	return f.batchFn(revision)
 }
 
 func TestAnalyzeMalformedRefsAndCancellation(t *testing.T) {
@@ -307,7 +339,7 @@ func TestAnalyzeMalformedRefsAndCancellation(t *testing.T) {
 		return "malformed", nil
 	}, patchFn: func(...string) (string, error) { return "", nil }}
 	got := analyze(context.Background(), f, Request{TargetRef: "refs/heads/topic"})
-	if got.Preserved || !strings.Contains(got.Reason, "parse") {
+	if got.Preserved || !strings.Contains(got.Reason, "surviving ref enumeration") {
 		t.Fatalf("result = %+v", got)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -348,6 +380,269 @@ func TestCommitsEnforcesBothScanLimits(t *testing.T) {
 				t.Fatalf("len=%d overflow=%v err=%v", len(list), overflow, err)
 			}
 		})
+	}
+}
+
+func TestHistoryPatchIDsRejectsMalformedMissingAndDuplicateRows(t *testing.T) {
+	commitA := strings.Repeat("a", 40)
+	commitB := strings.Repeat("b", 40)
+	patchA := strings.Repeat("1", 40)
+	patchB := strings.Repeat("2", 40)
+	tests := []struct {
+		name string
+		out  string
+	}{
+		{name: "malformed", out: "not-a-patch-row\n" + patchB + " " + commitB},
+		{name: "duplicate", out: patchA + " " + commitA + "\n" + patchB + " " + commitA},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := fakeRunner{
+				runFn:   func(...string) (string, error) { return "", fmt.Errorf("unexpected run") },
+				patchFn: func(...string) (string, error) { return "", fmt.Errorf("unexpected patch") },
+				batchFn: func(string) (string, error) { return tt.out, nil },
+			}
+			if _, err := historyPatchIDs(context.Background(), f, "range", []string{commitA, commitB}); err == nil {
+				t.Fatal("historyPatchIDs unexpectedly accepted invalid rows")
+			}
+		})
+	}
+	f := fakeRunner{
+		runFn:   func(...string) (string, error) { return "", fmt.Errorf("unexpected run") },
+		patchFn: func(...string) (string, error) { return "", fmt.Errorf("unexpected patch") },
+		batchFn: func(string) (string, error) { return patchA + " " + commitA, nil },
+	}
+	patches, err := historyPatchIDs(context.Background(), f, "range", []string{commitA, commitB})
+	if err != nil || len(patches) != 1 || patches[0].commit != commitA {
+		t.Fatalf("ordered missing row subset = %+v, err=%v", patches, err)
+	}
+}
+
+type countingRunner struct {
+	inner      runner
+	runCalls   int
+	patchCalls int
+	batchCalls int
+	runArgs    [][]string
+}
+
+func (c *countingRunner) run(ctx context.Context, args ...string) (string, error) {
+	c.runCalls++
+	c.runArgs = append(c.runArgs, append([]string(nil), args...))
+	return c.inner.run(ctx, args...)
+}
+func (c *countingRunner) patchID(ctx context.Context, args ...string) (string, error) {
+	c.patchCalls++
+	return c.inner.patchID(ctx, args...)
+}
+func (c *countingRunner) patchIDs(ctx context.Context, revision string) (string, error) {
+	c.batchCalls++
+	return c.inner.patchIDs(ctx, revision)
+}
+
+func TestAnalyzeBatchesPatchProcessesIndependentOfCommitCount(t *testing.T) {
+	r := newRepo(t)
+	r.git("switch", "-c", "topic")
+	for i := 0; i < 24; i++ {
+		r.commit(fmt.Sprintf("file-%02d", i), fmt.Sprintf("value-%02d\n", i), fmt.Sprintf("topic %02d", i))
+	}
+	r.git("switch", "main")
+	r.git("merge", "--squash", "topic")
+	r.git("commit", "-m", "squash")
+	r.integrationRef()
+	c := &countingRunner{inner: gitRunner{repo: r.dir}}
+	got := analyze(context.Background(), c, Request{TargetRef: "refs/heads/topic", DeletionRefs: []string{"refs/heads/topic"}})
+	if !got.Preserved || got.Kind != KindSquash {
+		t.Fatalf("result = %+v", got)
+	}
+	if c.batchCalls != 2 || c.patchCalls != 1 {
+		t.Fatalf("process calls: run=%d batch=%d aggregate=%d", c.runCalls, c.batchCalls, c.patchCalls)
+	}
+	if c.runCalls > 8 {
+		t.Fatalf("git metadata calls grew with commit count: %d", c.runCalls)
+	}
+}
+
+func TestAnalyzerReusesRefAndIntegrationEvidenceAcrossTargets(t *testing.T) {
+	r := newRepo(t)
+	r.git("switch", "-c", "topic-one")
+	r.commit("one", "one\n", "one")
+	r.git("switch", "main")
+	r.git("switch", "-c", "topic-two")
+	r.commit("two", "two\n", "two")
+	r.git("switch", "main")
+	for _, branch := range []string{"topic-one", "topic-two"} {
+		r.git("merge", "--squash", branch)
+		r.git("commit", "-m", "squash "+branch)
+	}
+	r.integrationRef()
+	c := &countingRunner{inner: gitRunner{repo: r.dir}}
+	a := &Analyzer{repo: r.dir, git: c, refs: make(map[string][]refInfo), patches: make(map[string]integrationEvidence)}
+	deleted := []string{"refs/heads/topic-one", "refs/heads/topic-two"}
+	for _, target := range deleted {
+		got := a.analyze(context.Background(), Request{Repo: r.dir, TargetRef: target, DeletionRefs: deleted})
+		if !got.Preserved {
+			t.Fatalf("%s result = %+v", target, got)
+		}
+	}
+	if c.batchCalls != 3 {
+		t.Fatalf("batch calls = %d, want two topic histories plus one cached integration history", c.batchCalls)
+	}
+	enumerations := 0
+	for _, args := range c.runArgs {
+		if len(args) >= 1 && args[0] == "for-each-ref" && !slices.ContainsFunc(args, func(arg string) bool { return strings.HasPrefix(arg, "--contains=") }) {
+			enumerations++
+		}
+	}
+	if enumerations != 1 {
+		t.Fatalf("surviving ref enumerations = %d, want 1", enumerations)
+	}
+}
+
+func TestAnalyzeReportsPatchSizeAndTimeoutDistinctly(t *testing.T) {
+	r := newRepo(t)
+	r.git("switch", "-c", "topic")
+	r.commit("large", strings.Repeat("payload", 2048), "large")
+	r.git("switch", "main")
+	r.integrationRef()
+	got := NewAnalyzer(r.dir, Options{MaxPatchBytes: 64}).Analyze(context.Background(), "refs/heads/topic", []string{"refs/heads/topic"})
+	if got.Preserved || !strings.Contains(got.Reason, "size limit during topic patch analysis") {
+		t.Fatalf("size result = %+v", got)
+	}
+	got = NewAnalyzer(r.dir, Options{Timeout: time.Nanosecond}).Analyze(context.Background(), "refs/heads/topic", []string{"refs/heads/topic"})
+	if got.Preserved || !strings.Contains(got.Reason, "timed out during") {
+		t.Fatalf("timeout result = %+v", got)
+	}
+}
+
+func TestAnalyzeEndToEndHistoryOverflow(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		topicCount       int
+		integrationCount int
+		want             string
+	}{
+		{name: "topic", topicCount: MaxTopicCommits + 1, integrationCount: 1, want: "topic history exceeds scan limit"},
+		{name: "integration", topicCount: 1, integrationCount: MaxIntegrationCommits + 1, want: "integration history exceeds scan limit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			git := scriptedAnalysisRunner(tc.topicCount, tc.integrationCount, "")
+			got := analyze(context.Background(), git, Request{TargetRef: testTargetRef, DeletionRefs: []string{testTargetRef}})
+			if got.Preserved || got.Reason != tc.want {
+				t.Fatalf("result = %+v", got)
+			}
+		})
+	}
+}
+
+func TestAnalyzePerStageFailureMatrix(t *testing.T) {
+	tests := []struct{ failure, want string }{
+		{failure: "target", want: "target resolution"},
+		{failure: "refs", want: "surviving ref enumeration"},
+		{failure: "reachability", want: "reachability inspection"},
+		{failure: "merge-base", want: "merge-base resolution"},
+		{failure: "topic-history", want: "topic history scan"},
+		{failure: "topic-merge", want: "topic merge scan"},
+		{failure: "topic-patch", want: "topic patch analysis"},
+		{failure: "integration-history", want: "integration history scan"},
+		{failure: "integration-patch", want: "integration patch parsing"},
+		{failure: "aggregate", want: "aggregate patch analysis"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.failure, func(t *testing.T) {
+			got := analyze(context.Background(), scriptedAnalysisRunner(1, 1, tt.failure), Request{TargetRef: testTargetRef, DeletionRefs: []string{testTargetRef}})
+			if got.Preserved || !strings.Contains(got.Reason, tt.want) {
+				t.Fatalf("result = %+v, want stage %q", got, tt.want)
+			}
+		})
+	}
+}
+
+const testTargetRef = "refs/heads/topic"
+
+func testOID(n int) string { return fmt.Sprintf("%040x", n) }
+
+func scriptedAnalysisRunner(topicCount, integrationCount int, failure string) fakeRunner {
+	target, main, base := testOID(1), testOID(2), testOID(3)
+	topicCommits := make([]string, topicCount)
+	for i := range topicCommits {
+		topicCommits[i] = testOID(100 + i)
+	}
+	integrationCommits := make([]string, integrationCount)
+	for i := range integrationCommits {
+		integrationCommits[i] = testOID(10000 + i)
+	}
+	failed := func(stage string) (string, error) {
+		if failure == stage {
+			return "", fmt.Errorf("injected %s failure", stage)
+		}
+		return "", nil
+	}
+	return fakeRunner{
+		runFn: func(args ...string) (string, error) {
+			switch args[0] {
+			case "rev-parse":
+				if out, err := failed("target"); err != nil {
+					return out, err
+				}
+				return target, nil
+			case "for-each-ref":
+				if slices.ContainsFunc(args, func(arg string) bool { return strings.HasPrefix(arg, "--contains=") }) {
+					if out, err := failed("reachability"); err != nil {
+						return out, err
+					}
+					return "", nil
+				}
+				if out, err := failed("refs"); err != nil {
+					return out, err
+				}
+				return "refs/remotes/origin/main\x00" + main + "\x00", nil
+			case "merge-base":
+				if out, err := failed("merge-base"); err != nil {
+					return out, err
+				}
+				return base, nil
+			case "rev-list":
+				if slices.Contains(args, "--min-parents=2") {
+					return failed("topic-merge")
+				}
+				if slices.Contains(args, fmt.Sprintf("--max-count=%d", MaxTopicCommits+1)) {
+					if out, err := failed("topic-history"); err != nil {
+						return out, err
+					}
+					return strings.Join(topicCommits, "\n"), nil
+				}
+				if out, err := failed("integration-history"); err != nil {
+					return out, err
+				}
+				return strings.Join(integrationCommits, "\n"), nil
+			}
+			return "", fmt.Errorf("unexpected git command %v", args)
+		},
+		batchFn: func(revision string) (string, error) {
+			commits := integrationCommits
+			patch := testOID(22)
+			stage := "integration-patch"
+			if strings.HasSuffix(revision, target) {
+				commits = topicCommits
+				patch = testOID(11)
+				stage = "topic-patch"
+			}
+			if out, err := failed(stage); err != nil {
+				return out, err
+			}
+			rows := make([]string, len(commits))
+			for i, commit := range commits {
+				rows[i] = patch + " " + commit
+			}
+			return strings.Join(rows, "\n"), nil
+		},
+		patchFn: func(...string) (string, error) {
+			if out, err := failed("aggregate"); err != nil {
+				return out, err
+			}
+			return testOID(33), nil
+		},
 	}
 }
 

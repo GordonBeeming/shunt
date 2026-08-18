@@ -3,12 +3,14 @@ package proc
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type boundedCountingWriter struct {
@@ -154,5 +156,58 @@ func TestRunPipelineInDirReportsProducerFailure(t *testing.T) {
 	_, err := RunPipelineInDir(context.Background(), t.TempDir(), "sh", []string{"-c", "printf evidence >&2; exit 7"}, "sh", []string{"-c", "cat"})
 	if err == nil || !strings.Contains(err.Error(), "exited 7: evidence") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRunPipelineInDirEarlyConsumerExitDoesNotBlockLargeProducer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := RunPipelineInDir(ctx, t.TempDir(), "sh", []string{"-c", "head -c 1048576 /dev/zero"}, "sh", []string{"-c", "exit 9"})
+	if err == nil {
+		t.Fatal("pipeline unexpectedly succeeded")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "producer sh") || !strings.Contains(message, "consumer sh exited 9") {
+		t.Fatalf("unlabelled pipeline error = %v", err)
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("pipeline hung until timeout: %v", err)
+	}
+}
+
+func TestRunPipelineInDirCancellationStopsBothProcesses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := RunPipelineInDir(ctx, t.TempDir(), "sh", []string{"-c", "while :; do printf x; done"}, "sh", []string{"-c", "cat >/dev/null"})
+	if err == nil {
+		t.Fatal("cancelled pipeline unexpectedly succeeded")
+	}
+	if time.Since(started) > 2*time.Second {
+		t.Fatalf("cancellation cleanup took %s", time.Since(started))
+	}
+	if !strings.Contains(err.Error(), "producer") || !strings.Contains(err.Error(), "consumer") {
+		t.Fatalf("missing process diagnostics: %v", err)
+	}
+}
+
+func TestRunPipelineInDirCleansUpConsumerWhenProducerCannotStart(t *testing.T) {
+	started := time.Now()
+	_, err := RunPipelineInDir(context.Background(), t.TempDir(), "shunt-command-that-does-not-exist", nil, "sh", []string{"-c", "while :; do :; done"})
+	if err == nil {
+		t.Fatal("pipeline unexpectedly succeeded")
+	}
+	if time.Since(started) > 2*time.Second {
+		t.Fatalf("startup cleanup took %s", time.Since(started))
+	}
+	if !strings.Contains(err.Error(), "producer start") || !strings.Contains(err.Error(), "consumer cleanup wait") {
+		t.Fatalf("startup error omitted cleanup diagnostics: %v", err)
+	}
+}
+
+func TestRunPipelineInDirLimitedStopsOversizedProducer(t *testing.T) {
+	_, err := RunPipelineInDirLimited(context.Background(), t.TempDir(), 1024, "sh", []string{"-c", "head -c 1048576 /dev/zero"}, "sh", []string{"-c", "cat >/dev/null"})
+	if !errors.Is(err, ErrPipelineInputLimit) {
+		t.Fatalf("error = %v, want ErrPipelineInputLimit", err)
 	}
 }
