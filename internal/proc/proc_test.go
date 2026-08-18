@@ -139,3 +139,20 @@ func TestRunStreamingHonorsCancelledContext(t *testing.T) {
 		t.Fatal("RunStreaming() unexpectedly succeeded")
 	}
 }
+
+func TestRunPipelineInDirStreamsProducerIntoConsumer(t *testing.T) {
+	result, err := RunPipelineInDir(context.Background(), t.TempDir(), "sh", []string{"-c", "printf 'patch bytes'"}, "sh", []string{"-c", "tr '[:lower:]' '[:upper:]'"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Stdout != "PATCH BYTES" {
+		t.Fatalf("stdout = %q", result.Stdout)
+	}
+}
+
+func TestRunPipelineInDirReportsProducerFailure(t *testing.T) {
+	_, err := RunPipelineInDir(context.Background(), t.TempDir(), "sh", []string{"-c", "printf evidence >&2; exit 7"}, "sh", []string{"-c", "cat"})
+	if err == nil || !strings.Contains(err.Error(), "exited 7: evidence") {
+		t.Fatalf("error = %v", err)
+	}
+}
