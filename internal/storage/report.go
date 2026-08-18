@@ -43,7 +43,8 @@ type ProjectReport struct {
 type GitArchiveEvidence struct {
 	Observation  string `json:"observation"`
 	RecoveryRefs int    `json:"recoveryRefs"`
-	WitnessRefs  int    `json:"witnessRefs"`
+	ArchiveRef   string `json:"archiveRef,omitempty"`
+	ArchiveTip   string `json:"archiveTip,omitempty"`
 	Detail       string `json:"detail,omitempty"`
 }
 
@@ -220,8 +221,11 @@ func collectGitArchives(ctx context.Context, repo string) GitArchiveEvidence {
 		if strings.HasPrefix(ref, "refs/shunt/recovery/") {
 			evidence.RecoveryRefs++
 		}
-		if strings.HasPrefix(ref, "refs/shunt/witness/") {
-			evidence.WitnessRefs++
+		if ref == "refs/shunt/witness/archive" {
+			evidence.ArchiveRef = ref
+			if tip, tipErr := proc.Run(ctx, "git", "-C", repo, "rev-parse", "--verify", ref+"^{commit}"); tipErr == nil {
+				evidence.ArchiveTip = strings.TrimSpace(tip.Stdout)
+			}
 		}
 	}
 	return evidence

@@ -51,7 +51,7 @@ func TestAppleContainerCachedLocalImageLoadUsesObservedGuestIdentity(t *testing.
 	guest := fmt.Sprintf("shunt-observed-identity-%d", time.Now().UnixNano())
 	sd := state.Siding{Name: "identity", Container: guest}
 	if err := container.Run(ctx, container.RunOpts{
-		Name: guest, Image: image.Tag(), Init: true, CapAddAll: true,
+		Name: guest, Image: image.Tag(), Init: true, CapAddAll: true, WritableProcSys: true,
 		Cmd: []string{"sleep", "600"},
 	}); err != nil {
 		t.Fatal(err)

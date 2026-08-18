@@ -56,42 +56,109 @@ func EnsureRemovalRecoveryRefs(ctx context.Context, repoPath, operationID string
 	return refs, nil
 }
 
-func EnsureRemovalWitnessRefs(ctx context.Context, repoPath string, targets []state.RemovalTarget) ([]string, error) {
-	byCommit := map[string]bool{}
+func EnsureRemovalWitnessArchive(ctx context.Context, repoPath string, targets []state.RemovalTarget) (string, string, error) {
+	set := map[string]bool{}
 	for _, target := range targets {
 		if target.Preserved && target.MatchingCommit != "" {
-			byCommit[target.MatchingCommit] = true
+			set[target.MatchingCommit] = true
 		}
 	}
-	commits := make([]string, 0, len(byCommit))
-	for oid := range byCommit {
+	if len(set) == 0 {
+		return "", "", nil
+	}
+	commits := make([]string, 0, len(set))
+	for oid := range set {
 		commits = append(commits, oid)
 	}
 	sort.Strings(commits)
-	refs := make([]string, 0, len(commits))
-	for _, oid := range commits {
-		ref := "refs/shunt/witness/" + oid
-		if _, err := proc.Run(ctx, "git", "-C", repoPath, "update-ref", ref, oid); err != nil {
-			return nil, fmt.Errorf("create preservation witness %q: %w", ref, err)
-		}
-		refs = append(refs, ref)
+	const ref = "refs/shunt/witness/archive"
+	old := ""
+	if result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", ref+"^{commit}"); err == nil {
+		old = strings.TrimSpace(result.Stdout)
 	}
-	return refs, nil
+	tree, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", commits[0]+"^{tree}")
+	if err != nil {
+		return "", "", err
+	}
+	args := []string{"-C", repoPath, "-c", "user.name=Shunt", "-c", "user.email=shunt@localhost", "commit-tree", strings.TrimSpace(tree.Stdout), "-m", "shunt preservation witness archive"}
+	if old != "" {
+		args = append(args, "-p", old)
+	}
+	for _, oid := range commits {
+		if oid != old {
+			args = append(args, "-p", oid)
+		}
+	}
+	created, err := proc.Run(ctx, "git", args...)
+	if err != nil {
+		return "", "", err
+	}
+	oid := strings.TrimSpace(created.Stdout)
+	update := []string{"-C", repoPath, "update-ref", ref, oid}
+	if old != "" {
+		update = append(update, old)
+	}
+	if _, err := proc.Run(ctx, "git", update...); err != nil {
+		return "", "", err
+	}
+	return ref, oid, nil
 }
 
-func GCOrphanRecoveryRefs(ctx context.Context, repoPath, activeOperationID string) error {
-	result, err := proc.Run(ctx, "git", "-C", repoPath, "for-each-ref", "--format=%(refname)", "refs/shunt/recovery")
+func CompleteRemovalRecoveryHandoff(ctx context.Context, repoPath, archiveRef, archiveOID string, targets []state.RemovalTarget, recoveryRefs []string) error {
+	expected := map[string]int{}
+	for _, target := range targets {
+		if target.ExpectedOID != "" {
+			expected[target.ExpectedOID]++
+		}
+	}
+	seen := map[string]int{}
+	lines := []string{"start"}
+	present := 0
+	for _, ref := range recoveryRefs {
+		result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", ref+"^{commit}")
+		if err != nil {
+			continue
+		}
+		oid := strings.TrimSpace(result.Stdout)
+		seen[oid]++
+		present++
+		lines = append(lines, "delete "+ref+" "+oid)
+	}
+	if present == 0 {
+		if archiveRef == "" {
+			return nil
+		}
+		result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", archiveRef+"^{commit}")
+		if err != nil || strings.TrimSpace(result.Stdout) != archiveOID {
+			return fmt.Errorf("recovery handoff archive moved or disappeared")
+		}
+		return nil
+	}
+	if present != len(recoveryRefs) {
+		return fmt.Errorf("recovery refs are in a mixed present/absent state")
+	}
+	if !maps.Equal(expected, seen) {
+		return fmt.Errorf("recovery refs do not retain exact target OIDs")
+	}
+	if archiveRef != "" {
+		lines = append(lines, "verify "+archiveRef+" "+archiveOID)
+	}
+	lines = append(lines, "prepare", "commit")
+	tmp, err := os.CreateTemp("", "shunt-handoff-*.stdin")
 	if err != nil {
 		return err
 	}
-	keep := "refs/shunt/recovery/" + safeOperationID(activeOperationID) + "/"
-	for _, ref := range strings.Fields(result.Stdout) {
-		if strings.HasPrefix(ref, keep) {
-			continue
-		}
-		if _, err := proc.Run(ctx, "git", "-C", repoPath, "update-ref", "-d", ref); err != nil {
-			return err
-		}
+	path := tmp.Name()
+	defer os.Remove(path)
+	if _, err := tmp.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := proc.RunStdin(ctx, path, "git", "-C", repoPath, "update-ref", "--stdin"); err != nil {
+		return fmt.Errorf("complete recovery handoff: %w", err)
 	}
 	return nil
 }

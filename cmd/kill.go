@@ -739,9 +739,6 @@ func ensureRemovalRecoveryRefs(ctx context.Context, app *state.App, operations r
 		return fmt.Errorf("removal %q lost siding state before recovery refs", journal.ID)
 	}
 	owner := state.WorktreeOwner(*app, sd)
-	if err := fsclone.GCOrphanRecoveryRefs(ctx, owner, journal.ID); err != nil {
-		return fmt.Errorf("collect orphan recovery refs: %w", err)
-	}
 	if err := fsclone.ValidateRemovalTargets(ctx, owner, journal.Targets); err != nil {
 		return err
 	}
@@ -749,7 +746,7 @@ func ensureRemovalRecoveryRefs(ctx context.Context, app *state.App, operations r
 	if err != nil {
 		return err
 	}
-	witnesses, err := fsclone.EnsureRemovalWitnessRefs(ctx, owner, journal.Targets)
+	archiveRef, archiveOID, err := fsclone.EnsureRemovalWitnessArchive(ctx, owner, journal.Targets)
 	if err != nil {
 		_ = fsclone.RemoveRecoveryRefs(context.WithoutCancel(ctx), owner, refs)
 		return err
@@ -760,7 +757,8 @@ func ensureRemovalRecoveryRefs(ctx context.Context, app *state.App, operations r
 		}
 		current.Removal.RecoveryRefs = append([]string(nil), refs...)
 		current.Removal.RecoveryRepo = owner
-		current.Removal.WitnessRefs = append([]string(nil), witnesses...)
+		current.Removal.ArchiveRef = archiveRef
+		current.Removal.ArchiveOID = archiveOID
 		return nil
 	})
 	if err != nil {
@@ -1023,6 +1021,7 @@ func removeWorktreeStage(ctx context.Context, app *state.App, operations removal
 	}
 	fmt.Println("• removing the worktree…")
 	owner := state.WorktreeOwner(*app, sd)
+	targetsAlreadyAbsent := false
 	if len(journal.Targets) > 0 {
 		allAbsent, absentErr := fsclone.RemovalTargetsAbsent(ctx, owner, journal.Targets)
 		if absentErr != nil {
@@ -1032,13 +1031,15 @@ func removeWorktreeStage(ctx context.Context, app *state.App, operations removal
 			if err := fsclone.ValidateRecoveryRefs(ctx, owner, journal.RecoveryRefs); err != nil {
 				return err
 			}
-			if _, err := os.Lstat(sourceRoot); !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("targets are retired but worktree bytes still exist at %q", sourceRoot)
+			if _, err := os.Lstat(sourceRoot); errors.Is(err, os.ErrNotExist) {
+				return checkpointRemoval(ctx, app, operations, state.RemovalGuestRemoved, state.RemovalWorktreeRemoved, nil)
 			}
-			return checkpointRemoval(ctx, app, operations, state.RemovalGuestRemoved, state.RemovalWorktreeRemoved, nil)
+			targetsAlreadyAbsent = true
 		}
-		if err := fsclone.ValidateRemovalTargets(ctx, owner, journal.Targets); err != nil {
-			return err
+		if !targetsAlreadyAbsent {
+			if err := fsclone.ValidateRemovalTargets(ctx, owner, journal.Targets); err != nil {
+				return err
+			}
 		}
 		if err := fsclone.ValidateRecoveryRefs(ctx, owner, journal.RecoveryRefs); err != nil {
 			return err
@@ -1091,7 +1092,7 @@ func removeWorktreeStage(ctx context.Context, app *state.App, operations removal
 			}
 		}
 	}
-	if len(journal.Targets) > 0 {
+	if len(journal.Targets) > 0 && !targetsAlreadyAbsent {
 		if err := fsclone.RetireRemovalTargetRefs(ctx, owner, journal.Targets, journal.RecoveryRefs); err != nil {
 			return err
 		}
@@ -1182,6 +1183,9 @@ func clearRemovalJournal(ctx context.Context, app *state.App, operations removal
 	if err != nil {
 		return err
 	}
+	if err := fsclone.CompleteRemovalRecoveryHandoff(ctx, journal.RecoveryRepo, journal.ArchiveRef, journal.ArchiveOID, journal.Targets, journal.RecoveryRefs); err != nil {
+		return err
+	}
 	updated, err := operations.updateApp(ctx, app.ConfigDir, func(current *state.App) error {
 		if current.Removal == nil || current.Removal.ID != journal.ID || current.Removal.Stage != state.RemovalOperationForgotten {
 			return fmt.Errorf("removal journal changed before completion")
@@ -1191,9 +1195,6 @@ func clearRemovalJournal(ctx context.Context, app *state.App, operations removal
 	})
 	if err == nil {
 		*app = updated
-		if cleanupErr := fsclone.RemoveRecoveryRefs(context.WithoutCancel(ctx), journal.RecoveryRepo, journal.RecoveryRefs); cleanupErr != nil {
-			fmt.Printf("warning: removal completed but recovery-ref cleanup failed: %v\n", cleanupErr)
-		}
 		return nil
 	}
 	var committed *state.CommittedDurabilityError
