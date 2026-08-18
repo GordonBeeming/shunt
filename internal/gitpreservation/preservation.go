@@ -4,9 +4,12 @@ package gitpreservation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
 )
@@ -14,6 +17,8 @@ import (
 const (
 	MaxTopicCommits       = 512
 	MaxIntegrationCommits = 4096
+	DefaultMaxPatchBytes  = 256 << 20
+	DefaultTimeout        = 30 * time.Second
 )
 
 type Kind string
@@ -42,9 +47,13 @@ type Result struct {
 type runner interface {
 	run(context.Context, ...string) (string, error)
 	patchID(context.Context, ...string) (string, error)
+	patchIDs(context.Context, string) (string, error)
 }
 
-type gitRunner struct{ repo string }
+type gitRunner struct {
+	repo          string
+	maxPatchBytes int64
+}
 
 func (g gitRunner) run(ctx context.Context, args ...string) (string, error) {
 	r, err := proc.RunInDir(ctx, g.repo, "git", args...)
@@ -53,7 +62,7 @@ func (g gitRunner) run(ctx context.Context, args ...string) (string, error) {
 
 func (g gitRunner) patchID(ctx context.Context, diffArgs ...string) (string, error) {
 	args := append([]string{"diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-renames"}, diffArgs...)
-	r, err := proc.RunPipelineInDir(ctx, g.repo, "git", args, "git", []string{"patch-id", "--verbatim"})
+	r, err := proc.RunPipelineInDirLimited(ctx, g.repo, g.maxPatchBytes, "git", args, "git", []string{"patch-id", "--verbatim"})
 	if err != nil {
 		return "", err
 	}
@@ -61,26 +70,82 @@ func (g gitRunner) patchID(ctx context.Context, diffArgs ...string) (string, err
 	if len(fields) == 0 {
 		return "", nil
 	}
-	if len(fields) != 2 || len(fields[0]) != 40 {
+	if len(fields) != 2 || !objectID(fields[0]) || !objectID(fields[1]) {
 		return "", fmt.Errorf("malformed git patch-id output")
 	}
 	return fields[0], nil
+}
+
+func (g gitRunner) patchIDs(ctx context.Context, revision string) (string, error) {
+	args := []string{"log", "--reverse", "--topo-order", "--format=commit %H", "-p", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-renames", revision}
+	r, err := proc.RunPipelineInDirLimited(ctx, g.repo, g.maxPatchBytes, "git", args, "git", []string{"patch-id", "--verbatim"})
+	if err != nil {
+		return "", err
+	}
+	return r.Stdout, nil
+}
+
+type Options struct {
+	MaxPatchBytes int64
+	Timeout       time.Duration
+}
+
+// Analyzer caches integration evidence for a single command invocation. It is
+// safe for concurrent use; callers should create a fresh Analyzer after refs
+// may have changed.
+type Analyzer struct {
+	repo    string
+	options Options
+	git     runner
+	mu      sync.Mutex
+	refs    map[string][]refInfo
+	patches map[string]integrationEvidence
+}
+
+func NewAnalyzer(repo string, options Options) *Analyzer {
+	if options.MaxPatchBytes <= 0 {
+		options.MaxPatchBytes = DefaultMaxPatchBytes
+	}
+	if options.Timeout <= 0 {
+		options.Timeout = DefaultTimeout
+	}
+	return &Analyzer{
+		repo: repo, options: options,
+		git:     gitRunner{repo: repo, maxPatchBytes: options.MaxPatchBytes},
+		refs:    make(map[string][]refInfo),
+		patches: make(map[string]integrationEvidence),
+	}
 }
 
 func Analyze(ctx context.Context, req Request) Result {
 	if strings.TrimSpace(req.Repo) == "" || strings.TrimSpace(req.TargetRef) == "" {
 		return unproven("repository and target ref are required")
 	}
-	return analyze(ctx, gitRunner{repo: req.Repo}, req)
+	return NewAnalyzer(req.Repo, Options{}).Analyze(ctx, req.TargetRef, req.DeletionRefs)
+}
+
+func (a *Analyzer) Analyze(ctx context.Context, targetRef string, deletionRefs []string) Result {
+	if strings.TrimSpace(a.repo) == "" || strings.TrimSpace(targetRef) == "" {
+		return unproven("repository and target ref are required")
+	}
+	ctx, cancel := context.WithTimeout(ctx, a.options.Timeout)
+	defer cancel()
+	return a.analyze(ctx, Request{Repo: a.repo, TargetRef: targetRef, DeletionRefs: deletionRefs})
 }
 
 func analyze(ctx context.Context, git runner, req Request) Result {
+	a := &Analyzer{repo: req.Repo, git: git, refs: make(map[string][]refInfo), patches: make(map[string]integrationEvidence)}
+	return a.analyze(ctx, req)
+}
+
+func (a *Analyzer) analyze(ctx context.Context, req Request) Result {
+	git := a.git
 	if err := ctx.Err(); err != nil {
-		return unproven("analysis cancelled")
+		return stageFailure(ctx, "start", err)
 	}
 	target, err := oneLine(git.run(ctx, "rev-parse", "--verify", req.TargetRef+"^{commit}"))
 	if err != nil || target == "" {
-		return unproven("target ref is missing or is not a commit")
+		return stageFailure(ctx, "target resolution", err)
 	}
 	deleted := make(map[string]bool, len(req.DeletionRefs))
 	for _, ref := range req.DeletionRefs {
@@ -88,21 +153,17 @@ func analyze(ctx context.Context, git runner, req Request) Result {
 	}
 	deleted[req.TargetRef] = true
 
-	refsOut, err := git.run(ctx, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", "refs/heads", "refs/remotes", "refs/tags")
+	refs, err := a.survivingRefs(ctx, deleted)
 	if err != nil {
-		return unproven("could not enumerate surviving refs")
-	}
-	refs, err := parseRefs(refsOut, deleted)
-	if err != nil {
-		return unproven("could not parse surviving refs")
+		return stageFailure(ctx, "surviving ref enumeration", err)
 	}
 	containingOut, err := git.run(ctx, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", "--contains="+target, "refs/heads", "refs/remotes", "refs/tags")
 	if err != nil {
-		return unproven("could not inspect ref reachability")
+		return stageFailure(ctx, "reachability inspection", err)
 	}
 	containing, err := parseRefs(containingOut, deleted)
 	if err != nil {
-		return unproven("could not parse reachable refs")
+		return stageFailure(ctx, "reachable ref parsing", err)
 	}
 	if len(containing) > 0 {
 		ref := containing[0]
@@ -115,57 +176,97 @@ func analyze(ctx context.Context, git runner, req Request) Result {
 	}
 	base, err := oneLine(git.run(ctx, "merge-base", target, integrationCommit))
 	if err != nil || base == "" {
-		return unproven("target and integration ref have no merge base")
+		return stageFailure(ctx, "merge-base resolution", err)
 	}
 	topic, overflow, err := commits(git, ctx, MaxTopicCommits, base+".."+target)
 	if err != nil || overflow {
 		if overflow {
 			return unproven("topic history exceeds scan limit")
 		}
-		return unproven("could not inspect topic history")
+		return stageFailure(ctx, "topic history scan", err)
 	}
 	if len(topic) == 0 {
 		return unproven("topic history contains no unique commits")
 	}
-	for _, commit := range topic {
-		parents, err := fields(git.run(ctx, "rev-list", "--parents", "-n", "1", commit))
-		if err != nil || len(parents) != 2 {
-			return unproven("topic history contains a merge or malformed commit")
-		}
+	merges, err := git.run(ctx, "rev-list", "--max-count=1", "--min-parents=2", base+".."+target)
+	if err != nil {
+		return stageFailure(ctx, "topic merge scan", err)
 	}
-	integrationCommits, overflow, err := commits(git, ctx, MaxIntegrationCommits, base+".."+integrationCommit)
-	if err != nil || overflow {
-		if overflow {
-			return unproven("integration history exceeds scan limit")
-		}
-		return unproven("could not inspect integration history")
+	if strings.TrimSpace(merges) != "" {
+		return unproven("topic history contains a merge or malformed commit")
 	}
 
-	match, matchCommit, err := equivalentCommits(ctx, git, topic, integrationCommits)
+	topicPatches, err := historyPatchIDs(ctx, git, base+".."+target, topic)
 	if err != nil {
-		return unproven("could not compare commit patches")
+		return stageFailure(ctx, "topic patch analysis", err)
 	}
+	if len(topicPatches) == 0 {
+		return unproven("topic history contains no comparable patches")
+	}
+	integrationPatches, err := a.integrationPatches(ctx, base, integrationCommit)
+	if err != nil {
+		if errors.Is(err, errIntegrationOverflow) {
+			return unproven("integration history exceeds scan limit")
+		}
+		var staged stageError
+		if errors.As(err, &staged) {
+			return stageFailure(ctx, staged.stage, staged.err)
+		}
+		return stageFailure(ctx, "integration patch analysis", err)
+	}
+	match, matchCommit := equivalentCommits(topicPatches, integrationPatches)
 	if match {
 		return Result{Preserved: true, Kind: KindEquivalent, MatchingRef: integrationRef, MatchingCommit: matchCommit, Reason: "every topic commit has an equivalent patch on " + integrationRef}
 	}
 
 	aggregate, err := git.patchID(ctx, base, target)
-	if err != nil || aggregate == "" {
+	if err != nil {
+		return stageFailure(ctx, "aggregate patch analysis", err)
+	}
+	if aggregate == "" {
 		return unproven("topic has no comparable aggregate patch")
 	}
-	for _, commit := range integrationCommits {
-		id, err := git.patchID(ctx, commit+"^", commit)
-		if err != nil {
-			return unproven("could not compare squash patches")
-		}
-		if id == aggregate {
-			return Result{Preserved: true, Kind: KindSquash, MatchingRef: integrationRef, MatchingCommit: commit, Reason: "aggregate topic patch matches squash commit " + commit + " on " + integrationRef}
+	for _, patch := range integrationPatches {
+		if patch.id == aggregate {
+			return Result{Preserved: true, Kind: KindSquash, MatchingRef: integrationRef, MatchingCommit: patch.commit, Reason: "aggregate topic patch matches squash commit " + patch.commit + " on " + integrationRef}
 		}
 	}
 	return unproven("committed work is not proven on a surviving ref")
 }
 
 type refInfo struct{ name, oid string }
+
+func deletionKey(deleted map[string]bool) string {
+	refs := make([]string, 0, len(deleted))
+	for ref := range deleted {
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	return strings.Join(refs, "\x00")
+}
+
+func (a *Analyzer) survivingRefs(ctx context.Context, deleted map[string]bool) ([]refInfo, error) {
+	key := deletionKey(deleted)
+	a.mu.Lock()
+	if refs, ok := a.refs[key]; ok {
+		copyOfRefs := append([]refInfo(nil), refs...)
+		a.mu.Unlock()
+		return copyOfRefs, nil
+	}
+	a.mu.Unlock()
+	out, err := a.git.run(ctx, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", "refs/heads", "refs/remotes", "refs/tags")
+	if err != nil {
+		return nil, err
+	}
+	refs, err := parseRefs(out, deleted)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	a.refs[key] = append([]refInfo(nil), refs...)
+	a.mu.Unlock()
+	return refs, nil
+}
 
 func parseRefs(out string, deleted map[string]bool) ([]refInfo, error) {
 	var refs []refInfo
@@ -206,31 +307,107 @@ func commits(git runner, ctx context.Context, limit int, revision string) ([]str
 	return list, len(list) > limit, nil
 }
 
-func equivalentCommits(ctx context.Context, git runner, topic, integration []string) (bool, string, error) {
-	topicIDs := make([]string, 0, len(topic))
-	for _, commit := range topic {
-		id, err := git.patchID(ctx, commit+"^", commit)
-		if err != nil {
-			return false, "", err
-		}
-		if id == "" {
-			return false, "", nil
-		}
-		topicIDs = append(topicIDs, id)
+type commitPatch struct{ commit, id string }
+
+var errIntegrationOverflow = errors.New("integration history exceeds scan limit")
+
+type integrationEvidence struct {
+	patches []commitPatch
+}
+
+type stageError struct {
+	stage string
+	err   error
+}
+
+func (e stageError) Error() string { return e.stage + ": " + e.err.Error() }
+func (e stageError) Unwrap() error { return e.err }
+
+func (a *Analyzer) integrationPatches(ctx context.Context, base, integrationCommit string) ([]commitPatch, error) {
+	key := base + "\x00" + integrationCommit
+	a.mu.Lock()
+	if evidence, ok := a.patches[key]; ok {
+		patches := append([]commitPatch(nil), evidence.patches...)
+		a.mu.Unlock()
+		return patches, nil
 	}
+	a.mu.Unlock()
+	revision := base + ".." + integrationCommit
+	commits, overflow, err := commits(a.git, ctx, MaxIntegrationCommits, revision)
+	if err != nil {
+		return nil, stageError{stage: "integration history scan", err: err}
+	}
+	if overflow {
+		return nil, errIntegrationOverflow
+	}
+	patches, err := historyPatchIDs(ctx, a.git, revision, commits)
+	if err != nil {
+		return nil, stageError{stage: "integration patch parsing", err: err}
+	}
+	a.mu.Lock()
+	a.patches[key] = integrationEvidence{patches: append([]commitPatch(nil), patches...)}
+	a.mu.Unlock()
+	return patches, nil
+}
+
+func historyPatchIDs(ctx context.Context, git runner, revision string, commits []string) ([]commitPatch, error) {
+	out, err := git.patchIDs(ctx, revision)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		lines = nil
+	}
+	if len(lines) > len(commits) {
+		return nil, fmt.Errorf("patch row count %d exceeds commit count %d", len(lines), len(commits))
+	}
+	seen := make(map[string]bool, len(lines))
+	patches := make([]commitPatch, 0, len(lines))
+	nextCommit := 0
+	for _, line := range lines {
+		parts := strings.Fields(line)
+		if len(parts) != 2 || !objectID(parts[0]) || !objectID(parts[1]) {
+			return nil, fmt.Errorf("malformed patch-id row")
+		}
+		if seen[parts[1]] {
+			return nil, fmt.Errorf("duplicate patch-id commit row")
+		}
+		for nextCommit < len(commits) && commits[nextCommit] != parts[1] {
+			nextCommit++
+		}
+		if nextCommit == len(commits) {
+			return nil, fmt.Errorf("unexpected patch-id commit row")
+		}
+		nextCommit++
+		seen[parts[1]] = true
+		patches = append(patches, commitPatch{commit: parts[1], id: parts[0]})
+	}
+	return patches, nil
+}
+
+func objectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, c := range value {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func equivalentCommits(topic, integration []commitPatch) (bool, string) {
 	next := 0
 	last := ""
-	for _, commit := range integration {
-		id, err := git.patchID(ctx, commit+"^", commit)
-		if err != nil {
-			return false, "", err
-		}
-		if next < len(topicIDs) && id == topicIDs[next] {
+	for _, patch := range integration {
+		if next < len(topic) && patch.id == topic[next].id {
 			next++
-			last = commit
+			last = patch.commit
 		}
 	}
-	return next == len(topicIDs), last, nil
+	return next == len(topic), last
 }
 
 func oneLine(out string, err error) (string, error) {
@@ -244,11 +421,20 @@ func oneLine(out string, err error) (string, error) {
 	return lines[0], nil
 }
 
-func fields(out string, err error) ([]string, error) {
-	if err != nil {
-		return nil, err
+func stageFailure(ctx context.Context, stage string, err error) Result {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return unproven("analysis timed out during " + stage)
 	}
-	return strings.Fields(out), nil
+	if errors.Is(err, proc.ErrPipelineInputLimit) {
+		return unproven("patch data exceeds size limit during " + stage)
+	}
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return unproven("analysis cancelled during " + stage)
+	}
+	if err == nil {
+		return unproven("no valid result during " + stage)
+	}
+	return unproven("git failure during " + stage)
 }
 
 func unproven(reason string) Result { return Result{Kind: KindUnproven, Reason: reason} }
