@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -115,6 +116,61 @@ func TestInspectErrorNamesOnlyRequestedAbsentGuest(t *testing.T) {
 		if inspectErrorNamesAbsentGuest(errors.New(message), "target") {
 			t.Fatalf("unrelated or ambiguous error %q proved target absence", message)
 		}
+	}
+}
+
+func TestInspectClassifiesAbsenceFromRawStderr(t *testing.T) {
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, Bin), []byte(`#!/bin/sh
+printf '%s\n' 'Error: container not found: target' >&2
+exit 1
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := inspect(context.Background(), "target")
+	var absent *guestNotFoundError
+	if !errors.As(err, &absent) || absent.name != "target" {
+		t.Fatalf("inspect() = %v, want typed absence for target", err)
+	}
+	if got := ObserveGuest(context.Background(), "target").State; got != GuestAbsent {
+		t.Fatalf("ObserveGuest() = %q, want %q", got, GuestAbsent)
+	}
+}
+
+func TestRunArgsDefaultAndWritableProcSysCapability(t *testing.T) {
+	base := RunOpts{
+		Name: "guest", Image: "image:latest", Init: true, CapAddAll: true,
+		Mounts: []Mount{{Host: "/host", Guest: "/guest", ReadOnly: true}},
+		Env:    map[string]string{"Z_LAST": "z", "A_FIRST": "a"},
+		Memory: "6g", CPUs: "4", Rosetta: true, Cmd: []string{"sleep", "infinity"},
+	}
+	wantDefault := []string{
+		"run", "-d", "--name", "guest", "--init", "--cap-add", "ALL",
+		"-m", "6g", "-c", "4", "--rosetta",
+		"-v", "/host:/guest:ro", "-e", "A_FIRST=a", "-e", "Z_LAST=z",
+		"image:latest", "sleep", "infinity",
+	}
+	if got := runArgs(base); !reflect.DeepEqual(got, wantDefault) {
+		t.Fatalf("runArgs(default) = %#v, want %#v", got, wantDefault)
+	}
+
+	privileged := base
+	privileged.WritableProcSys = true
+	wantPrivileged := []string{
+		"run", "-d", "--name", "guest", "--init", "--cap-add", "ALL",
+		"--read-only-path", "NONE",
+		"--read-only-path", "/proc/bus",
+		"--read-only-path", "/proc/fs",
+		"--read-only-path", "/proc/irq",
+		"--read-only-path", "/proc/sysrq-trigger",
+		"-m", "6g", "-c", "4", "--rosetta",
+		"-v", "/host:/guest:ro", "-e", "A_FIRST=a", "-e", "Z_LAST=z",
+		"image:latest", "sleep", "infinity",
+	}
+	if got := runArgs(privileged); !reflect.DeepEqual(got, wantPrivileged) {
+		t.Fatalf("runArgs(writable proc sys) = %#v, want %#v", got, wantPrivileged)
 	}
 }
 
