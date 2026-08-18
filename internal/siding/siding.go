@@ -1783,16 +1783,17 @@ func recreate(ctx context.Context, app state.App, sd state.Siding, freshData boo
 		}
 	}
 	if err := runGuest(ctx, container.RunOpts{
-		Name:      sd.Container,
-		Image:     image.Tag(),
-		Init:      true,
-		CapAddAll: true,
-		Memory:    orDefaultStr(app.Memory, config.GuestMemory()),
-		CPUs:      orDefaultStr(app.CPUs, config.GuestCPUs()),
-		Rosetta:   true,
-		Mounts:    mounts,
-		Env:       guestEnv(app),
-		Cmd:       []string{"/bin/sh", "-lc", "exec sleep infinity"},
+		Name:            sd.Container,
+		Image:           image.Tag(),
+		Init:            true,
+		CapAddAll:       true,
+		Memory:          orDefaultStr(app.Memory, config.GuestMemory()),
+		CPUs:            orDefaultStr(app.CPUs, config.GuestCPUs()),
+		Rosetta:         true,
+		WritableProcSys: true,
+		Mounts:          mounts,
+		Env:             guestEnv(app),
+		Cmd:             []string{"/bin/sh", "-lc", "exec sleep infinity"},
 	}); err != nil {
 		return sd, err
 	}

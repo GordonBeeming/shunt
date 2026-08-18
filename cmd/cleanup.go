@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/gordonbeeming/shunt/internal/gitpreservation"
 	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
@@ -19,10 +20,13 @@ import (
 )
 
 type cleanupCandidate struct {
-	Name   string
-	Status string
-	Dirty  bool
+	Name             string
+	Status           string
+	Dirty            bool
+	ProtectionReason string
 }
+
+type protectedSiding struct{ Name, Reason string }
 
 func newCleanupCmd() *cobra.Command {
 	var force bool
@@ -64,20 +68,24 @@ func newCleanupCmd() *cobra.Command {
 			}
 			var safety map[string]*removalSafety
 			if !force {
+				deletionRefs, err := resolveSelectedRemovalRefs(ctx, app, selected)
+				if err != nil {
+					return err
+				}
 				safety = make(map[string]*removalSafety, len(selected))
 				for _, name := range selected {
-					snapshot, err := captureRemovalSafety(ctx, app, name, selected)
+					snapshot, err := captureRemovalSafety(ctx, app, name, deletionRefs)
 					if err != nil {
 						return err
 					}
 					safety[name] = &snapshot
 				}
-				dirty, err := dirtySelectedSidings(ctx, app, selected)
+				dirty, err := protectedSelectedSidings(ctx, app, selected, safety)
 				if err != nil {
 					return err
 				}
 				if len(dirty) > 0 {
-					confirmed, err := confirmDirtyCleanup(dirty, in, os.Stdout)
+					confirmed, err := confirmProtectedCleanup(dirty, in, os.Stdout)
 					if err != nil {
 						return err
 					}
@@ -85,12 +93,13 @@ func newCleanupCmd() *cobra.Command {
 						fmt.Println("cleanup cancelled")
 						return nil
 					}
+					for _, item := range dirty {
+						if snapshot := safety[item.Name]; snapshot != nil {
+							snapshot.ExplicitDiscard = true
+						}
+					}
 				}
 			}
-			if err := ensureBaseSelected(ctx, &app); err != nil {
-				return err
-			}
-
 			removedBase := app.BaseSiding
 			successor, err := prepareBaseRemoval(app, selected, nextBase, in)
 			if err != nil {
@@ -118,6 +127,39 @@ func newCleanupCmd() *cobra.Command {
 	return c
 }
 
+func resolveSelectedRemovalRefs(ctx context.Context, app state.App, selected []string) ([]string, error) {
+	refs := map[string]bool{}
+	selectedSet := map[string]bool{}
+	for _, name := range selected {
+		selectedSet[name] = true
+		if sd, ok := app.Sidings[name]; ok && sd.Branch != "" {
+			refs["refs/heads/"+sd.Branch] = true
+		}
+	}
+	for _, name := range selected {
+		src, _, err := siding.Paths(app, name)
+		if err != nil {
+			return nil, err
+		}
+		branch, err := currentWorktreeBranch(ctx, src)
+		if err != nil {
+			continue
+		}
+		for survivor, sd := range app.Sidings {
+			if !selectedSet[survivor] && sd.Branch == branch {
+				return nil, fmt.Errorf("checked-out branch %q for %q is owned by surviving siding %q", branch, name, survivor)
+			}
+		}
+		refs["refs/heads/"+branch] = true
+	}
+	result := make([]string, 0, len(refs))
+	for ref := range refs {
+		result = append(result, ref)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
 func buildCleanupCandidates(ctx context.Context, app state.App, checkDirty bool) ([]cleanupCandidate, error) {
 	names := make([]string, 0, len(app.Sidings))
 	for name := range app.Sidings {
@@ -129,11 +171,12 @@ func buildCleanupCandidates(ctx context.Context, app state.App, checkDirty bool)
 	for _, name := range names {
 		candidate := cleanupCandidate{Name: name, Status: statuses[name]}
 		if checkDirty {
-			dirty, err := sidingWorktreeHasChanges(ctx, app, name, []string{name})
+			dirty, reason, err := sidingWorktreeProtection(ctx, app, name, []string{name})
 			if err != nil {
 				return nil, err
 			}
 			candidate.Dirty = dirty
+			candidate.ProtectionReason = reason
 		}
 		candidates = append(candidates, candidate)
 	}
@@ -141,9 +184,29 @@ func buildCleanupCandidates(ctx context.Context, app state.App, checkDirty bool)
 }
 
 func sidingWorktreeHasChanges(ctx context.Context, app state.App, name string, removing []string) (bool, error) {
+	protected, _, err := sidingWorktreeProtection(ctx, app, name, removing)
+	return protected, err
+}
+
+func sidingWorktreeProtection(ctx context.Context, app state.App, name string, removing []string) (bool, string, error) {
 	src, _, err := siding.Paths(app, name)
 	if err != nil {
-		return false, err
+		return false, "", err
+	}
+	if _, statErr := os.Stat(src); errors.Is(statErr, os.ErrNotExist) {
+		return true, "worktree is missing; committed and uncommitted state cannot be inspected", nil
+	} else if statErr != nil {
+		return false, "", fmt.Errorf("inspect siding worktree %s: %w", src, statErr)
+	}
+	status, err := proc.Run(ctx, "git", "-C", src, "status", "--porcelain=v1", "--untracked-files=normal")
+	if err != nil {
+		return false, "", fmt.Errorf("check siding worktree %s: %w", src, err)
+	}
+	if output := strings.TrimSpace(status.Stdout); output != "" {
+		if strings.Contains(output, "?? ") {
+			return true, "dirty worktree with untracked files", nil
+		}
+		return true, "dirty worktree with uncommitted changes", nil
 	}
 	branches := make([]string, 0, len(removing))
 	for _, candidate := range removing {
@@ -151,7 +214,42 @@ func sidingWorktreeHasChanges(ctx context.Context, app state.App, name string, r
 			branches = append(branches, siding.Branch)
 		}
 	}
-	return worktreeHasChanges(ctx, src, app.Sidings[name].Branch, branches)
+	checkedOut, err := currentWorktreeBranch(ctx, src)
+	if err != nil {
+		return true, "worktree branch is detached or unavailable", nil
+	}
+	for survivor, siding := range app.Sidings {
+		if !containsName(removing, survivor) && siding.Branch == checkedOut {
+			return true, fmt.Sprintf("checked-out branch %q is owned by surviving siding %q", checkedOut, survivor), nil
+		}
+	}
+	if checkedOut != app.Sidings[name].Branch {
+		branches = append(branches, checkedOut)
+	}
+	deletions := plannedBranchRefs(branches)
+	analyzer := gitpreservation.NewAnalyzer(src, gitpreservation.Options{})
+	observedResult := analyzer.Analyze(ctx, "refs/heads/"+checkedOut, deletions)
+	var recordedResult gitpreservation.Result
+	if checkedOut != app.Sidings[name].Branch {
+		recordedResult = analyzer.Analyze(ctx, "refs/heads/"+app.Sidings[name].Branch, deletions)
+	} else {
+		recordedResult = observedResult
+	}
+	if !observedResult.Preserved {
+		return true, fmt.Sprintf("branch %q is not proven preserved: %s", checkedOut, observedResult.Reason), nil
+	}
+	if !recordedResult.Preserved {
+		return true, fmt.Sprintf("recorded branch %q is not proven preserved: %s", app.Sidings[name].Branch, recordedResult.Reason), nil
+	}
+	return false, "", nil
+}
+
+func plannedBranchRefs(branches []string) []string {
+	refs := make([]string, 0, len(branches))
+	for _, branch := range branches {
+		refs = append(refs, "refs/heads/"+branch)
+	}
+	return refs
 }
 
 func worktreeHasChanges(ctx context.Context, src, branch string, removing []string) (bool, error) {
@@ -173,26 +271,17 @@ func worktreeHasChanges(ctx context.Context, src, branch string, removing []stri
 		return true, nil
 	}
 
-	checkedOut, err := proc.Run(ctx, "git", "-C", src, "symbolic-ref", "--quiet", "HEAD")
-	if err != nil || strings.TrimSpace(checkedOut.Stdout) != "refs/heads/"+branch {
-		return true, nil
-	}
-	refs, err := proc.Run(ctx, "git", "-C", src, "for-each-ref", "--format=%(refname)", "--contains=refs/heads/"+branch, "refs/heads", "refs/remotes")
-	if err != nil {
-		return false, fmt.Errorf("check whether siding commits are reachable: %w", err)
-	}
 	removed := map[string]bool{"refs/heads/" + branch: true}
 	for _, branch := range removing {
 		removed["refs/heads/"+branch] = true
 	}
-	for _, ref := range strings.Fields(refs.Stdout) {
-		if !removed[ref] {
-			return false, nil
-		}
+	deletions := make([]string, 0, len(removed))
+	for ref := range removed {
+		deletions = append(deletions, ref)
 	}
-	// A clean worktree is still unsafe to remove when its checked-out branch is
-	// the only ref that reaches HEAD: deleting it would lose committed work.
-	return true, nil
+	sort.Strings(deletions)
+	result := gitpreservation.Analyze(ctx, gitpreservation.Request{Repo: src, TargetRef: "refs/heads/" + branch, DeletionRefs: deletions})
+	return !result.Preserved, nil
 }
 
 func pickCleanupCandidates(candidates []cleanupCandidate, in *bufio.Reader) ([]string, error) {
@@ -212,6 +301,7 @@ func pickCleanupInteractive(candidates []cleanupCandidate, fd int, in *bufio.Rea
 
 	selected := make([]bool, len(candidates))
 	cursor := 0
+	width, _, _ := term.GetSize(fd)
 	draw := func(first bool) {
 		if !first {
 			fmt.Fprintf(os.Stdout, "\x1b[%dA", len(candidates)+1)
@@ -223,6 +313,11 @@ func pickCleanupInteractive(candidates []cleanupCandidate, fd int, in *bufio.Rea
 				check = "x"
 			}
 			row := fmt.Sprintf("[%s] %s  (%s)", check, candidate.Name, cleanupStatus(candidate))
+			available := width - 4
+			if available < 1 {
+				available = 1
+			}
+			row = truncateTerminalRow(row, available)
 			if i == cursor {
 				fmt.Fprintf(os.Stdout, "\r\x1b[7m> %s \x1b[0m\x1b[K\r\n", row)
 			} else {
@@ -271,6 +366,17 @@ func pickCleanupInteractive(candidates []cleanupCandidate, fd int, in *bufio.Rea
 	}
 }
 
+func truncateTerminalRow(value string, width int) string {
+	if width <= 1 {
+		return "…"
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	return string(runes[:width-1]) + "…"
+}
+
 func pickCleanupByNumber(candidates []cleanupCandidate, in *bufio.Reader, out io.Writer) ([]string, error) {
 	fmt.Fprintln(out, "Select sidings to clean up (comma-separated numbers, 'all', or 'q'):")
 	for i, candidate := range candidates {
@@ -317,7 +423,10 @@ func parseCleanupSelection(line string, candidates []cleanupCandidate) ([]string
 
 func cleanupStatus(candidate cleanupCandidate) string {
 	if candidate.Dirty {
-		return candidate.Status + ", work not safely saved"
+		if candidate.ProtectionReason == "" {
+			return candidate.Status + ", work not safely saved"
+		}
+		return candidate.Status + ", protected: " + candidate.ProtectionReason
 	}
 	return candidate.Status
 }
@@ -332,15 +441,38 @@ func selectedCleanupNames(candidates []cleanupCandidate, selected []bool) []stri
 	return names
 }
 
-func dirtySelectedSidings(ctx context.Context, app state.App, selected []string) ([]string, error) {
-	var dirty []string
+func protectedSelectedSidings(ctx context.Context, app state.App, selected []string, snapshots map[string]*removalSafety) ([]protectedSiding, error) {
+	var dirty []protectedSiding
 	for _, name := range selected {
-		hasChanges, err := sidingWorktreeHasChanges(ctx, app, name, selected)
+		src, _, err := siding.Paths(app, name)
 		if err != nil {
 			return nil, err
 		}
-		if hasChanges {
-			dirty = append(dirty, name)
+		if _, statErr := os.Stat(src); errors.Is(statErr, os.ErrNotExist) {
+			dirty = append(dirty, protectedSiding{Name: name, Reason: "worktree is missing; state cannot be inspected"})
+			continue
+		} else if statErr != nil {
+			return nil, statErr
+		}
+		status, err := proc.Run(ctx, "git", "-C", src, "status", "--porcelain=v1", "--untracked-files=normal")
+		if err != nil {
+			return nil, err
+		}
+		if output := strings.TrimSpace(status.Stdout); output != "" {
+			reason := "dirty worktree with uncommitted changes"
+			if strings.Contains(output, "?? ") {
+				reason = "dirty worktree with untracked files"
+			}
+			dirty = append(dirty, protectedSiding{Name: name, Reason: reason})
+			continue
+		}
+		if snapshot := snapshots[name]; snapshot != nil {
+			for _, target := range snapshot.Targets {
+				if !target.Preserved {
+					dirty = append(dirty, protectedSiding{Name: name, Reason: fmt.Sprintf("branch %q is not proven preserved: %s", strings.TrimPrefix(target.Ref, "refs/heads/"), target.Reason)})
+					break
+				}
+			}
 		}
 	}
 	return dirty, nil
@@ -356,9 +488,17 @@ func containsName(names []string, target string) bool {
 }
 
 func confirmDirtyCleanup(names []string, in *bufio.Reader, out io.Writer) (bool, error) {
-	fmt.Fprintln(out, "The following sidings have work that is not safely saved:")
+	protected := make([]protectedSiding, 0, len(names))
 	for _, name := range names {
-		fmt.Fprintf(out, "  - %s\n", name)
+		protected = append(protected, protectedSiding{Name: name, Reason: "work not safely saved"})
+	}
+	return confirmProtectedCleanup(protected, in, out)
+}
+
+func confirmProtectedCleanup(names []protectedSiding, in *bufio.Reader, out io.Writer) (bool, error) {
+	fmt.Fprintln(out, "The following sidings have work that is not safely saved:")
+	for _, item := range names {
+		fmt.Fprintf(out, "  - %s: %s\n", item.Name, item.Reason)
 	}
 	fmt.Fprint(out, "Permanently remove them and discard those changes? [y/N] ")
 	line, err := in.ReadString('\n')

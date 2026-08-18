@@ -156,6 +156,24 @@ func TestRemovalJournalRoundTripPreservesSafetyPolicy(t *testing.T) {
 	}
 }
 
+func TestRemovalJournalRoundTripPreservesOptionalBranchEvidence(t *testing.T) {
+	dir := t.TempDir()
+	app := App{Name: "app", ConfigDir: dir, Sidings: map[string]Siding{}, Removal: &RemovalOperation{
+		ID: "remove-one", Siding: "one", Stage: RemovalBaselinePromoted, StartedAt: "2026-08-18T00:00:00Z",
+		ObservedWorktreeBranch: "gb/shunt/actual", PreservationFingerprint: "preserved-fingerprint",
+	}}
+	if err := SaveApp(app); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadApp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Removal == nil || loaded.Removal.ObservedWorktreeBranch != "gb/shunt/actual" || loaded.Removal.PreservationFingerprint != "preserved-fingerprint" {
+		t.Fatalf("loaded removal evidence = %#v", loaded.Removal)
+	}
+}
+
 func TestUpdateAppRollsBackCallbackFailure(t *testing.T) {
 	dir := t.TempDir()
 	app := App{ConfigDir: dir, Memory: "4g", Sidings: map[string]Siding{}}

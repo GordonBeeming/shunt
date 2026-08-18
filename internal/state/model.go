@@ -60,14 +60,32 @@ const (
 // that may be resumed. GenerationID is filled once the data baseline reports a
 // committed generation for ID.
 type RemovalOperation struct {
-	ID           string       `json:"id"`
-	Siding       string       `json:"siding"`
-	Stage        RemovalStage `json:"stage"`
-	GenerationID string       `json:"generationId,omitempty"`
-	StartedAt    string       `json:"startedAt"`
-	Force        bool         `json:"force,omitempty"`
-	Safety       string       `json:"safetyFingerprint,omitempty"`
-	Removing     []string     `json:"removing,omitempty"`
+	ID                      string          `json:"id"`
+	Siding                  string          `json:"siding"`
+	Stage                   RemovalStage    `json:"stage"`
+	GenerationID            string          `json:"generationId,omitempty"`
+	StartedAt               string          `json:"startedAt"`
+	Force                   bool            `json:"force,omitempty"`
+	Safety                  string          `json:"safetyFingerprint,omitempty"`
+	Removing                []string        `json:"removing,omitempty"`
+	ObservedWorktreeBranch  string          `json:"observedWorktreeBranch,omitempty"`
+	PreservationFingerprint string          `json:"preservationFingerprint,omitempty"`
+	Targets                 []RemovalTarget `json:"targets,omitempty"`
+	RecoveryRefs            []string        `json:"recoveryRefs,omitempty"`
+	RecoveryRepo            string          `json:"recoveryRepo,omitempty"`
+	ExplicitDiscard         bool            `json:"explicitDiscard,omitempty"`
+}
+
+// RemovalTarget is an immutable local-ref witness captured before removal.
+// ExpectedOID is empty only when the ref was explicitly absent at confirmation.
+type RemovalTarget struct {
+	Ref            string `json:"ref"`
+	ExpectedOID    string `json:"expectedOid,omitempty"`
+	Preserved      bool   `json:"preserved"`
+	Kind           string `json:"kind"`
+	MatchingRef    string `json:"matchingRef,omitempty"`
+	MatchingCommit string `json:"matchingCommit,omitempty"`
+	Reason         string `json:"reason"`
 }
 
 // Registry is the global index (~/.shunt[-channel]/registry.json): just enough
