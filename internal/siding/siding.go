@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/gordonbeeming/shunt/internal/aspire"
 	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/container"
@@ -35,14 +34,7 @@ const (
 	// Guest-internal ports shunt pins (each guest is isolated, so these are the
 	// same across sidings).
 	guestDashboardPort = 18888
-	guestRSPort        = 18890
 
-	// rsExtPort is the guest-external (0.0.0.0) port the in-guest socat bridge for
-	// the resource service listens on. Front-door route bridges instead reuse each
-	// route's own port on the guest IP (host == guest); see Activate.
-	rsExtPort = 38890
-
-	startedMarker        = "Distributed application started"
 	guestImageMarkerPath = "/var/lib/shunt/image-cache.json"
 )
 
@@ -66,18 +58,21 @@ var (
 	stopLifecycleApp         = StopApp
 	startLifecycleApp        = StartApp
 	waitLifecycleReady       = WaitReady
-	upMaterialize            = materialize
-	ensureGuestRuntime       = container.EnsureSystemStarted
-	upEnsureGuestLive        = EnsureGuestLive
-	upResolveFrontDoor       = resolveSidingFrontDoor
-	upProbeAppRunning        = ProbeAppRunning
-	upPrepareGuest           = PrepareGuest
-	upStopApp                = StopApp
-	upStartApp               = StartApp
-	upWaitReady              = WaitReady
-	upActivate               = Activate
-	upGuestIP                = container.IP
-	upClearAppLog            = func(ctx context.Context, guest string) {
+	// probeExec is the readiness probe seam, so the port rules can be tested
+	// without a guest.
+	probeExec          = container.Exec
+	upMaterialize      = materialize
+	ensureGuestRuntime = container.EnsureSystemStarted
+	upEnsureGuestLive  = EnsureGuestLive
+	upResolveFrontDoor = resolveSidingFrontDoor
+	upProbeAppRunning  = ProbeAppRunning
+	upPrepareGuest     = PrepareGuest
+	upStopApp          = StopApp
+	upStartApp         = StartApp
+	upWaitReady        = WaitReady
+	upActivate         = Activate
+	upGuestIP          = container.IP
+	upClearAppLog      = func(ctx context.Context, guest string) {
 		_, _ = container.Exec(ctx, guest, "sh", "-c", "> "+appLogPath)
 	}
 	upSiding           = up
@@ -194,7 +189,7 @@ func spin(ctx context.Context, app state.App, name, branch, fromBranch string) (
 	}
 	return state.Siding{Name: name, Branch: wtBranch, WorktreeRepoPath: owner,
 		MaterializationPhase: state.PhaseWorktree, Container: config.ContainerName(app.Name, name),
-		RSPort: guestRSPort, Bridges: map[string]int{}}, nil
+		Bridges: map[string]int{}}, nil
 }
 
 func cleanupFailedSpin(app state.App, name, guest, branch string, keepBranch bool) error {
@@ -367,7 +362,12 @@ func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		// Non-blocking: the app keeps building in the background; the eager bridges
 		// serve each route as it comes up.
 		fmt.Fprintln(progress, "• starting the app (it keeps building in the background)…")
-		_ = upWaitReady(ctx, app, sd, 45*time.Second)
+		// Say so when the app hasn't confirmed a start yet. Swallowing this
+		// silently is what let a permanently-unreachable readiness check look
+		// like a slow build for as long as it did.
+		if err := upWaitReady(ctx, app, sd, 45*time.Second); err != nil {
+			fmt.Fprintf(progress, "  (still starting — `%s logs %s` shows how it's going)\n", config.Current().BinaryName, sd.Name)
+		}
 	}
 
 	if !bridge {
@@ -376,7 +376,7 @@ func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		}
 		return sd, nil
 	}
-	fmt.Fprintln(progress, "• discovering endpoints + bridging to the host…")
+	fmt.Fprintln(progress, "• bridging the declared routes to the host…")
 	if err := upActivate(ctx, app, &sd); err != nil {
 		return sd, err
 	}
@@ -901,60 +901,6 @@ func AssureImageCache(ctx context.Context, app state.App) error {
 	return nil
 }
 
-// WaitStarted blocks until the AppHost log says the app started, the guest exits,
-// or the deadline passes. It renders progress in a compact live region that
-// collapses to a one-line summary on success and stays visible (last few lines)
-// on failure, with the full log available via `shunt logs`.
-func WaitStarted(ctx context.Context, guestName string, timeout time.Duration) error {
-	tail := ui.NewLiveTail(5)
-	logHint := fmt.Sprintf("see `%s logs %s` for the full log", config.Current().BinaryName, guestNameToSiding(guestName))
-	deadline := time.Now().Add(timeout)
-	start := time.Now()
-	shown := 0
-	var dashSince time.Time // when the Aspire dashboard first came up
-	for time.Now().Before(deadline) {
-		st, err := container.State(ctx, guestName)
-		if err == nil && st != "running" {
-			tail.Freeze()
-			return fmt.Errorf("guest exited (state=%s) before the app started — %s", st, logHint)
-		}
-		out, _ := container.Exec(ctx, guestName, "sh", "-c", "cat "+appLogPath+" 2>/dev/null")
-		lines := strings.Split(out, "\n")
-		var fresh []string
-		if len(lines) > shown {
-			fresh = lines[shown:]
-			shown = len(lines)
-		}
-		tail.Update(fmt.Sprintf("⏳ starting Aspire… (%s)", time.Since(start).Round(time.Second)), fresh)
-
-		if strings.Contains(out, startedMarker) {
-			tail.Stop(fmt.Sprintf("✓ Aspire started (%s)", time.Since(start).Round(time.Second)))
-			return nil
-		}
-		// Fallback: Aspire's core (the dashboard) is up but not every resource has
-		// reported "started" — a flaky/slow resource (a heavy web UI is prone to
-		// this). After a grace period, proceed so the front door can still bridge
-		// whatever IS up (DB, APIs, dashboard).
-		if strings.Contains(out, "Now listening on") && strings.Contains(out, ":18888") {
-			if dashSince.IsZero() {
-				dashSince = time.Now()
-			}
-			if time.Since(dashSince) > 90*time.Second {
-				tail.Stop(fmt.Sprintf("✓ Aspire up (%s) — dashboard reachable; some resources may still be starting", time.Since(start).Round(time.Second)))
-				return nil
-			}
-		}
-		if strings.Contains(out, "Unhandled exception") || strings.Contains(out, "Hosting failed") ||
-			strings.Contains(out, "Exited with error code") {
-			tail.Freeze()
-			return fmt.Errorf("Aspire app failed to start — %s", logHint)
-		}
-		time.Sleep(2 * time.Second)
-	}
-	tail.Freeze()
-	return fmt.Errorf("timed out after %s waiting for the app to start — %s", timeout, logHint)
-}
-
 // guestNameToSiding strips the channel/app prefix from a container name back to
 // the siding name, for user-facing hints (best-effort; falls back to the full
 // name). Container names are "<prefix>_<app>_<siding>".
@@ -991,6 +937,7 @@ func RouteFromContract(appName string, r contract.FrontDoorRoute, listenPort int
 		Resource:   r.Resource,
 		Endpoint:   r.Endpoint,
 		GuestPort:  r.GuestPort,
+		Optional:   r.Optional,
 		TLS:        r.TLS,
 		CaddyID:    caddy.RouteID(appName, r.Kind, r.Key),
 	}
@@ -1101,95 +1048,18 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 		sd.Bridges = map[string]int{}
 	}
 
-	// Any route with a declared guestPort is bridged eagerly, host==guest: bind
-	// the guest IP at the same port and forward to the app's loopback port. socat
-	// comes up immediately (before the app even binds), so the front door
-	// auto-serves the moment each service starts — no discovery, no waiting on a
-	// slow/unhealthy resource, no re-switch.
-	var needDiscovery []state.Route
+	// Every route declares its guestPort, so all of them bridge eagerly,
+	// host==guest: bind the guest IP at the same port and forward to the app's
+	// loopback port. socat comes up before the app even binds, so the front door
+	// auto-serves the moment each service starts, with nothing to discover and no
+	// waiting on a slow resource.
 	for _, r := range EffRoutes(app, *sd) {
-		if r.GuestPort == 0 {
-			needDiscovery = append(needDiscovery, r)
-			continue
-		}
 		if err := container.Bridge(ctx, sd.Container, ip, r.ListenPort, r.GuestPort); err != nil {
 			return err
 		}
 		sd.Bridges[r.Key] = r.ListenPort
 	}
-	if len(needDiscovery) == 0 {
-		return nil // every route declared its port — nothing to discover
-	}
-
-	// Discovery fallback only for routes that DON'T declare a guestPort (legacy
-	// Aspire apps that let Aspire assign ports): bridge the resource service,
-	// resolve each one, bridge whatever has come up.
-	if err := container.Bridge(ctx, sd.Container, "", rsExtPort, guestRSPort); err != nil {
-		return err
-	}
-	eps, err := discoverReady(ctx, fmt.Sprintf("%s:%d", ip, rsExtPort), needDiscovery, 90*time.Second)
-	if err != nil {
-		return fmt.Errorf("discover endpoints: %w", err)
-	}
-	var pending []string
-	for _, r := range needDiscovery {
-		ep, ok := aspire.Find(eps, r.Resource, r.Endpoint)
-		if !ok {
-			pending = append(pending, fmt.Sprintf("%s (%s)", r.Key, r.Resource))
-			continue
-		}
-		// For container-backed resources, target the real docker-published port
-		// rather than Aspire's DCP proxy port (which doesn't forward through a
-		// bridge). Project/process resources have no container, so keep ep.Port.
-		realPort := ep.Port
-		if dp := container.DockerPort(ctx, sd.Container, ep.Resource); dp > 0 {
-			realPort = dp
-		}
-		if err := container.Bridge(ctx, sd.Container, ip, r.ListenPort, realPort); err != nil {
-			return err
-		}
-		sd.Bridges[r.Key] = r.ListenPort
-	}
-	if len(pending) > 0 {
-		// These are discovery-only routes (no declared guestPort) that hadn't
-		// resolved within the window, so — unlike the eagerly-bridged host==guest
-		// routes — they have no bridge yet. Re-run once they're up to bridge them.
-		fmt.Printf("  ⚠ %d route(s) didn't resolve in time: %s — run `%s up %s` (or `switch`) again once they start\n",
-			len(pending), strings.Join(pending, ", "), config.Current().BinaryName, sd.Name)
-	}
 	return nil
-}
-
-// discoverReady polls the resource service until every front-door route's
-// resource has resolved, or the timeout passes (returning the last snapshot so
-// the caller can report exactly which route is missing).
-func discoverReady(ctx context.Context, addr string, routes []state.Route, timeout time.Duration) ([]aspire.Endpoint, error) {
-	deadline := time.Now().Add(timeout)
-	var last []aspire.Endpoint
-	for {
-		eps, err := aspire.Discover(ctx, addr, "")
-		if err == nil {
-			last = eps
-			if allResolved(eps, routes) {
-				return eps, nil
-			}
-		} else if time.Now().After(deadline) {
-			return nil, err
-		}
-		if time.Now().After(deadline) {
-			return last, nil
-		}
-		time.Sleep(2 * time.Second)
-	}
-}
-
-func allResolved(eps []aspire.Endpoint, routes []state.Route) bool {
-	for _, r := range routes {
-		if _, ok := aspire.Find(eps, r.Resource, r.Endpoint); !ok {
-			return false
-		}
-	}
-	return true
 }
 
 // PointCaddy repoints the app's front-door routes at this siding's bridged
@@ -1250,26 +1120,28 @@ func DashboardURL(app state.App, sd state.Siding) string {
 	if sd.LastIP == "" {
 		return ""
 	}
-	port := dashboardGuestPort(app, sd)
+	port, tls := dashboardGuestPort(app, sd)
 	if port == 0 {
 		return ""
 	}
-	return fmt.Sprintf("http://%s:%d", sd.LastIP, port)
+	scheme := "http"
+	if tls {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s:%d", scheme, sd.LastIP, port)
 }
 
-func dashboardGuestPort(app state.App, sd state.Siding) int {
-	port := 0
-	if app.Runner == "" || app.Runner == runner.Aspire {
-		port = guestDashboardPort
-	}
+// dashboardGuestPort finds the dashboard route the contract declares, if any.
+// There is no default port: a dashboard is reachable because the contract says
+// where it is, exactly like every other route.
+func dashboardGuestPort(app state.App, sd state.Siding) (int, bool) {
 	for _, r := range EffRoutes(app, sd) {
-		if r.Kind == state.KindHTTP && r.GuestPort != 0 &&
+		if r.Kind == state.KindHTTP &&
 			(r.Resource == "aspire-dashboard" || r.Key == "aspire-dashboard" || r.Key == "dashboard") {
-			port = r.GuestPort
-			break
+			return r.GuestPort, r.TLS
 		}
 	}
-	return port
+	return 0, false
 }
 
 // expandHome replaces a leading ~ with the user's home dir.
@@ -1293,20 +1165,9 @@ func originForClone(app state.App) string {
 	return app.RepoOrigin
 }
 
-func summarize(eps []aspire.Endpoint) string {
-	parts := make([]string, 0, len(eps))
-	for _, e := range eps {
-		parts = append(parts, fmt.Sprintf("%s/%s=%s:%d", e.Resource, e.Name, e.Host, e.Port))
-	}
-	return strings.Join(parts, ", ")
-}
-
 // WaitReady blocks until the app is ready: Aspire waits for the "started"
 // marker, other runners poll until every front-door route's guestPort listens.
 func WaitReady(ctx context.Context, app state.App, sd state.Siding, timeout time.Duration) error {
-	if app.Runner == "" || app.Runner == runner.Aspire {
-		return WaitStarted(ctx, sd.Container, timeout)
-	}
 	tail := ui.NewLiveTail(5)
 	deadline := time.Now().Add(timeout)
 	start := time.Now()
@@ -1325,6 +1186,15 @@ func WaitReady(ctx context.Context, app state.App, sd state.Siding, timeout time
 			shown = len(lines)
 		}
 		tail.Update(fmt.Sprintf("⏳ waiting for %s to listen… (%s)", app.Runner, time.Since(start).Round(time.Second)), fresh)
+		// Best-effort early exit: a log that already says the process died means
+		// waiting out the timeout only delays the same answer. It never blocks
+		// readiness, so a runner whose crashes read differently just falls through
+		// to the port check.
+		if strings.Contains(out, "Unhandled exception") || strings.Contains(out, "Hosting failed") ||
+			strings.Contains(out, "Exited with error code") {
+			tail.Freeze()
+			return fmt.Errorf("the app failed to start — %s", logHint)
+		}
 		ready, err := ProbeAppRunning(ctx, app, sd)
 		if err != nil {
 			tail.Freeze()
@@ -1344,8 +1214,8 @@ func WaitReady(ctx context.Context, app state.App, sd state.Siding, timeout time
 // connection inside the guest (socat is in the base image; sh has no /dev/tcp).
 func allPortsListening(ctx context.Context, app state.App, sd state.Siding) bool {
 	for _, r := range EffRoutes(app, sd) {
-		if r.GuestPort == 0 {
-			return false
+		if r.Optional {
+			continue
 		}
 		out, _ := container.Exec(ctx, sd.Container, "sh", "-c",
 			fmt.Sprintf("socat -T1 /dev/null TCP:127.0.0.1:%d 2>/dev/null && echo up", r.GuestPort))
@@ -1449,23 +1319,16 @@ func AppRunning(ctx context.Context, app state.App, sd state.Siding) bool {
 
 // ProbeAppRunning reports process state without treating a failed guest probe as
 // a stopped application.
+// ProbeAppRunning reports whether every required route is listening in the
+// guest. One rule for every runner: the contract states which port each resource
+// binds, so nothing here needs to know what kind of app it is. Routes marked
+// optional are skipped, so a slow dev server cannot hold the app back.
 func ProbeAppRunning(ctx context.Context, app state.App, sd state.Siding) (bool, error) {
-	if app.Runner == "" || app.Runner == runner.Aspire {
-		// Probe the dashboard route the AppHost actually exposes. Newer Aspire CLI
-		// versions no longer leave the old resource-service port (18890) listening,
-		// which made a live AppHost look stopped and caused `up` to restart it.
-		port := dashboardGuestPort(app, sd)
-		out, err := container.Exec(ctx, sd.Container, "sh", "-c",
-			fmt.Sprintf("if socat -T1 /dev/null TCP:127.0.0.1:%d >/dev/null 2>&1; then echo up; else echo down; fi", port))
-		if err != nil {
-			return false, err
-		}
-		return strings.Contains(out, "up"), nil
-	}
-	checks := make([]string, 0, len(EffRoutes(app, sd)))
-	for _, route := range EffRoutes(app, sd) {
-		if route.GuestPort == 0 {
-			return false, nil
+	routes := EffRoutes(app, sd)
+	checks := make([]string, 0, len(routes))
+	for _, route := range routes {
+		if route.Optional {
+			continue
 		}
 		checks = append(checks, fmt.Sprintf("socat -T1 /dev/null TCP:127.0.0.1:%d >/dev/null 2>&1", route.GuestPort))
 	}
@@ -1473,7 +1336,7 @@ func ProbeAppRunning(ctx context.Context, app state.App, sd state.Siding) (bool,
 	if len(checks) == 0 {
 		script = "echo up"
 	}
-	out, err := container.Exec(ctx, sd.Container, "sh", "-c", script)
+	out, err := probeExec(ctx, sd.Container, "sh", "-c", script)
 	if err != nil {
 		return false, err
 	}

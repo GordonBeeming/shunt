@@ -55,7 +55,6 @@ func newRootCmd() *cobra.Command {
 		newPlaywrightCmd(),
 		newCdCmd(),
 		newDashboardCmd(),
-		newDebugDiscoverCmd(),
 	)
 	return root
 }

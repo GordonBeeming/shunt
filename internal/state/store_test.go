@@ -118,7 +118,7 @@ func TestSaveLoadAppRoundTrip(t *testing.T) {
 			{Key: "frontend", Kind: KindHTTP, ListenPort: 5000, Resource: "web", CaddyID: "app_myapp_http_frontend"},
 		},
 		Sidings: map[string]Siding{
-			"exp1": {Name: "exp1", Container: "shuntdev_myapp_exp1", RSPort: 18890, Bridges: map[string]int{"frontend": 39001}},
+			"exp1": {Name: "exp1", Container: "shuntdev_myapp_exp1", Bridges: map[string]int{"frontend": 39001}},
 		},
 		LiveSiding: "exp1",
 	}
@@ -133,7 +133,7 @@ func TestSaveLoadAppRoundTrip(t *testing.T) {
 		t.Fatalf("roundtrip mismatch: %+v", got)
 	}
 	s := got.Sidings["exp1"]
-	if s.Bridges["frontend"] != 39001 || s.RSPort != 18890 {
+	if s.Bridges["frontend"] != 39001 {
 		t.Errorf("siding roundtrip mismatch: %+v", s)
 	}
 }

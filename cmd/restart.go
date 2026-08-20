@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/gordonbeeming/shunt/internal/siding"
+	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
 )
 
@@ -43,6 +44,13 @@ func newRestartCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("%s %q restarted\n", tick(), name)
+			// Restart records where the rebuilt app's dashboard actually answered,
+			// so report from the saved state rather than the pre-restart copy.
+			if latest, err := state.LoadApp(app.ConfigDir); err == nil {
+				if latestSiding, ok := latest.Sidings[name]; ok {
+					app, sd = latest, latestSiding
+				}
+			}
 			if dashboard := siding.DashboardURL(app, sd); dashboard != "" {
 				fmt.Printf("  dashboard (guest): %s\n", dashboard)
 			}
