@@ -42,6 +42,8 @@ Existing registrations load legacy `state.json` without rewriting it during read
 
 A siding's `src` is an ordinary checkout on the host, so build it and run the tests **there** before touching the guest — `dotnet build` / `dotnet test`, `pnpm build`, whatever the project uses. That's the fast feedback loop; `up` is a full guest rebuild, so don't spend it on code that doesn't compile yet.
 
+Tests that spin up their own containers (Testcontainers and the like) are the exception, because Docker lives in the guest rather than on the host: run those with `{{shunt-command}} run <siding> …`. Every image they use has to be declared in `prebakeImages` and warmed first — the guest never pulls, so an undeclared image fails the test instead of fetching it. That covers images the framework launches on your behalf too: either add Testcontainers' Ryuk reaper to `prebakeImages` or set `TESTCONTAINERS_RYUK_DISABLED=true` in the contract's `env`.
+
 Once it builds and the tests pass, bring it online without stealing the front door, then go live deliberately:
 
 1. **Ask the user first, then `{{shunt-command}} up <name> --no-bridge`** — starts the app in the guest but leaves the host alone: no socat bridges and no Caddy, so nothing is taken from whatever's currently live. Check the runner's guest output (the Aspire dashboard for an Aspire app) to confirm the app actually comes up ("would it work").
