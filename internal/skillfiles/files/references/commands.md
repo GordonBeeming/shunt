@@ -58,7 +58,8 @@ Legacy projects load from `state.json` with safe in-memory defaults. Legacy work
   "workdir": "src/web",
   "frontDoor": [
     { "key": "web", "kind": "http", "listenPort": 7011, "guestPort": 7011, "resource": "web", "tls": true },
-    { "key": "db", "kind": "layer4", "listenPort": 5432, "guestPort": 5432, "resource": "postgres" }
+    { "key": "db", "kind": "layer4", "listenPort": 5432, "guestPort": 5432, "resource": "postgres" },
+    { "key": "storybook", "kind": "http", "listenPort": 6006, "guestPort": 6006, "resource": "storybook", "optional": true }
   ],
   "mounts": [
     { "host": "~/.microsoft/usersecrets", "guest": "/root/.microsoft/usersecrets", "readOnly": true }
@@ -75,7 +76,7 @@ Legacy projects load from `state.json` with safe in-memory defaults. Legacy work
 }
 ```
 
-- The example is valid JSON for a Node app. `runner` is how the app starts: `aspire` keeps gRPC discovery; `dotnet`, `node`, and `custom` use `start` plus a per-route `guestPort` (the in-guest port the app binds). `app add` auto-detects common cases and asks when it can't.
+- The example is valid JSON for a Node app. `runner` is how the app starts: `aspire` runs the AppHost through the Aspire CLI, while `dotnet`, `node`, and `custom` use `start`. Every runner declares a `guestPort` per route. `app add` auto-detects common cases and asks when it can't.
 - `frontDoor` maps each service to a stable local port (the host:port you and Entra always hit). `kind` is `http` (web) or `layer4` (raw TCP, e.g. SQL). **HTTP routes serve HTTPS** at the front door using the **.NET dev cert** loaded by `init`; trust it with `dotnet dev-certs https --trust`, then reload it with `cert install` only after trust, rotation, or regeneration. The proxy reaches the app over TLS with skip-verify. `layer4` routes stay raw TCP.
 - **Ports are host == guest.** Set each route's `listenPort` and `guestPort` to the app's actual port. For Aspire, that is the project's launchSettings port. Shunt runs the Aspire AppHost with its launch profile, then bridges each route to the same port on the guest IP. No random bridge ports.
 - **`guestPort` is the port that resource binds *inside* the guest — look it up, never copy `listenPort` into it.** They match only when you have chosen the same number for both, which is the intent but not a given. Getting it wrong is quiet: the bridge comes up pointing at a port nothing is listening on and the front door serves 502, with no error at bridge time. For an Aspire **project** resource, read `Properties/launchSettings.json` → `applicationUrl` and pick the URL matching that route's `endpoint` name, so a route with `"endpoint": "http"` takes the `http://` port even when an `https://` one is also live. For a **container** resource, use whatever the AppHost pins (e.g. `AddSqlServer("sql", password: …, port: 1500)` means `guestPort` is 1500). Confirm against the running guest before trusting either:
@@ -84,7 +85,9 @@ Legacy projects load from `state.json` with safe in-memory defaults. Legacy work
   {{shunt-command}} run <siding> sh -c 'curl -sk -o /dev/null -w "%{http_code}\n" https://localhost:<port>'
   ```
 
-- Omitting `guestPort` is not a safe default: it sends the route down the endpoint-discovery path, which is slower and depends on reaching the AppHost's resource service. Declare the port whenever you know it.
+- **`guestPort` is required on every route, for every runner.** shunt does not work the port out for you and there is no discovery fallback, so `app add` rejects a contract that omits one and names the route. That rejection happens before anything is written, so a bad contract never half-registers.
+- **`optional: true` takes a route out of the readiness check.** Readiness means every *required* route is listening in the guest, and it is the same rule whether the app is Aspire, Vite, or a shell command. Mark the slow or flaky one (a dev server that compiles on boot) so it cannot hold the app back. Optional changes readiness **only**: the route is still bridged and still served the moment it comes up. Default is required, so a route blocks unless it says otherwise.
+- The Aspire dashboard is a route like any other. Declare it (`"key": "aspire-dashboard"`, its launch-profile port, `"tls": true` when it serves HTTPS) if you want `up` to print a link to it; there is no built-in default port.
 - `mounts` carries per-project host paths into the guest (typically user-secrets so the app's config resolves). Each entry is either a plain path string — `"~/.microsoft/usersecrets"` auto-maps the host home to the guest home (`/root/…`) read-only, `"/abs"` maps to the same path — or the full `{ "host", "guest", "readOnly" }` object for read-write or a different guest path. Keep user-secrets mounts read-only: every worktree with the same `<UserSecretsId>` shares the host store. Read-only protects it from guest processes, but host-side `dotnet user-secrets` commands run in a siding worktree still change the values seen by the registration checkout and all sidings. Like `env`, mounts are fixed at guest creation, so changing them needs `{{shunt-command}} reapply [siding]` before an existing guest sees the new set.
 - `env` passes extra environment variables into the guest (Aspire parameters, secrets, test-runner switches such as `TESTCONTAINERS_RYUK_DISABLED`). `app add` records them, but `container run` bakes them into a guest at creation, so an existing guest keeps the values it was built with until `{{shunt-command}} reapply [siding]`. Registration warns and names the stale guests when that happens.
 - `fixedPorts: true` pins the front door to the exact `listenPort` values (no channel offset) — required for host==guest when the app's config + Entra redirect URIs point at specific ports. Default (omit it) lets the channel offset apply so channels coexist (ports won't match the app then).
