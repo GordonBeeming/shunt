@@ -595,8 +595,14 @@ func StartApp(ctx context.Context, app state.App, sd state.Siding) error {
 // service 18890, MCP 18891) as the hex used in /proc/net/tcp local addresses.
 const aspirePortHex = "49C8 49C9 49CA 49CB"
 
+// dcp is Aspire's orchestrator: one `start-apiserver`, one `run-controllers`,
+// and a `monitor-process` per resource. It outlives the AppHost that spawned it,
+// and its API server binds a random port, so the fixed-port sweep below cannot
+// reach it. Left running, the tree survives a restart and collides with the DCP
+// the next AppHost starts, which hangs the app and eventually wedges the guest.
 const aspireProcessKillScript = `pkill -9 -x dotnet 2>/dev/null
-pkill -9 -x aspire 2>/dev/null`
+pkill -9 -x aspire 2>/dev/null
+pkill -9 -x dcp 2>/dev/null`
 
 // StopApp stops the app inside the guest WITHOUT touching the guest, dockerd, or
 // the dependency containers (which run under dockerd on other ports), so a
@@ -607,7 +613,9 @@ pkill -9 -x aspire 2>/dev/null`
 // compiled AppHost binary when killed — it SIGKILLs the run/watch wrappers so
 // nothing respawns and frees the Aspire host ports by finding whatever holds
 // them via the socket inode in /proc/net/tcp (name-agnostic; catches the
-// compiled AppHost binary, dashboard, and DCP).
+// compiled AppHost binary and the dashboard). That sweep only covers the fixed
+// ports in aspirePortHex, which is why the process kills above have to name
+// every executable that can outlive the AppHost on a port of its own choosing.
 func StopApp(ctx context.Context, app state.App, sd state.Siding) error {
 	if app.Runner != "" && app.Runner != runner.Aspire {
 		var stopErrs []error

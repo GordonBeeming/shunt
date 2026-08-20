@@ -15,12 +15,14 @@ import (
 )
 
 func TestStopAppDoesNotUseFullCommandLineProcessKills(t *testing.T) {
-	for _, unsafe := range []string{"pkill -9 -f dotnet", "pkill -9 -f aspire"} {
+	for _, unsafe := range []string{"pkill -9 -f dotnet", "pkill -9 -f aspire", "pkill -9 -f dcp"} {
 		if strings.Contains(aspireProcessKillScript, unsafe) {
 			t.Fatalf("StopApp contains self-matching process kill %q", unsafe)
 		}
 	}
-	for _, safe := range []string{"pkill -9 -x dotnet", "pkill -9 -x aspire"} {
+	// dcp is the orchestrator tree; it outlives the AppHost and binds a random
+	// API-server port, so nothing else in StopApp reaps it.
+	for _, safe := range []string{"pkill -9 -x dotnet", "pkill -9 -x aspire", "pkill -9 -x dcp"} {
 		if !strings.Contains(aspireProcessKillScript, safe) {
 			t.Fatalf("StopApp is missing executable-name process kill %q", safe)
 		}
