@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
@@ -16,7 +17,7 @@ func RequireGuest(sd state.Siding) error {
 	if sd.MaterializationPhase == "" || sd.MaterializationPhase == state.PhaseGuest {
 		return nil
 	}
-	return fmt.Errorf("siding %q is %s; run `shunt up %s` first", sd.Name, sd.MaterializationPhase, sd.Name)
+	return fmt.Errorf("siding %q is %s; run `%s up %s` first", sd.Name, sd.MaterializationPhase, config.Current().BinaryName, sd.Name)
 }
 
 // Park removes only the recreatable Apple guest. Code, branch, data, and output

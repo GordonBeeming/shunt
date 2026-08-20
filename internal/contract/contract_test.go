@@ -23,8 +23,8 @@ func TestLoadValid(t *testing.T) {
 	dir := writeContract(t, `{
       "apphost": "src/App.AppHost/App.AppHost.csproj",
       "frontDoor": [
-        { "key": "frontend", "kind": "http",   "listenPort": 5000, "resource": "web" },
-        { "key": "db",       "kind": "layer4", "listenPort": 15432, "resource": "postgres", "endpoint": "tcp" }
+        { "key": "frontend", "kind": "http",   "listenPort": 5000, "guestPort": 5000, "resource": "web", "optional": true },
+        { "key": "db",       "kind": "layer4", "listenPort": 15432, "guestPort": 5432, "resource": "postgres", "endpoint": "tcp" }
       ],
       "dataVolumes": [ "pg-data" ]
     }`)
@@ -305,5 +305,47 @@ func TestValidationErrors(t *testing.T) {
 				t.Errorf("expected validation error for %q", name)
 			}
 		})
+	}
+}
+
+// A route that does not say which port it binds used to fall through to an
+// Aspire-only discovery path, which could never serve another runner. It is
+// config now, and the failure names the route so the fix is obvious.
+func TestLoadRequiresGuestPort(t *testing.T) {
+	dir := writeContract(t, `{
+      "apphost": "src/App.AppHost/App.AppHost.csproj",
+      "frontDoor": [
+        { "key": "api", "kind": "http", "listenPort": 5000, "guestPort": 5000, "resource": "api" },
+        { "key": "web", "kind": "http", "listenPort": 5001, "resource": "web" }
+      ]
+    }`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected a contract with a portless route to be rejected")
+	}
+	if !strings.Contains(err.Error(), `"web"`) || !strings.Contains(err.Error(), "guestPort is required") {
+		t.Fatalf("error should name the offending route: %v", err)
+	}
+}
+
+// optional is how a slow dev server avoids holding readiness back, so it has to
+// survive the round trip rather than being silently dropped.
+func TestLoadCarriesOptionalPerRoute(t *testing.T) {
+	dir := writeContract(t, `{
+      "apphost": "src/App.AppHost/App.AppHost.csproj",
+      "frontDoor": [
+        { "key": "api",    "kind": "http", "listenPort": 5000, "guestPort": 7260, "resource": "api" },
+        { "key": "webapp", "kind": "http", "listenPort": 5001, "guestPort": 5173, "resource": "webapp", "optional": true }
+      ]
+    }`)
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.FrontDoor[0].Optional {
+		t.Error("a route with no optional flag must default to required")
+	}
+	if !c.FrontDoor[1].Optional {
+		t.Error("optional: true did not survive the load")
 	}
 }

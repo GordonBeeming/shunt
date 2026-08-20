@@ -10,7 +10,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var readGuestLog = container.Exec
+var (
+	readGuestLog      = container.Exec
+	observeGuestState = func(ctx context.Context, name string) container.GuestObservationState {
+		return container.ObserveGuest(ctx, name).State
+	}
+)
 
 func newLogsCmd() *cobra.Command {
 	var lines int
@@ -59,6 +64,13 @@ func sidingLog(ctx context.Context, configDir, name string, lines int) (string, 
 		var err error
 		output, err = readGuestLog(ctx, sd.Container, "sh", "-c", read)
 		if err != nil {
+			// Reading a file is no reason to stop and start a guest, so unlike
+			// `run` this reports the state instead of healing it. The listing and
+			// the exec path can disagree — a guest that lists as running while
+			// refusing every exec looks transient and is not.
+			if observeGuestState(ctx, sd.Container) == container.GuestRunning {
+				return fmt.Errorf("siding %q lists as running but refuses commands; `%s up %s` restarts the guest and recovers it: %w", name, bin(), name, err)
+			}
 			return fmt.Errorf("read log (is the guest running?): %w", err)
 		}
 		return nil

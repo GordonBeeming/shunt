@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -11,16 +12,19 @@ import (
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/dockerdpolicy"
 	"github.com/gordonbeeming/shunt/internal/imagecache"
+	"github.com/gordonbeeming/shunt/internal/runner"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
 
 func TestStopAppDoesNotUseFullCommandLineProcessKills(t *testing.T) {
-	for _, unsafe := range []string{"pkill -9 -f dotnet", "pkill -9 -f aspire"} {
+	for _, unsafe := range []string{"pkill -9 -f dotnet", "pkill -9 -f aspire", "pkill -9 -f dcp"} {
 		if strings.Contains(aspireProcessKillScript, unsafe) {
 			t.Fatalf("StopApp contains self-matching process kill %q", unsafe)
 		}
 	}
-	for _, safe := range []string{"pkill -9 -x dotnet", "pkill -9 -x aspire"} {
+	// dcp is the orchestrator tree; it outlives the AppHost and binds a random
+	// API-server port, so nothing else in StopApp reaps it.
+	for _, safe := range []string{"pkill -9 -x dotnet", "pkill -9 -x aspire", "pkill -9 -x dcp"} {
 		if !strings.Contains(aspireProcessKillScript, safe) {
 			t.Fatalf("StopApp is missing executable-name process kill %q", safe)
 		}
@@ -372,5 +376,83 @@ func TestRecreateRejectsSidingParkedBeforeLockedReload(t *testing.T) {
 	_, err := Recreate(context.Background(), app, state.Siding{Name: "alpha", Container: "guest", MaterializationPhase: state.PhaseGuest}, false)
 	if err == nil || !strings.Contains(err.Error(), "parked") {
 		t.Fatalf("Recreate() error = %v, want parked-phase rejection", err)
+	}
+}
+
+// Readiness is one rule for every runner: the required routes are listening.
+// An optional route is still bridged and still served, it just does not get to
+// hold the app back, which is what a slow dev server needs.
+func TestProbeAppRunningWaitsForRequiredRoutesOnly(t *testing.T) {
+	tests := []struct {
+		name    string
+		routes  []state.Route
+		up      map[int]bool
+		want    bool
+		probing []int
+	}{
+		{
+			name:    "optional route down does not block",
+			routes:  []state.Route{{Key: "api", GuestPort: 7260}, {Key: "webapp", GuestPort: 5173, Optional: true}},
+			up:      map[int]bool{7260: true},
+			want:    true,
+			probing: []int{7260},
+		},
+		{
+			name:    "required route down blocks",
+			routes:  []state.Route{{Key: "api", GuestPort: 7260}, {Key: "db", GuestPort: 1500}},
+			up:      map[int]bool{7260: true},
+			want:    false,
+			probing: []int{7260, 1500},
+		},
+		{
+			name:    "every required route up",
+			routes:  []state.Route{{Key: "api", GuestPort: 7260}, {Key: "db", GuestPort: 1500}},
+			up:      map[int]bool{7260: true, 1500: true},
+			want:    true,
+			probing: []int{7260, 1500},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var script string
+			restore := probeExec
+			defer func() { probeExec = restore }()
+			probeExec = func(_ context.Context, _ string, args ...string) (string, error) {
+				script = args[len(args)-1]
+				for port, listening := range tc.up {
+					if !listening && strings.Contains(script, fmt.Sprintf(":%d ", port)) {
+						return "down", nil
+					}
+				}
+				for _, r := range tc.routes {
+					if r.Optional {
+						continue
+					}
+					if !tc.up[r.GuestPort] {
+						return "down", nil
+					}
+				}
+				return "up", nil
+			}
+
+			app := state.App{Runner: runner.Custom, FrontDoor: tc.routes}
+			got, err := ProbeAppRunning(context.Background(), app, state.Siding{Container: "guest"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("ready = %v, want %v", got, tc.want)
+			}
+			for _, port := range tc.probing {
+				if !strings.Contains(script, fmt.Sprintf(":%d ", port)) {
+					t.Fatalf("required port %d was not probed:\n%s", port, script)
+				}
+			}
+			for _, r := range tc.routes {
+				if r.Optional && strings.Contains(script, fmt.Sprintf(":%d ", r.GuestPort)) {
+					t.Fatalf("optional port %d must not be probed:\n%s", r.GuestPort, script)
+				}
+			}
+		})
 	}
 }
