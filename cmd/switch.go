@@ -3,7 +3,9 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -204,6 +206,16 @@ func liveMarker(m string) string {
 }
 
 // pickSidingByNumber is the non-TTY fallback: print the list, read a number.
+// sidingRetryHint lists the exact commands that resolve the ambiguity the
+// picker could not resolve on its own.
+func sidingRetryHint(names []string) string {
+	var b strings.Builder
+	for _, n := range names {
+		fmt.Fprintf(&b, "  %s %s\n", commandHint(), n)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 func pickSidingByNumber(app state.App, names []string, statuses map[string]string, in *bufio.Reader) (string, error) {
 	fmt.Println("Select a siding:")
 	for i, n := range names {
@@ -216,6 +228,11 @@ func pickSidingByNumber(app state.App, names []string, statuses map[string]strin
 	fmt.Print("> ")
 	line, err := in.ReadString('\n')
 	if err != nil {
+		// Nothing on stdin at all: the caller is a script or an agent that ran the
+		// command bare. Name the sidings so it can retry without a second probe.
+		if errors.Is(err, io.EOF) && strings.TrimSpace(line) == "" {
+			return "", fmt.Errorf("no siding given and stdin is not interactive.\nRe-run with a name:\n%s", sidingRetryHint(names))
+		}
 		return "", fmt.Errorf("read selection: %w", err)
 	}
 	idx, err := strconv.Atoi(strings.TrimSpace(line))

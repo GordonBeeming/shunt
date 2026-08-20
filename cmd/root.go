@@ -20,6 +20,9 @@ func newRootCmd() *cobra.Command {
 		Short:         "Run parallel app experiments and switch between them with no teardown",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		PersistentPreRun: func(cmd *cobra.Command, _ []string) {
+			invokedCommandPath = cmd.CommandPath()
+		},
 	}
 	root.AddCommand(
 		newVersionCmd(),
