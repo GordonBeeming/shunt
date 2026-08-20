@@ -492,3 +492,55 @@ func TestValidateBaselineVolumeChangeAllowsUninitializedBaselineAndReordering(t 
 		t.Fatalf("uninitialized volume change error = %v", err)
 	}
 }
+
+func TestWarnStaleGuestsOnlyForGuestBackedSidings(t *testing.T) {
+	base := state.App{
+		Env:    map[string]string{"A": "1"},
+		Mounts: []state.MountSpec{{Host: "~/x", Guest: "/x", ReadOnly: true}},
+		Memory: "4g",
+		CPUs:   "4",
+	}
+	guest := map[string]state.Siding{
+		"one": {MaterializationPhase: state.PhaseGuest},
+		"two": {MaterializationPhase: ""}, // pre-dates the phase field: still a guest
+	}
+	worktree := map[string]state.Siding{"one": {MaterializationPhase: state.PhaseWorktree}}
+
+	tests := []struct {
+		name    string
+		mutate  func(*state.App)
+		sidings map[string]state.Siding
+		want    []string
+		quiet   bool
+	}{
+		{name: "env change with guests", mutate: func(a *state.App) { a.Env = map[string]string{"A": "2"} }, sidings: guest, want: []string{"env", "reapply one", "reapply two"}},
+		{name: "mounts change with guests", mutate: func(a *state.App) { a.Mounts = nil }, sidings: guest, want: []string{"mounts"}},
+		{name: "memory and cpus change", mutate: func(a *state.App) { a.Memory, a.CPUs = "12g", "8" }, sidings: guest, want: []string{"memory and cpus"}},
+		{name: "no guest-fixed change", mutate: func(a *state.App) { a.Start = "different" }, sidings: guest, quiet: true},
+		{name: "change but only worktree sidings", mutate: func(a *state.App) { a.Env = map[string]string{"A": "2"} }, sidings: worktree, quiet: true},
+		{name: "change but no sidings at all", mutate: func(a *state.App) { a.Env = nil }, sidings: nil, quiet: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			existing := base
+			existing.Sidings = tc.sidings
+			updated := base
+			updated.Sidings = tc.sidings
+			tc.mutate(&updated)
+
+			var out strings.Builder
+			warnStaleGuests(&out, existing, updated)
+			if tc.quiet {
+				if out.Len() != 0 {
+					t.Fatalf("expected no warning, got %q", out.String())
+				}
+				return
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(out.String(), want) {
+					t.Fatalf("warning missing %q:\n%s", want, out.String())
+				}
+			}
+		})
+	}
+}

@@ -5,9 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -308,6 +312,9 @@ func newAppAddCmd() *cobra.Command {
 				for _, r := range app.FrontDoor {
 					fmt.Printf("  %-10s %-6s localhost:%d  ->  %s/%s\n", r.Key, r.Kind, r.ListenPort, r.Resource, r.Endpoint)
 				}
+				if updating {
+					warnStaleGuests(os.Stdout, existing, app)
+				}
 				fmt.Println("next: `" + bin() + " new <name>` to create a siding")
 				return errors.Join(durabilityErrs...)
 			})
@@ -398,4 +405,60 @@ func promptStartCommand(project string) (string, error) {
 		return "", fmt.Errorf("no start command given — set `runner` + `start` in .shunt.app.json")
 	}
 	return cmd, nil
+}
+
+// changedGuestSettings lists the contract settings that a guest fixes at
+// creation. `container run` bakes them in, so a guest that already exists keeps
+// whatever it was built with no matter what the contract now says.
+func changedGuestSettings(existing, updated state.App) []string {
+	var changed []string
+	if !maps.Equal(existing.Env, updated.Env) {
+		changed = append(changed, "env")
+	}
+	if !slices.Equal(existing.Mounts, updated.Mounts) {
+		changed = append(changed, "mounts")
+	}
+	if existing.Memory != updated.Memory {
+		changed = append(changed, "memory")
+	}
+	if existing.CPUs != updated.CPUs {
+		changed = append(changed, "cpus")
+	}
+	return changed
+}
+
+// materializedGuests names the sidings grown far enough to have a guest. An
+// empty phase predates the phase field and means guest.
+func materializedGuests(app state.App) []string {
+	var names []string
+	for name, sd := range app.Sidings {
+		if sd.MaterializationPhase == state.PhaseGuest || sd.MaterializationPhase == "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// warnStaleGuests reports settings that changed in the contract but cannot reach
+// a guest that already exists. Registration still succeeded, so this warns
+// rather than failing: the new values apply to the next guest either way.
+func warnStaleGuests(out io.Writer, existing, updated state.App) {
+	changed := changedGuestSettings(existing, updated)
+	stale := materializedGuests(updated)
+	if len(changed) == 0 || len(stale) == 0 {
+		return
+	}
+	fmt.Fprintf(out, "warning: %s changed, but %s already built with the old values.\n",
+		strings.Join(changed, " and "), pluralGuests(len(stale)))
+	for _, name := range stale {
+		fmt.Fprintf(out, "  %s reapply %s && %s up %s\n", bin(), name, bin(), name)
+	}
+}
+
+func pluralGuests(n int) string {
+	if n == 1 {
+		return "1 guest was"
+	}
+	return fmt.Sprintf("%d guests were", n)
 }
