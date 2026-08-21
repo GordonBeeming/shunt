@@ -46,7 +46,7 @@ Tests that spin up their own containers (Testcontainers and the like) are the ex
 
 `node_modules` is the other exception. The worktree is shared between macOS and the Linux guest, but npm installs native binaries for whichever platform it ran on, so `npm install` on the host leaves darwin binaries the guest cannot load and a Vite/rolldown build inside the guest dies with "Cannot find native binding". Install node dependencies where the app runs: `{{shunt-command}} run <siding> npm install`. One `node_modules` cannot serve both platforms, so that leaves the host unable to build the same tree until you reinstall there — worth saying to the user before you switch a project over.
 
-A .NET apphost is the same class of problem. Host builds stay the default because they cost no guest resources, but `bin` and `obj` are shared with the guest, and an apphost is a native per-platform executable, so a host `dotnet build` leaves macOS binaries where the guest expects Linux ones. Nothing fails at build time, so the first sign is the guest process dying with `Exec format error`. If that happens, delete the affected project's `bin` and `obj`, then rebuild in the guest with `{{shunt-command}} run <siding> dotnet build`.
+A .NET apphost is the same class of problem. Host builds stay the default because they cost no guest resources, but `bin` and `obj` are shared with the guest, and an apphost is a native per-platform executable, so a host `dotnet build` leaves macOS binaries where the guest expects Linux ones. Nothing fails at build time, so the first sign is the guest process dying with `Exec format error`. If that happens, rebuild in the guest with `{{shunt-command}} run <siding> dotnet build`, which is usually enough on its own. If it is not, delete the affected project's `bin` and `obj` and build again.
 
 Once it builds and the tests pass, bring it online without stealing the front door, then go live deliberately:
 
@@ -83,6 +83,12 @@ Ending the stuck command releases the lock, and everything queued behind it proc
 If that is not enough, `{{shunt-command}} restart <siding>` reaps the app's own processes while leaving the guest, its Docker daemon, dependency containers, and data untouched. It is the cheap fix, and it comes before anything heavier.
 
 Recreating or killing the guest is the last resort. It works, but it costs you the running stack: data, dependency containers, all of it.
+
+## A guest resolves DNS through the host
+
+A guest's only nameserver is the host side of the container bridge, so it resolves exactly what the host resolves and nothing more. Turning off a VPN's DNS, or losing a split-horizon resolver, takes those names away from every guest at the same time.
+
+That failure surfaces a long way from its cause. A resource that cannot resolve a name never reports healthy, so anything gated on that resource waits forever. The command you ran then hangs on the gate rather than on the name. When a resource will not come up, check what the host can resolve before looking at the app.
 
 ## Cleaning up sidings without losing work
 
