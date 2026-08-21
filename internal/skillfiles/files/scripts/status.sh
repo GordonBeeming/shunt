@@ -37,6 +37,17 @@ for s in sids:
     label = ",".join(flags) or "idle"
     print(f"  {s['name']:<16} [{label}]")
     print(f"      edit: {s['src']}")
+    probe_error = s.get("probeError", "")
+    if probe_error:
+        print(f"      probe error: {probe_error}")
+    elif s["guestRunning"] and not s["appRunning"]:
+        def route_label(r):
+            port = r.get("guestPort", 0)
+            return f"{r['key']}({port if port > 0 else 'no guestPort'})"
+        waiting = [route_label(r) for r in s.get("routes") or []
+                   if not r.get("optional") and not r.get("listening")]
+        if waiting:
+            print(f"      waiting on: {', '.join(waiting)}")
     if not registered:
         print("      next: edit and test in this worktree")
     elif not s["appRunning"]:
