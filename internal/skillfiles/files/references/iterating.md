@@ -102,14 +102,16 @@ Shunt does not clone that store per siding. Mount `~/.microsoft/usersecrets` rea
 
 ## Reading `active --json` to decide the next move
 
+`appRunning` is all-or-nothing across every non-optional route, so a large app can report `appRunning: false` while most of it already serves. An agent that only needs one resource should read that route's own entry in `routes` (`guestPort`, `listening`) rather than wait on `appRunning`. When `probeError` is set, shunt could not tell: read that as unknown, not not-ready. Treating unknown as not-ready is what turns a readiness poll into a wait with no end.
+
 - `managed == false` → create a worktree with `{{shunt-command}} new <name>`
 - `managed == true` and `registered == false` → edit/test in a siding; add `.shunt.app.json` and run `{{shunt-command}} app add` before any guest operation
-- `registered == true` and `appRunning == false` → `{{shunt-command}} up <name>`
+- `registered == true` and `appRunning == false` → `{{shunt-command}} up <name>`, unless the task only needs one resource; check that route's entry in `routes` first, since it may already be listening
 - `registered == true`, `appRunning == true`, but `live == false` → `{{shunt-command}} switch <name>`
 - `registered`, `appRunning`, and `live` all `true` → it's already serving; nothing to do
 
 `active` retains its compatibility meaning of a registered app. New consumers should use `managed` to distinguish no state from worktree-only state, and `registered` before recommending guest commands.
-Use `--json` for that decision: it exits successfully whenever discovery succeeds. Plain `active` retains its legacy exit-status contract and exits non-zero for worktree-only as well as unmanaged directories, even though it prints the discovered worktree details.
+Use `--json` for that decision: it exits successfully whenever discovery succeeds. Plain `active` retains its legacy exit-status contract and exits non-zero for worktree-only as well as unmanaged directories, even though it prints the discovered worktree details; plain mode also names the routes a siding is waiting on.
 
 `scripts/status.sh` wraps this and prints the recommended next command.
 
