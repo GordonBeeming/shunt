@@ -46,6 +46,8 @@ Tests that spin up their own containers (Testcontainers and the like) are the ex
 
 `node_modules` is the other exception. The worktree is shared between macOS and the Linux guest, but npm installs native binaries for whichever platform it ran on, so `npm install` on the host leaves darwin binaries the guest cannot load and a Vite/rolldown build inside the guest dies with "Cannot find native binding". Install node dependencies where the app runs: `{{shunt-command}} run <siding> npm install`. One `node_modules` cannot serve both platforms, so that leaves the host unable to build the same tree until you reinstall there — worth saying to the user before you switch a project over.
 
+A .NET apphost is the same class of problem. Host builds stay the default because they cost no guest resources, but `bin` and `obj` are shared with the guest, and an apphost is a native per-platform executable, so a host `dotnet build` leaves macOS binaries where the guest expects Linux ones. Nothing fails at build time, so the first sign is the guest process dying with `Exec format error`. If that happens, delete the affected project's `bin` and `obj`, then rebuild in the guest with `{{shunt-command}} run <siding> dotnet build`.
+
 Once it builds and the tests pass, bring it online without stealing the front door, then go live deliberately:
 
 1. **Ask the user first, then `{{shunt-command}} up <name> --no-bridge`** — starts the app in the guest but leaves the host alone: no socat bridges and no Caddy, so nothing is taken from whatever's currently live. Check the runner's guest output (the Aspire dashboard for an Aspire app) to confirm the app actually comes up ("would it work").
