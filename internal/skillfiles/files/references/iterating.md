@@ -64,6 +64,24 @@ The guest, its Docker daemon, and the dependency containers (SQL etc.) are separ
 
 So the loop is: `up` once, then edit-and-hot-reload, and reach for `restart` when watch falls short. You should rarely pay the cold start again on a warmed project.
 
+## When a guest command does not answer
+
+Guest commands are serialized per siding: `run`, `logs`, `git`, `sync`, and `playwright` take the same exclusive lock as `up`, `kill`, and `data promote`, so only one of them runs against a given siding at a time. A command against a different siding is unaffected. Whichever one is waiting on that lock says so on stderr after a couple of seconds, naming the pid holding it, that process's command line, and how long it has held it, then repeats every 15 seconds or so for as long as the wait continues. It never times out, because a legitimate `up` can hold the same lock for many minutes.
+
+So a command that looks hung is usually queued behind another command on the same siding, not a dead guest. Read the wait message: it names the exact process to go look at.
+
+That serialization is what turns one stuck command into what reads as a dead siding. `{{shunt-command}} logs` is the command an agent reaches for next to check on a hung `run`, and it takes the same lock, so it waits too. The wait message appears there as well: read it, rather than concluding the guest itself needs restarting.
+
+Before suspecting the guest, check it. `{{shunt-command}} active --json` gives the guest's IP. A guest that answers `ping` and reports a low load average is not a guest that needs restarting; it is idle and reachable, just behind the lock.
+
+The command most likely to hold the lock forever is one that waits on a condition the app itself cannot satisfy. `aspire resource <name> restart` blocks until that resource reports healthy, so a resource whose dependency has an unsatisfiable health gate never returns. Check the dependency chain before issuing a command like that, and once it is stuck, do not cancel it partway: cancelling on the host leaves the guest-side process running, and the lock stays held.
+
+Ending the stuck command releases the lock, and everything queued behind it proceeds immediately.
+
+If that is not enough, `{{shunt-command}} restart <siding>` reaps the app's own processes while leaving the guest, its Docker daemon, dependency containers, and data untouched. It is the cheap fix, and it comes before anything heavier.
+
+Recreating or killing the guest is the last resort. It works, but it costs you the running stack: data, dependency containers, all of it.
+
 ## Cleaning up sidings without losing work
 
 Run `{{shunt-command}} cleanup` from the registered repo when several sidings are finished. It lists every siding for that project, lets you select more than one, and marks worktrees with uncommitted or untracked files, or commits reachable only from that siding branch. After the selection, a protected siding gets a second confirmation before Shunt removes its guest, worktree, branch, and data.
