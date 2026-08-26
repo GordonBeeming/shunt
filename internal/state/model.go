@@ -140,7 +140,14 @@ type App struct {
 	DisableCache bool              `json:"disableCache,omitempty"`
 	Sidings      map[string]Siding `json:"sidings"`
 	LiveSiding   string            `json:"liveSiding"` // "" = nothing live
-	Removal      *RemovalOperation `json:"removal,omitempty"`
+	// FrontDoorReleased records that the app deliberately gave its fixed ports
+	// back to the host, so nothing is bound even though LiveSiding still names a
+	// siding. LiveSiding is kept so a later claim knows where to point; without
+	// this flag the reporting commands would keep calling that siding "live"
+	// while its ports answer nothing. Omitted from state written before the flag
+	// existed, which reads back as false: a front door that was never released.
+	FrontDoorReleased bool              `json:"frontDoorReleased,omitempty"`
+	Removal           *RemovalOperation `json:"removal,omitempty"`
 }
 
 // PrebakeBuild declares one local image build that feeds shunt's shared,
