@@ -81,6 +81,10 @@
   .siding .nm { font-family: var(--mono); font-size: 13px; font-weight: 600; }
   .badge { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; padding: 2px 8px; border-radius: 999px; }
   .badge.live { background: var(--up); color: #fff; }
+  /* --busy is the file's existing "operator did this on purpose, pay attention"
+     register (removal-in-progress banner, transient action status) — reused
+     here rather than --up (green reads as healthy/serving, which this isn't). */
+  .badge.released { background: var(--busy); color: var(--on-primary); }
   .badge.base { background: var(--primary); color: var(--on-primary); }
   .badge.phase { background: var(--ui); color: var(--text); }
   .guest { font-size: 11px; color: var(--text2); }
@@ -177,7 +181,10 @@ function actionHTML(appName, s, removalActive){
 }
 
 function sidingHTML(appName, s, removalActive){
-  const liveBadge = s.live ? '<span class="badge live">live</span>' : '';
+  // A released front door still marks its siding live (a later claim needs to
+  // know where to point), but nothing is actually bound — badging it "live"
+  // would read as serving when it isn't, so "released" takes precedence.
+  const liveBadge = s.released ? '<span class="badge released">released</span>' : (s.live ? '<span class="badge live">live</span>' : '');
   const baseBadge = s.base ? '<span class="badge base">base</span>' : '';
   const phaseBadge = `<span class="badge phase" title="persisted siding phase">${esc(s.phase || 'worktree')}</span>`;
   const status = `<span class="status terminal-status" role="status" aria-live="polite">${esc(s.status || '')}</span>`;

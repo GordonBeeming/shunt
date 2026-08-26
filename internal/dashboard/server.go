@@ -141,8 +141,12 @@ type routeView struct {
 }
 
 type sidingView struct {
-	Name          string   `json:"name"`
-	Live          bool     `json:"live"`
+	Name string `json:"name"`
+	Live bool   `json:"live"`
+	// Released is true only for the live siding of an app whose front door was
+	// deliberately released: Live stays true (a later claim needs somewhere to
+	// point), but nothing is bound, so the page must not badge it as serving.
+	Released      bool     `json:"released,omitempty"`
 	Base          bool     `json:"base"`
 	Phase         string   `json:"phase"`   // persisted: worktree | data | guest | parked
 	Runtime       string   `json:"runtime"` // observed: running | stopped | missing | runtime-unavailable
@@ -156,11 +160,14 @@ type sidingView struct {
 }
 
 type appView struct {
-	Name       string       `json:"name"`
-	LiveSiding string       `json:"liveSiding"`
-	Removal    *removalView `json:"removal,omitempty"`
-	Sidings    []sidingView `json:"sidings"`
-	Routes     []routeView  `json:"routes"`
+	Name       string `json:"name"`
+	LiveSiding string `json:"liveSiding"`
+	// FrontDoorReleased mirrors state.App.FrontDoorReleased, matching the field
+	// name `ls --json` and `active --json` already expose.
+	FrontDoorReleased bool         `json:"frontDoorReleased,omitempty"`
+	Removal           *removalView `json:"removal,omitempty"`
+	Sidings           []sidingView `json:"sidings"`
+	Routes            []routeView  `json:"routes"`
 }
 
 type removalView struct {
@@ -212,7 +219,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		if _, exists := app.Sidings[live]; live != "" && !exists {
 			live = ""
 		}
-		av := appView{Name: app.Name, LiveSiding: live, Routes: []routeView{}, Sidings: []sidingView{}, Removal: removalStatus(app.Removal)}
+		av := appView{Name: app.Name, LiveSiding: live, FrontDoorReleased: app.FrontDoorReleased, Routes: []routeView{}, Sidings: []sidingView{}, Removal: removalStatus(app.Removal)}
 
 		// Liveness is a front-door dial (through Caddy) — see routeUp for why we
 		// can't dial the guest directly from the launchd dashboard. The guest's own
@@ -254,6 +261,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 			sv := sidingView{
 				Name:          sn,
 				Live:          live == sn,
+				Released:      live == sn && app.FrontDoorReleased,
 				Base:          app.BaseSiding == sn,
 				Phase:         string(phase),
 				Runtime:       runtimeState,
