@@ -79,11 +79,11 @@ func TestAppSwitchReleaseFreesRoutesAndMarksReleased(t *testing.T) {
 	configDir := t.TempDir()
 	app := state.App{
 		Version:   state.StateVersion,
-		Name:      "HubX",
+		Name:      "Alpha",
 		ConfigDir: configDir,
 		FrontDoor: []state.Route{
-			{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_HubX_http_web"},
-			{Key: "api", Kind: state.KindHTTP, ListenPort: 4101, CaddyID: "app_HubX_http_api"},
+			{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_Alpha_http_web"},
+			{Key: "api", Kind: state.KindHTTP, ListenPort: 4101, CaddyID: "app_Alpha_http_api"},
 		},
 	}
 	registerApp(t, app)
@@ -95,12 +95,12 @@ func TestAppSwitchReleaseFreesRoutesAndMarksReleased(t *testing.T) {
 	}
 
 	cmd := newAppSwitchCmd()
-	cmd.SetArgs([]string{"HubX", "--release"})
+	cmd.SetArgs([]string{"Alpha", "--release"})
 	out, err := captureStdout(t, func() error { return cmd.ExecuteContext(context.Background()) })
 	if err != nil {
 		t.Fatalf("release: %v (output=%s)", err, out)
 	}
-	if removedFor.Name != "HubX" || len(removedFor.FrontDoor) != 2 {
+	if removedFor.Name != "Alpha" || len(removedFor.FrontDoor) != 2 {
 		t.Fatalf("RemoveFrontDoor was not called with the full route set: %#v", removedFor)
 	}
 	saved, err := state.LoadApp(configDir)
@@ -110,7 +110,7 @@ func TestAppSwitchReleaseFreesRoutesAndMarksReleased(t *testing.T) {
 	if !saved.FrontDoorReleased {
 		t.Fatal("FrontDoorReleased was not set")
 	}
-	for _, want := range []string{"released HubX front door", "freed :4100 :4101", "reclaim with", "app switch HubX"} {
+	for _, want := range []string{"released Alpha front door", "freed :4100 :4101", "reclaim with", "app switch Alpha"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}
@@ -125,9 +125,9 @@ func TestAppSwitchReleaseAlreadyReleasedIsANoOp(t *testing.T) {
 	configDir := t.TempDir()
 	app := state.App{
 		Version:           state.StateVersion,
-		Name:              "HubX",
+		Name:              "Alpha",
 		ConfigDir:         configDir,
-		FrontDoor:         []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_HubX_http_web"}},
+		FrontDoor:         []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_Alpha_http_web"}},
 		FrontDoorReleased: true,
 	}
 	registerApp(t, app)
@@ -136,7 +136,7 @@ func TestAppSwitchReleaseAlreadyReleasedIsANoOp(t *testing.T) {
 	appSwitchRemoveFrontDoor = func(context.Context, *caddy.Admin, state.App) error { called = true; return nil }
 
 	cmd := newAppSwitchCmd()
-	cmd.SetArgs([]string{"HubX", "--release"})
+	cmd.SetArgs([]string{"Alpha", "--release"})
 	out, err := captureStdout(t, func() error { return cmd.ExecuteContext(context.Background()) })
 	if err != nil {
 		t.Fatalf("release: %v (output=%s)", err, out)
@@ -157,9 +157,9 @@ func TestAppSwitchClaimClearsFrontDoorReleasedOnTarget(t *testing.T) {
 	configDir := t.TempDir()
 	app := state.App{
 		Version:           state.StateVersion,
-		Name:              "HubX",
+		Name:              "Alpha",
 		ConfigDir:         configDir,
-		FrontDoor:         []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_HubX_http_web"}},
+		FrontDoor:         []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_Alpha_http_web"}},
 		FrontDoorReleased: true,
 	}
 	registerApp(t, app)
@@ -173,7 +173,7 @@ func TestAppSwitchClaimClearsFrontDoorReleasedOnTarget(t *testing.T) {
 	appSwitchSwitchTo = func(context.Context, *state.App, string) error { switchToCalled = true; return nil }
 
 	cmd := newAppSwitchCmd()
-	cmd.SetArgs([]string{"HubX"})
+	cmd.SetArgs([]string{"Alpha"})
 	if err := cmd.ExecuteContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -200,9 +200,9 @@ func TestAppSwitchClaimPointsAtLiveSiding(t *testing.T) {
 	configDir := t.TempDir()
 	app := state.App{
 		Version:    state.StateVersion,
-		Name:       "HubX",
+		Name:       "Alpha",
 		ConfigDir:  configDir,
-		FrontDoor:  []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_HubX_http_web"}},
+		FrontDoor:  []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_Alpha_http_web"}},
 		LiveSiding: "one",
 		Sidings:    map[string]state.Siding{"one": {Name: "one"}},
 	}
@@ -215,7 +215,7 @@ func TestAppSwitchClaimPointsAtLiveSiding(t *testing.T) {
 	}
 
 	cmd := newAppSwitchCmd()
-	cmd.SetArgs([]string{"HubX"})
+	cmd.SetArgs([]string{"Alpha"})
 	if err := cmd.ExecuteContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -232,9 +232,9 @@ func TestAppSwitchClaimParksConflictingAppAndMarksItReleased(t *testing.T) {
 	targetDir, otherDir := t.TempDir(), t.TempDir()
 	target := state.App{
 		Version:   state.StateVersion,
-		Name:      "HubX",
+		Name:      "Alpha",
 		ConfigDir: targetDir,
-		FrontDoor: []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_HubX_http_web"}},
+		FrontDoor: []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_Alpha_http_web"}},
 	}
 	other := state.App{
 		Version:   state.StateVersion,
@@ -252,7 +252,7 @@ func TestAppSwitchClaimParksConflictingAppAndMarksItReleased(t *testing.T) {
 	}
 
 	cmd := newAppSwitchCmd()
-	cmd.SetArgs([]string{"HubX"})
+	cmd.SetArgs([]string{"Alpha"})
 	out, err := captureStdout(t, func() error { return cmd.ExecuteContext(context.Background()) })
 	if err != nil {
 		t.Fatalf("claim: %v (output=%s)", err, out)
@@ -280,11 +280,11 @@ func TestAppSwitchClaimLeavesFlagFalseOnAPartialPark(t *testing.T) {
 	targetDir, otherDir := t.TempDir(), t.TempDir()
 	target := state.App{
 		Version:   state.StateVersion,
-		Name:      "HubX",
+		Name:      "Alpha",
 		ConfigDir: targetDir,
-		FrontDoor: []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_HubX_http_web"}},
+		FrontDoor: []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_Alpha_http_web"}},
 	}
-	// Vite holds 2 ports; only :4100 conflicts with HubX. Its :4101 keeps
+	// Vite holds 2 ports; only :4100 conflicts with Alpha. Its :4101 keeps
 	// serving after the switch, so it must not be reported as released.
 	other := state.App{
 		Version:   state.StateVersion,
@@ -305,7 +305,7 @@ func TestAppSwitchClaimLeavesFlagFalseOnAPartialPark(t *testing.T) {
 	}
 
 	cmd := newAppSwitchCmd()
-	cmd.SetArgs([]string{"HubX"})
+	cmd.SetArgs([]string{"Alpha"})
 	out, err := captureStdout(t, func() error { return cmd.ExecuteContext(context.Background()) })
 	if err != nil {
 		t.Fatalf("claim: %v (output=%s)", err, out)
@@ -333,9 +333,9 @@ func TestAppSwitchClaimFailsWhenParkingDeleteFails(t *testing.T) {
 	targetDir, otherDir := t.TempDir(), t.TempDir()
 	target := state.App{
 		Version:   state.StateVersion,
-		Name:      "HubX",
+		Name:      "Alpha",
 		ConfigDir: targetDir,
-		FrontDoor: []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_HubX_http_web"}},
+		FrontDoor: []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_Alpha_http_web"}},
 	}
 	other := state.App{
 		Version:   state.StateVersion,
@@ -350,7 +350,7 @@ func TestAppSwitchClaimFailsWhenParkingDeleteFails(t *testing.T) {
 	appSwitchDeleteRouteIfExists = func(context.Context, *caddy.Admin, string) error { return sentinel }
 
 	cmd := newAppSwitchCmd()
-	cmd.SetArgs([]string{"HubX"})
+	cmd.SetArgs([]string{"Alpha"})
 	out, err := captureStdout(t, func() error { return cmd.ExecuteContext(context.Background()) })
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want %v", err, sentinel)
@@ -375,9 +375,9 @@ func TestAppSwitchClaimWarnsAndContinuesOnAnUnreadableRegistryEntry(t *testing.T
 	targetDir := t.TempDir()
 	registerApp(t, state.App{
 		Version:   state.StateVersion,
-		Name:      "HubX",
+		Name:      "Alpha",
 		ConfigDir: targetDir,
-		FrontDoor: []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_HubX_http_web"}},
+		FrontDoor: []state.Route{{Key: "web", Kind: state.KindHTTP, ListenPort: 4100, CaddyID: "app_Alpha_http_web"}},
 	})
 	// Register "Broken" pointing at a config dir with no state file at all —
 	// the same shape as a corrupted or half-written registry entry.
@@ -389,7 +389,7 @@ func TestAppSwitchClaimWarnsAndContinuesOnAnUnreadableRegistryEntry(t *testing.T
 	}
 
 	cmd := newAppSwitchCmd()
-	cmd.SetArgs([]string{"HubX"})
+	cmd.SetArgs([]string{"Alpha"})
 	var stderr string
 	oldStderr := os.Stderr
 	r, w, err := os.Pipe()
@@ -461,10 +461,10 @@ func TestAppSwitchClaimFailsFastWhenCaddyIsUnreachable(t *testing.T) {
 	appSwitchPrepareCaddy = func(context.Context) (*caddy.Admin, error) { return nil, sentinel }
 
 	configDir := t.TempDir()
-	registerApp(t, state.App{Version: state.StateVersion, Name: "HubX", ConfigDir: configDir})
+	registerApp(t, state.App{Version: state.StateVersion, Name: "Alpha", ConfigDir: configDir})
 
 	cmd := newAppSwitchCmd()
-	cmd.SetArgs([]string{"HubX"})
+	cmd.SetArgs([]string{"Alpha"})
 	if err := cmd.ExecuteContext(context.Background()); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want %v", err, sentinel)
 	}
