@@ -58,7 +58,7 @@ func TestRenderedStatusScriptListsWaitingOnRoutesForAGuestUpButNotServingSiding(
 	}
 	fakeBinary := filepath.Join(t.TempDir(), "shunt-dev")
 	fake := `#!/bin/sh
-printf '%s\n' '{"active":true,"managed":true,"registered":true,"project":"sample","sidings":[{"name":"feature-flag-admin","live":false,"appRunning":false,"guestRunning":true,"src":"/work/feature-flag-admin","ip":"10.0.0.2","dashboard":"","routes":[{"key":"client-portal-ui","guestPort":5100,"listening":false},{"key":"hub-api","guestPort":7219,"listening":false},{"key":"gateway","guestPort":7022,"listening":true},{"key":"webapp","guestPort":5173,"optional":true,"listening":false}]}]}'
+printf '%s\n' '{"active":true,"managed":true,"registered":true,"project":"sample","sidings":[{"name":"one","live":false,"appRunning":false,"guestRunning":true,"src":"/work/one","ip":"10.0.0.2","dashboard":"","routes":[{"key":"storefront","guestPort":5100,"listening":false},{"key":"api","guestPort":7219,"listening":false},{"key":"gateway","guestPort":7022,"listening":true},{"key":"webapp","guestPort":5173,"optional":true,"listening":false}]}]}'
 `
 	if err := os.WriteFile(fakeBinary, []byte(fake), 0o700); err != nil {
 		t.Fatal(err)
@@ -70,7 +70,7 @@ printf '%s\n' '{"active":true,"managed":true,"registered":true,"project":"sample
 		t.Fatalf("status script: %v\n%s", err, out)
 	}
 	text := string(out)
-	if !strings.Contains(text, "waiting on: client-portal-ui(5100), hub-api(7219)") {
+	if !strings.Contains(text, "waiting on: storefront(5100), api(7219)") {
 		t.Fatalf("status output omits the routes still down:\n%s", text)
 	}
 	for _, unwanted := range []string{"gateway(7022)", "webapp(5173)"} {
@@ -88,7 +88,7 @@ func TestRenderedStatusScriptPrintsProbeErrorInsteadOfWaitingOnRoutes(t *testing
 	}
 	fakeBinary := filepath.Join(t.TempDir(), "shunt-dev")
 	fake := `#!/bin/sh
-printf '%s\n' '{"active":true,"managed":true,"registered":true,"project":"sample","sidings":[{"name":"feature-flag-admin","live":false,"appRunning":false,"guestRunning":true,"src":"/work/feature-flag-admin","ip":"10.0.0.2","dashboard":"","probeError":"probe routes for \"feature-flag-admin\": exec into guest did not answer within 5s"}]}'
+printf '%s\n' '{"active":true,"managed":true,"registered":true,"project":"sample","sidings":[{"name":"one","live":false,"appRunning":false,"guestRunning":true,"src":"/work/one","ip":"10.0.0.2","dashboard":"","probeError":"probe routes for \"one\": exec into guest did not answer within 5s"}]}'
 `
 	if err := os.WriteFile(fakeBinary, []byte(fake), 0o700); err != nil {
 		t.Fatal(err)
@@ -100,7 +100,7 @@ printf '%s\n' '{"active":true,"managed":true,"registered":true,"project":"sample
 		t.Fatalf("status script: %v\n%s", err, out)
 	}
 	text := string(out)
-	if !strings.Contains(text, "probe error: probe routes for \"feature-flag-admin\": exec into guest did not answer within 5s") {
+	if !strings.Contains(text, "probe error: probe routes for \"one\": exec into guest did not answer within 5s") {
 		t.Fatalf("status output omits the probe error:\n%s", text)
 	}
 	if strings.Contains(text, "waiting on:") {
