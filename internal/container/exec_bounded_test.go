@@ -98,7 +98,7 @@ func TestParseAttachedExecsExtractsRightGuestOnly(t *testing.T) {
 }
 
 func TestSidingNameHintDerivesShortNameFromPrefixedGuest(t *testing.T) {
-	if got := sidingNameHint("shuntdev_HubX_feature-flag-admin"); got != "feature-flag-admin" {
+	if got := sidingNameHint("shuntdev_Alpha_one"); got != "one" {
 		t.Fatalf("sidingNameHint() = %q", got)
 	}
 	if got := sidingNameHint("no-underscore"); got != "no-underscore" {
