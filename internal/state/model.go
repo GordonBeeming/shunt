@@ -79,8 +79,8 @@ type Registry struct {
 }
 
 // FindProject looks up a project by name — exact first, then case-insensitively.
-// macOS paths are case-insensitive, so a cwd basename or arg like "hubX" must still
-// resolve the registered "HubX". Returns the canonical registered name, its config
+// macOS paths are case-insensitive, so a cwd basename or arg like "myApp" must still
+// resolve the registered "MyApp". Returns the canonical registered name, its config
 // dir, and whether it was found.
 func (r Registry) FindProject(name string) (canonical, dir string, ok bool) {
 	if d, found := r.Projects[name]; found {
