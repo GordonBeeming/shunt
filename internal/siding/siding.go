@@ -46,6 +46,7 @@ var (
 	execGuestStdinFileDigest = container.ExecStdinFileDigest
 	removeGuest              = container.Remove
 	runGuest                 = container.Run
+	containerVersionCheck    = container.CheckMinimum
 	ensureBaseImage          = image.EnsureBuilt
 	stopGuest                = container.Stop
 	startGuest               = container.Start
@@ -1781,6 +1782,13 @@ func recreate(ctx context.Context, app state.App, sd state.Siding, freshData boo
 		if err := os.MkdirAll(filepath.Join(volRoot, vol), 0o755); err != nil {
 			return sd, err
 		}
+	}
+	// Fail before creating anything when the host CLI cannot accept the flags a
+	// guest needs. Left unchecked this surfaces as `container exited 64: Unknown
+	// option`, which reads as a corrupt guest and invites `reapply` or `rm` —
+	// neither of which touches the host tooling that is actually at fault.
+	if err := containerVersionCheck(ctx); err != nil {
+		return sd, err
 	}
 	if err := runGuest(ctx, container.RunOpts{
 		Name:            sd.Container,
