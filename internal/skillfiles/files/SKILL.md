@@ -78,6 +78,20 @@ guest's next build fails with `NETSDK1064` and the running app can die with `Exe
 the cost of a host test run against a siding checkout, and the repair is a restore and rebuild inside the
 guest afterwards.
 
+**A killed run leaks its containers, and the reaper does not save you.** Testcontainers starts a
+`ryuk` sidecar to clean up after the run, but ryuk is a child of that run. Cancel a suite, or let it
+time out, and ryuk dies with it holding nothing to reap against, so the SQL Server, Azurite and
+smtp4dev it was meant to remove stay up indefinitely. A clean exit reaps correctly; a kill does not.
+
+That matters on a shared machine, because the memory is not returned and the next person's suite
+fails to start with a timeout that looks like their own code. Check with `docker ps` before
+concluding a failure is yours, and reclaim with `docker container prune`.
+
+Read a container census as valid only at the instant it is taken. Runs finish underneath you, so a
+list gathered a few minutes ago will name containers that have since exited and miss ones that
+started. Measure and act in the same breath, and never kill a container without confirming it has no
+live parent process.
+
 ## Browser automation & recording
 
 Guests bake in headless Chromium, `playwright-cli`, and the `playwright` Node library, so a browser session can run **inside** a siding instead of on the host. `{{shunt-command}} playwright [siding] [args...]` execs `playwright-cli <args>` in the guest, stdio passed through — every arg goes straight to `playwright-cli` (the command has no flags of its own beyond `-h`). Siding resolution matches `run`: the one your cwd is inside, else a leading arg naming a siding, else the live siding. The image's global playwright-cli config also pins the browser (`chromium`, sandbox off), so a bare `playwright-cli open <url>` just works — no `--browser` flag needed. See [references/commands.md](references/commands.md) for the full command surface.
