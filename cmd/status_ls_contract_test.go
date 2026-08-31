@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -271,4 +272,58 @@ func containsAll(value string, values ...string) bool {
 		}
 	}
 	return true
+}
+
+func TestSidingReclaimableNeverOffersLiveBaseOrARunningGuest(t *testing.T) {
+	app := state.App{
+		Name:       "Alpha",
+		LiveSiding: "live",
+		BaseSiding: "base",
+		Sidings: map[string]state.Siding{
+			"live": {Name: "live"}, "base": {Name: "base"}, "busy": {Name: "busy"},
+		},
+	}
+	// Each of these is excluded before any Git work happens, so the analyzer is
+	// never reached and the answer cannot depend on the worktree's state.
+	for _, c := range []struct{ name, guest string }{
+		{"live", "stopped"}, // the front-door target: switch away first
+		{"base", "stopped"}, // removing the base needs a successor
+		{"busy", "running"}, // a run inside the guest leaves no trace in Git
+	} {
+		got := sidingReclaimable(context.Background(), app, c.name, c.guest)
+		if got == nil || *got {
+			t.Errorf("sidingReclaimable(%q, guest=%s) = %v, want a definite false", c.name, c.guest, got)
+		}
+	}
+}
+
+func TestReclaimableFooterIsSilentUnlessAsked(t *testing.T) {
+	yes := true
+	apps := []lsApp{{Name: "Alpha", Sidings: []lsSiding{{Name: "one", Reclaimable: &yes}}}}
+
+	var quiet strings.Builder
+	printReclaimableFooter(&quiet, false, apps)
+	if quiet.String() != "" {
+		t.Errorf("footer printed without --reclaimable: %q", quiet.String())
+	}
+
+	var asked strings.Builder
+	printReclaimableFooter(&asked, true, apps)
+	if !strings.Contains(asked.String(), "Alpha/one") {
+		t.Errorf("footer did not name the reclaimable siding:\n%s", asked.String())
+	}
+}
+
+func TestReclaimableFooterSaysSoWhenNothingIsFree(t *testing.T) {
+	no := false
+	// An unchecked siding (nil) must read the same as a held one: absent is not a
+	// licence to delete.
+	apps := []lsApp{{Name: "Alpha", Sidings: []lsSiding{
+		{Name: "held", Reclaimable: &no}, {Name: "unchecked"},
+	}}}
+	var out strings.Builder
+	printReclaimableFooter(&out, true, apps)
+	if !strings.Contains(out.String(), "no siding is reclaimable") {
+		t.Errorf("expected the nothing-free line, got:\n%s", out.String())
+	}
 }

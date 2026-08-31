@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"sort"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/gordonbeeming/shunt/internal/container"
@@ -24,6 +27,11 @@ type lsSiding struct {
 	IP            string `json:"ip,omitempty"`
 	Dashboard     string `json:"dashboard,omitempty"`
 	Src           string `json:"src,omitempty"`
+	// Reclaimable is nil unless --reclaimable asked for it. A pointer rather than
+	// a bool because "we did not check" and "checked, not reclaimable" must not
+	// look alike: absent means unknown, and only false is a claim that the siding
+	// still holds work.
+	Reclaimable *bool `json:"reclaimable,omitempty"`
 }
 
 type lsApp struct {
@@ -39,7 +47,7 @@ type lsApp struct {
 const lsSchemaVersion = 2
 
 func newLsCmd() *cobra.Command {
-	var all, asJSON bool
+	var all, asJSON, reclaimable bool
 	c := &cobra.Command{
 		Use:   "ls",
 		Short: "List sidings for the current project (use -a for every registered project)",
@@ -116,7 +124,12 @@ func newLsCmd() *cobra.Command {
 					if err != nil {
 						return err
 					}
+					var reclaimableFlag *bool
+					if reclaimable {
+						reclaimableFlag = sidingReclaimable(ctx, app, sn, guestState)
+					}
 					la.Sidings = append(la.Sidings, lsSiding{
+						Reclaimable:   reclaimableFlag,
 						Name:          sn,
 						Live:          app.LiveSiding == sn,
 						Status:        compatibilityLsStatus(app, sn, s, guestState),
@@ -150,11 +163,17 @@ func newLsCmd() *cobra.Command {
 						a.Name, s.Name, lsTableStatus(a, s), s.Guest, s.IP, s.Dashboard)
 				}
 			}
-			return w.Flush()
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			printReclaimableFooter(os.Stdout, reclaimable, apps)
+			return nil
 		},
 	}
 	c.Flags().BoolVarP(&all, "all", "a", false, "list sidings for every registered project, not just the current one")
 	c.Flags().BoolVar(&asJSON, "json", false, "machine-readable output")
+	c.Flags().BoolVar(&reclaimable, "reclaimable", false,
+		"also report which sidings hold no unpreserved work; off by default because it runs Git per siding")
 	return c
 }
 
@@ -178,6 +197,57 @@ func classifyLsRuntime(phase state.MaterializationPhase, system container.Runtim
 	default:
 		return "runtime-unavailable", "guest inspection unavailable", "stopped"
 	}
+}
+
+// sidingReclaimable reports whether a siding holds no work that removing it
+// would lose. It is the inverse of the protection cleanup already computes, so
+// the two can never disagree about what is safe.
+//
+// This is a hint for a person deciding what to tidy, never an authority: rm and
+// cleanup re-run their own analysis before deleting anything, and must keep
+// doing so. A live or base siding is never offered, because removing either
+// needs a deliberate switch or a successor first.
+//
+// Returns nil when the answer could not be established, so an error reads as
+// unknown rather than as "safe to delete".
+// printReclaimableFooter names the sidings that hold no unpreserved work, after
+// the table rather than as a column: it is only ever populated under
+// --reclaimable, and an extra column that is blank on every normal run costs
+// width for nothing.
+func printReclaimableFooter(out io.Writer, asked bool, apps []lsApp) {
+	if !asked {
+		return
+	}
+	var free []string
+	for _, a := range apps {
+		for _, s := range a.Sidings {
+			if s.Reclaimable != nil && *s.Reclaimable {
+				free = append(free, a.Name+"/"+s.Name)
+			}
+		}
+	}
+	if len(free) == 0 {
+		fmt.Fprintln(out, "\nno siding is reclaimable — every one holds work, is live, or is the base")
+		return
+	}
+	fmt.Fprintf(out, "\nreclaimable (no unpreserved work): %s\n", strings.Join(free, ", "))
+	fmt.Fprintf(out, "  `%s cleanup` re-checks each one before removing it\n", bin())
+}
+
+func sidingReclaimable(ctx context.Context, app state.App, name string, guest string) *bool {
+	// A running guest is work in progress even when Git has nothing to lose: a
+	// test run or a debugger inside it leaves no trace in the worktree, so the
+	// preservation analysis below would happily call it free.
+	if app.LiveSiding == name || app.BaseSiding == name || guest == "running" {
+		no := false
+		return &no
+	}
+	protected, _, err := sidingWorktreeProtectionWithAnalyzer(ctx, app, name, []string{name}, nil)
+	if err != nil {
+		return nil
+	}
+	free := !protected
+	return &free
 }
 
 func effectiveLsPhase(s state.Siding) state.MaterializationPhase {
