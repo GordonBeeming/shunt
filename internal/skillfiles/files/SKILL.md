@@ -24,7 +24,7 @@ This installed skill is scoped to **`{{shunt-command}}`**. Its commands, operati
    - *existing* → use the selected siding and work only in its `src` path.
    - *new* → ask for a name, then run `{{shunt-command}} new <name>`. In any Git repository, this creates only the persistent managed branch and worktree state—no app registration, registry entry, data, output directory, image load, guest, or application. Default `new` starts at the clean base siding's committed HEAD (or the saved zero-siding base commit). Use `--branch <ref>` only for an explicit alternate start point, or `--from <branch>` to continue an existing remote branch.
    - Registration is optional while the work stays in the worktree. Before the first guest is needed, add `.shunt.app.json` and run `{{shunt-command}} app add`; this enriches the same project state and preserves its sidings.
-3. Build and test in the siding worktree before `up` (`dotnet build`/`dotnet test`, `pnpm build`, and so on). Documentation, config, and other worktree-only changes may never need a guest.
+3. Build and test on the host, in the siding worktree, before `up` (`dotnet build`/`dotnet test`, `pnpm build`, and so on). Documentation, config, and other worktree-only changes may never need a guest. Read [the siding runs the app; tests run on the host](#the-siding-runs-the-app-tests-run-on-the-host) first: a host build against a siding checkout has a cost inside the guest.
 4. When the app is needed, make sure `.shunt.app.json` has been registered with `{{shunt-command}} app add`, **ask the user before materializing the guest**, then run `{{shunt-command}} up <name> --no-bridge`. This is the step that grows the siding through data and guest phases and consumes runtime resources. Once healthy, plain `{{shunt-command}} up <name>` bridges it without moving the front door. **Confirm again before** `{{shunt-command}} switch <name>` (or use `up <name> --switch` when going live is already approved). The app always runs in the guest. Hot reload handles most edits; `{{shunt-command}} restart <name>` rebuilds the app without dropping the environment. Use `{{shunt-command}} park <name>` to release a non-live guest while keeping its worktree, data, and output. See [iterating](references/iterating.md).
 
 ## Rules
@@ -43,11 +43,60 @@ This installed skill is scoped to **`{{shunt-command}}`**. Its commands, operati
 
 `dataVolumes` starts with an empty source. To make a siding's complete volume set the source for later work, run `{{shunt-command}} data promote <siding>` after it quiesces the app and every volume consumer. Future first materializations (`up`) and `{{shunt-command}} reapply <siding> --fresh-data` rebuild from the promoted generation; worktree-only `new` does not touch data, already-materialized siding copies remain unchanged, and plain `reapply` preserves the siding copy. If the promotion is bad, run `{{shunt-command}} data rollback` before rebuilding affected sidings. The detailed recovery flow is in [iterating](references/iterating.md).
 
+## The siding runs the app; tests run on the host
+
+A siding exists to run the **app** in isolation. Test suites are not part of that split. Run them on the
+host, the same as you would without shunt. That applies to the whole suite, integration tests included.
+
+**The guest refuses image pulls, by design, and that is what breaks a Testcontainers suite.** A fixture
+whose image is already present can still start; one that has to pull dies before its first test:
+
+```
+Docker API responded with status code=Forbidden,
+response={"message":"shunt offline policy rejects Docker image pulls"}
+```
+
+The signature is a whole test project failing in milliseconds. Across a repository with many integration
+projects that reads as thousands of failures and total breakage. It is neither. Every message is
+identical, and that uniformity is the tell.
+
+Three things make it easy to misdiagnose, and all three point at "run it on the host" rather than at a fix
+inside the guest:
+
+- **`docker ps` and `docker version` in the guest look healthy.** The daemon runs and the app's own
+  containers are up. Only *pulls* are refused, so a check that stops at "is Docker working" concludes the
+  wrong thing. Read the error text; it names the policy.
+- **Prebaked images do not make the suite runnable.** `prebakeImages` and `prebakeBuilds` cover what the
+  *app* needs. A suite pulling its own database image is reaching for something the cache was never meant
+  to hold.
+- **`TESTCONTAINERS_RYUK_DISABLED=true` gets some suites further, which is a trap.** It skips the reaper
+  sidecar, so a suite whose database image happens to be prebaked then passes and the rest still fail. A
+  partly-green run invites the conclusion that the remaining reds are real. They are not.
+
+A host `dotnet` command in a siding worktree overwrites the bind-mounted `obj/` with host paths, so the
+guest's next build fails with `NETSDK1064` and the running app can die with `Exec format error`. That is
+the cost of a host test run against a siding checkout, and the repair is a restore and rebuild inside the
+guest afterwards.
+
+**A killed run leaks its containers, and the reaper does not save you.** Testcontainers starts a
+`ryuk` sidecar to clean up after the run, but ryuk is a child of that run. Cancel a suite, or let it
+time out, and ryuk dies with it holding nothing to reap against, so the SQL Server, Azurite and
+smtp4dev it was meant to remove stay up indefinitely. A clean exit reaps correctly; a kill does not.
+
+That matters on a shared machine, because the memory is not returned and the next person's suite
+fails to start with a timeout that looks like their own code. Check with `docker ps` before
+concluding a failure is yours, and reclaim with `docker container prune`.
+
+Read a container census as valid only at the instant it is taken. Runs finish underneath you, so a
+list gathered a few minutes ago will name containers that have since exited and miss ones that
+started. Measure and act in the same breath, and never kill a container without confirming it has no
+live parent process.
+
 ## Browser automation & recording
 
 Guests bake in headless Chromium, `playwright-cli`, and the `playwright` Node library, so a browser session can run **inside** a siding instead of on the host. `{{shunt-command}} playwright [siding] [args...]` execs `playwright-cli <args>` in the guest, stdio passed through — every arg goes straight to `playwright-cli` (the command has no flags of its own beyond `-h`). Siding resolution matches `run`: the one your cwd is inside, else a leading arg naming a siding, else the live siding. The image's global playwright-cli config also pins the browser (`chromium`, sandbox off), so a bare `playwright-cli open <url>` just works — no `--browser` flag needed. See [references/commands.md](references/commands.md) for the full command surface.
 
-- **Record or test where the app runs.** Only one siding is ever live on the shared front door, so a macOS-side browser can only reach that one app; in-guest, each siding's own `https://localhost:<port>` is the app's real address (not a host-forwarded port), so N materialized sidings can be browser-tested and recorded in parallel. Use in-guest sessions for QA evidence and a macOS-side browser for a narrated, polished demo of the siding currently live at the front door.
+- **Drive the browser where the app runs.** This is browser automation against the running app, not the test suite: unit and integration suites still run on the host, per [the siding runs the app; tests run on the host](#the-siding-runs-the-app-tests-run-on-the-host). Only one siding is ever live on the shared front door, so a macOS-side browser can only reach that one app; in-guest, each siding's own `https://localhost:<port>` is the app's real address (not a host-forwarded port), so N materialized sidings can be browser-tested and recorded in parallel. Use in-guest sessions for QA evidence and a macOS-side browser for a narrated, polished demo of the siding currently live at the front door.
 - **Sessions persist.** The guest is long-lived, so the browser stays open between `{{shunt-command}} playwright` calls, the same stateful behaviour a host Playwright session has.
 - **Recordings.** Auto-named output (snapshots, traces, `video-start`/`video-stop` without `--filename`) lands under `/out/playwright` in the guest, which is `<siding>/out/playwright` on the host: the standing per-siding output directory, outside the worktree and never committed. An explicit `--filename` resolves relative to the guest's cwd (the worktree) instead, so pass an explicit `/out/...` path if you want a named file to land there too. That redirect is set once, when the browser session **opens**, and sticks for the session's whole life. Open through `{{shunt-command}} playwright` — a session opened via a manual `{{shunt-command}} run <siding> playwright-cli open …` never gets it, so its auto-named output (video included) stays in the worktree's `.playwright-cli/` for as long as that session runs, even once you switch back to `{{shunt-command}} playwright` for later calls on it.
 - **TLS just works — through playwright-cli's own config, not NSS.** The dev cert is a self-signed leaf, so Chromium's verifier won't accept it as a trust anchor no matter what the guest's NSS store says (NSS + the system CA bundle cover .NET `HttpClient` and other non-Chromium consumers, not Chromium). Instead the image bakes `--allow-insecure-localhost` into playwright-cli's global config, applied to every invocation — including a manual `{{shunt-command}} run <siding> playwright-cli …` — scoped to literal `localhost`/`127.0.0.1` origins, which is all a guest app ever serves. A script that imports the `playwright` Node library directly bypasses that config, so it needs `args: ['--allow-insecure-localhost']` in its own launch options. Either way, don't reach for `ignoreHTTPSErrors`.
