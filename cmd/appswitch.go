@@ -153,6 +153,14 @@ func claimAppFrontDoor(ctx context.Context, app state.App, target string) error 
 		return err
 	}
 
+	// Refuse before touching Caddy at all. Checked only alongside the state write
+	// below, a removal in progress would abort after other apps had been parked
+	// and the target's servers rebuilt, leaving the front door half-moved and
+	// disagreeing with the state that was never saved.
+	if err := siding.EnsureNoRemovalInProgress(app, "claim the front door"); err != nil {
+		return err
+	}
+
 	want := map[int]bool{}
 	for _, r := range app.FrontDoor {
 		want[r.ListenPort] = true

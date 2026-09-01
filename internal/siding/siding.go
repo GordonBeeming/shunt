@@ -1042,8 +1042,16 @@ func extraRoutes(app state.App, sd state.Siding) []state.Route {
 // outage, and it clobbers PointCaddy's rollback capture.
 func createMissingRoutes(ctx context.Context, admin *caddy.Admin, app state.App, routes []state.Route) error {
 	for _, r := range routes {
-		if _, err := admin.GetID(ctx, r.CaddyID); err == nil {
+		_, err := admin.GetID(ctx, r.CaddyID)
+		if err == nil {
 			continue
+		}
+		// Only a genuine 404 proves the server is absent. Treating a timeout or a
+		// 500 as "missing" would send a live route through EnsureFrontDoor's
+		// delete-then-put and cause exactly the outage and upstream clobber this
+		// guard exists to prevent, on the transient failure where it hurts most.
+		if !caddy.IsNotFound(err) {
+			return fmt.Errorf("look up front-door route %q: %w", r.Key, err)
 		}
 		ea := app
 		ea.FrontDoor = []state.Route{r}
