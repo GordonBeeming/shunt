@@ -48,8 +48,8 @@ This installed skill is scoped to **`{{shunt-command}}`**. Its commands, operati
 A siding exists to run the **app** in isolation. Test suites are not part of that split. Run them on the
 host, the same as you would without shunt. That applies to the whole suite, integration tests included.
 
-**A Testcontainers-backed suite cannot work in the guest, by design.** The guest's offline policy refuses
-image pulls, so any fixture that starts a container dies before its first test:
+**The guest refuses image pulls, by design, and that is what breaks a Testcontainers suite.** A fixture
+whose image is already present can still start; one that has to pull dies before its first test:
 
 ```
 Docker API responded with status code=Forbidden,
