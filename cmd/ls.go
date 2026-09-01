@@ -126,7 +126,7 @@ func newLsCmd() *cobra.Command {
 					}
 					var reclaimableFlag *bool
 					if reclaimable {
-						reclaimableFlag = sidingReclaimable(ctx, app, sn, guestState)
+						reclaimableFlag = sidingReclaimable(ctx, app, sn, guest)
 					}
 					la.Sidings = append(la.Sidings, lsSiding{
 						Reclaimable:   reclaimableFlag,
@@ -210,23 +210,37 @@ func classifyLsRuntime(phase state.MaterializationPhase, system container.Runtim
 //
 // Returns nil when the answer could not be established, so an error reads as
 // unknown rather than as "safe to delete".
-// printReclaimableFooter names the sidings that hold no unpreserved work, after
-// the table rather than as a column: it is only ever populated under
-// --reclaimable, and an extra column that is blank on every normal run costs
-// width for nothing.
+// printReclaimableFooter renders the reclaimable summary after the table rather
+// than as a column: the value is only ever populated under --reclaimable, and a
+// column that is blank on every normal run costs width for nothing.
 func printReclaimableFooter(out io.Writer, asked bool, apps []lsApp) {
 	if !asked {
 		return
 	}
-	var free []string
+	var free, unknown []string
 	for _, a := range apps {
 		for _, s := range a.Sidings {
-			if s.Reclaimable != nil && *s.Reclaimable {
+			switch {
+			case s.Reclaimable == nil:
+				unknown = append(unknown, a.Name+"/"+s.Name)
+			case *s.Reclaimable:
 				free = append(free, a.Name+"/"+s.Name)
 			}
 		}
 	}
+	// A siding whose check failed is not evidence of anything, so it is named
+	// separately rather than folded into either answer. Reporting it as held
+	// would be a guess, and reporting it as free would be a dangerous one.
+	defer func() {
+		if len(unknown) > 0 {
+			fmt.Fprintf(out, "  could not check: %s\n", strings.Join(unknown, ", "))
+		}
+	}()
 	if len(free) == 0 {
+		if len(unknown) > 0 {
+			fmt.Fprintln(out, "\nno siding was found reclaimable, but some could not be checked")
+			return
+		}
 		fmt.Fprintln(out, "\nno siding is reclaimable — every one holds work, is live, or is the base")
 		return
 	}
@@ -234,19 +248,20 @@ func printReclaimableFooter(out io.Writer, asked bool, apps []lsApp) {
 	fmt.Fprintf(out, "  `%s cleanup` re-checks each one before removing it\n", bin())
 }
 
-func sidingReclaimable(ctx context.Context, app state.App, name string, guest string) *bool {
-	// A running guest is work in progress even when Git has nothing to lose: a
-	// test run or a debugger inside it leaves no trace in the worktree, so the
-	// preservation analysis below would happily call it free.
-	if app.LiveSiding == name || app.BaseSiding == name || guest == "running" {
+func sidingReclaimable(ctx context.Context, app state.App, name string, guest container.GuestObservation) *bool {
+	// Anything but a positively observed absent guest keeps the siding off the
+	// list. A running guest holds work that leaves no trace in the worktree, and
+	// an unavailable one means the inspection itself failed, which must not be
+	// read as stopped: the guest may well still be up.
+	if app.LiveSiding == name || app.BaseSiding == name || guest.State != container.GuestAbsent {
 		no := false
 		return &no
 	}
-	protected, _, err := sidingWorktreeProtectionWithAnalyzer(ctx, app, name, []string{name}, nil)
+	changed, err := sidingWorktreeHasChanges(ctx, app, name, []string{name})
 	if err != nil {
 		return nil
 	}
-	free := !protected
+	free := !changed
 	return &free
 }
 
