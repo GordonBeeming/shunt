@@ -153,17 +153,20 @@ type PrebakeBuild struct {
 	BuildArgs  map[string]string `json:"buildArgs,omitempty"`
 }
 
-// Route is a stable front-door entry. The upstream target is NOT stored — it's
-// discovered live from the running Aspire app on each switch.
+// Route is a stable front-door entry. The upstream target is NOT stored: it is
+// rebuilt on each switch from the route's declared guestPort and the live
+// siding's current guest IP. Nothing is discovered from the running app.
 type Route struct {
 	Key        string `json:"key"`                 // logical name: frontend | api | db
 	Kind       string `json:"kind"`                // KindHTTP | KindLayer4
 	ListenPort int    `json:"listenPort"`          // stable host port Caddy listens on (offset applied)
 	Resource   string `json:"resource"`            // aspire: resource name to proxy
 	Endpoint   string `json:"endpoint"`            // aspire: endpoint name within that resource
-	GuestPort  int    `json:"guestPort,omitempty"` // non-aspire: in-guest port the app binds
-	TLS        bool   `json:"tls"`                 // terminate TLS at the front door (https redirect)
-	CaddyID    string `json:"caddyId"`             // @id, e.g. app_myapp_http_frontend
+	GuestPort  int    `json:"guestPort,omitempty"` // required: in-guest port the app binds
+	// Optional excludes the route from readiness; it is still bridged and served.
+	Optional bool   `json:"optional,omitempty"`
+	TLS      bool   `json:"tls"`     // terminate TLS at the front door (https redirect)
+	CaddyID  string `json:"caddyId"` // @id, e.g. app_myapp_http_frontend
 }
 
 // DataVolume is a reusable data dir cloned per siding and bind-mounted into the
@@ -223,8 +226,6 @@ type Siding struct {
 	MaterializationPhase MaterializationPhase `json:"materializationPhase,omitempty"`
 	Container            string               `json:"container"` // channel-prefixed guest name
 	CreatedAt            string               `json:"createdAt"` // RFC3339, stamped by the caller
-	RSPort               int                  `json:"rsPort"`    // pinned Aspire resource-service port in the guest
-	RSKey                string               `json:"rsKey"`     // resource-service API key shunt set on launch
 	LastIP               string               `json:"lastIp"`    // cached guest IP, refreshed on switch
 	Stopped              bool                 `json:"stopped"`   // kill keeps the clone/volume but stops the guest
 	// Bridges maps each front-door route key to the guest-external port shunt's

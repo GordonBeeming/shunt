@@ -16,8 +16,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const newSidingResourceServicePort = 18890
-
 func newNewCmd() *cobra.Command {
 	var branch, from string
 	c := &cobra.Command{
@@ -254,7 +252,6 @@ func createSidingWithOps(ctx context.Context, configDir, name, branch, from stri
 			MaterializationPhase: state.PhaseWorktree,
 			Container:            config.ContainerName(app.Name, name),
 			CreatedAt:            time.Now().Format(time.RFC3339),
-			RSPort:               newSidingResourceServicePort,
 			Bridges:              map[string]int{},
 		}
 		if app.BaseSiding == "" && len(app.Sidings) == 0 {

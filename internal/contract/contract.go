@@ -22,8 +22,8 @@ const FileName = ".shunt.app.json"
 // Contract is the parsed .shunt.app.json.
 type Contract struct {
 	// Runner selects how the app starts (aspire | dotnet | node | custom).
-	// Empty = auto-detect at `app add`. Aspire keeps gRPC discovery; the others
-	// use Start + a declared per-route guestPort.
+	// Empty = auto-detect at `app add`. Aspire runs the AppHost through the Aspire
+	// CLI; the others use Start. Every runner declares a guestPort per route.
 	Runner  string `json:"runner"`
 	Start   string `json:"start"`   // start command for dotnet/node/custom (run in Workdir)
 	Stop    string `json:"stop"`    // optional clean-stop command (e.g. `aspire stop`); shunt's force-kill is the fallback
@@ -74,8 +74,12 @@ type FrontDoorRoute struct {
 	ListenPort int    `json:"listenPort"` // stable host port (before channel offset)
 	Resource   string `json:"resource"`   // aspire: resource name to proxy
 	Endpoint   string `json:"endpoint"`   // aspire: endpoint name within that resource (optional)
-	GuestPort  int    `json:"guestPort"`  // non-aspire: the in-guest port the app binds (no discovery)
+	GuestPort  int    `json:"guestPort"`  // required: the in-guest port the app binds
 	TLS        bool   `json:"tls"`        // terminate TLS at the front door
+	// Optional excludes the route from the readiness check. It is still bridged
+	// and still served the moment it comes up; it just does not hold the app back,
+	// which suits a slow dev server next to an API and a database that must be up.
+	Optional bool `json:"optional"`
 }
 
 // Load reads and validates the contract from a repo directory.
@@ -109,6 +113,19 @@ func ValidateVolumeName(volume string) error {
 }
 
 func (c *Contract) validate(repoPath string) error {
+	// Every route states the port its resource binds inside the guest. shunt does
+	// not work it out: a missing port used to fall through to an Aspire-specific
+	// discovery path that could not serve any other runner, so it is config now,
+	// and a missing one fails here rather than at `up`.
+	for i, r := range c.FrontDoor {
+		if r.GuestPort == 0 {
+			key := r.Key
+			if key == "" {
+				key = fmt.Sprintf("#%d", i)
+			}
+			return fmt.Errorf("frontDoor route %q: guestPort is required — set it to the port this route's resource listens on inside the guest (for a project resource, its launch-profile port; for a container, the port the app pins)", key)
+		}
+	}
 	seenImage := make(map[string]struct{}, len(c.PrebakeImages))
 	for i, ref := range c.PrebakeImages {
 		parsed, err := name.ParseReference(ref)

@@ -39,6 +39,29 @@ This installed skill is scoped to **`{{shunt-command}}`**. Its commands, operati
 - Never start the app locally (e.g. `aspire start`, `dotnet run`, `pnpm dev`). Use `up` / `restart`.
 - Declare registry dependency tags in `prebakeImages` and local image builds in `prebakeBuilds`; normal lifecycle commands load only missing or changed refs, update the marker, and refuse application startup until every declared tag loads and inspects successfully. Use `warm` to refresh tags and rebuild local declarations. Re-run `{{shunt-command}} app add` from the registration checkout after changing the shared `.shunt.app.json`. See [iterating](references/iterating.md).
 
+## When shunt itself misbehaves
+
+Report it instead of working around it. A workaround you keep to yourself leaves the bug in place for everyone who hits it next, and shunt problems are usually environment-level rather than something your project can fix.
+
+First check whether an agent session named `shunt-admin` is running — in Claude Code, list the agents you can reach. That session maintains shunt and can change the CLI, the guest image, or this skill directly.
+
+**If `shunt-admin` is running**, message it like you would file a support ticket, and say outright that you are blocked and want it to **message you back once it is fixed so you can continue**. Give it:
+
+- the channel and binary (`{{shunt-command}}`) and its `version` output
+- the project, the siding, and whether the guest was running at the time
+- the exact command and the exact error text, quoted rather than paraphrased
+- what you already checked in the guest (`{{shunt-command}} run <siding> …`), and what you ruled out
+- whether it reproduces on a fresh siding or only that one
+
+Vague reports cost a round trip, and the person reading it cannot see your terminal. While you wait, carry on with anything the bug does not block, and do not silently change your approach to dodge it.
+
+**If `shunt-admin` is not running**, ask the user with your question tool and let them choose between two options:
+
+1. They start the `shunt-admin` agent, and you then send the ticket above.
+2. You log it as a bug at https://github.com/GordonBeeming/shunt/issues instead.
+
+That choice is the user's. Don't start the agent yourself and don't open an issue without being asked to.
+
 ## Data baseline workflow
 
 `dataVolumes` starts with an empty source. To make a siding's complete volume set the source for later work, run `{{shunt-command}} data promote <siding>` after it quiesces the app and every volume consumer. Future first materializations (`up`) and `{{shunt-command}} reapply <siding> --fresh-data` rebuild from the promoted generation; worktree-only `new` does not touch data, already-materialized siding copies remain unchanged, and plain `reapply` preserves the siding copy. If the promotion is bad, run `{{shunt-command}} data rollback` before rebuilding affected sidings. The detailed recovery flow is in [iterating](references/iterating.md).

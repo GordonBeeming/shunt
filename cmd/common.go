@@ -40,6 +40,20 @@ func loadCurrentApp() (state.App, resolve.Location, error) {
 // user-facing hints so copy-pasted commands actually exist on PATH.
 func bin() string { return config.Current().BinaryName }
 
+// invokedCommandPath is the command the user actually typed ("shunt-dev logs"),
+// recorded by the root command so a hint can name it. Empty when a helper is
+// exercised outside a cobra run.
+var invokedCommandPath string
+
+// commandHint is the prefix for a "re-run it like this" suggestion: the invoked
+// subcommand when one is known, otherwise just the binary.
+func commandHint() string {
+	if invokedCommandPath != "" {
+		return invokedCommandPath
+	}
+	return bin()
+}
+
 // tick is the brand-cyan success check mark for "done" lines.
 func tick() string { return ui.Cyan("✓") }
 

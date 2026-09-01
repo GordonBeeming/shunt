@@ -81,6 +81,13 @@ func runInSiding(ctx context.Context, configDir, name string, command []string, 
 		if err := siding.RequireGuest(sd); err != nil {
 			return err
 		}
+		// A guest can list as running while its exec path refuses every command,
+		// and it stays that way until something restarts it. EnsureGuestLive is
+		// the same recovery `up` performs, so an ad-hoc command in the guest
+		// heals it instead of reporting the runtime's raw refusal.
+		if err := siding.EnsureGuestLive(ctx, sd); err != nil {
+			return err
+		}
 		if announce {
 			fmt.Fprintf(os.Stderr, "• in siding %q\n", name)
 		}

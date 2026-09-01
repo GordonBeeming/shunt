@@ -296,7 +296,7 @@ func DockerPort(ctx context.Context, guest, containerName string) int {
 // Bridge starts an in-guest socat that exposes a loopback port (intPort) at the
 // guest's external interface (extPort), so the host can reach it at <guest-ip>:<extPort>.
 // Aspire binds the resource service and app/dep endpoints to loopback, so this
-// is how shunt makes them reachable for discovery and proxying.
+// is how shunt makes them reachable from the host for proxying.
 //
 // bindIP pins socat's listen address. Pass the guest IP so the bridge can reuse
 // the app's exact port number (extPort == intPort, host == guest) without
@@ -306,6 +306,27 @@ func DockerPort(ctx context.Context, guest, containerName string) int {
 //
 // On a busy guest (e.g. SQL Server starting under Rosetta) a detached exec can
 // fail to take, so this relaunches socat until the port is actually listening.
+// retireMismatchedBridge kills any socat already listening on extPort whose
+// forwarding target differs from want, so Bridge can move a bridge rather than
+// accept whatever is already there. A socat whose full command line matches want
+// is left alone, which keeps Bridge idempotent for an unchanged bridge.
+func retireMismatchedBridge(ctx context.Context, name string, extPort int, want string) error {
+	// The launcher `sh -c 'socat …'` carries the same command line as the socat
+	// it spawned, so matching on the text retires both halves together.
+	script := fmt.Sprintf(
+		`ps -eo pid,args | grep "[s]ocat TCP-LISTEN:%d," | grep -vF %s | awk '{print $1}' | xargs -r kill -9 2>/dev/null; true`,
+		extPort, shellSingleQuote(want))
+	if _, err := Exec(ctx, name, "sh", "-c", script); err != nil {
+		return fmt.Errorf("retire stale bridge on port %d: %w", extPort, err)
+	}
+	return nil
+}
+
+// shellSingleQuote wraps s for safe use inside a single-quoted shell word.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 func Bridge(ctx context.Context, name, bindIP string, extPort, intPort int) error {
 	listen := fmt.Sprintf("TCP-LISTEN:%d,fork,reuseaddr", extPort)
 	probe := "127.0.0.1"
@@ -314,9 +335,17 @@ func Bridge(ctx context.Context, name, bindIP string, extPort, intPort int) erro
 		probe = bindIP
 	}
 	spec := fmt.Sprintf("socat %s TCP:127.0.0.1:%d", listen, intPort)
+	// Retire a bridge on this port that forwards somewhere else before probing.
+	// The probe below only asks whether the port answers, so a stale bridge left
+	// by an earlier run looks healthy and this returns success while traffic
+	// keeps going to the old target. That makes a changed guest port impossible
+	// to apply, and the symptom is a working connection to the wrong service.
+	if err := retireMismatchedBridge(ctx, name, extPort, spec); err != nil {
+		return err
+	}
 	// Confirm the bridge by actually connecting to it — not by pgrep, which
 	// matches the launching `sh -c 'socat …'` wrapper before socat has bound the
-	// port (a false positive that left discovery dialing a dead bridge).
+	// port (a false positive that left callers dialing a dead bridge).
 	listening := fmt.Sprintf("socat -T1 /dev/null TCP:%s:%d 2>/dev/null && echo up", probe, extPort)
 	var lastErr error
 	for attempt := 0; attempt < 10; attempt++ {

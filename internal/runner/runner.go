@@ -1,6 +1,7 @@
 // Package runner classifies how an app starts — .NET Aspire, plain .NET, Node,
-// or a custom command — so shunt can run any repo, not just Aspire. Aspire keeps
-// its gRPC discovery; the others use a declared start command + per-route port.
+// or a custom command — so shunt can run any repo, not just Aspire. The runner
+// decides only how the app is launched: every runner, Aspire included, declares
+// a guest port per front-door route rather than having one discovered for it.
 package runner
 
 import (

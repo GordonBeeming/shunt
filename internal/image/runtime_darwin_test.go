@@ -128,6 +128,18 @@ docker image rm "$proof_tag" >/dev/null
 docker image load -i /tmp/shunt-admission-proof.tar >/dev/null
 docker run --detach --name "$proof_container" "$proof_tag" >/dev/null
 test "$(docker inspect --format '{{.State.Running}}' "$proof_container")" = true
+attach_route="http://localhost/v1.51/containers/$proof_container/attach?stream=1&stdout=1&stderr=1"
+curl --silent --raw --max-time 3 --request POST --unix-socket /var/run/docker.sock --dump-header /tmp/shunt-attach-shim.h --output /dev/null "$attach_route" || true
+curl --silent --raw --max-time 3 --request POST --unix-socket /run/shunt/dockerd/docker.sock --dump-header /tmp/shunt-attach-backend.h --output /dev/null "$attach_route" || true
+grep -Fi 'application/vnd.docker.raw-stream' /tmp/shunt-attach-shim.h >/dev/null
+if grep -Fi 'Transfer-Encoding' /tmp/shunt-attach-backend.h; then
+    echo 'dockerd framed a hijacked stream; this assertion no longer proves anything' >&2
+    exit 1
+fi
+if grep -Fi 'Transfer-Encoding' /tmp/shunt-attach-shim.h; then
+    echo 'admission gate re-framed a hijacked Docker stream' >&2
+    exit 1
+fi
 docker rm --force "$proof_container" >/dev/null
 docker volume create "$proof_volume" >/dev/null
 docker volume inspect "$proof_volume" >/dev/null
