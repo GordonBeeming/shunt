@@ -324,16 +324,16 @@ func TestWriteJSONReportsCommittedDurabilityFailure(t *testing.T) {
 }
 
 func TestRegistryFindProjectCaseInsensitive(t *testing.T) {
-	reg := Registry{Projects: map[string]string{"HubX": "/cfg/HubX"}}
+	reg := Registry{Projects: map[string]string{"MyApp": "/cfg/MyApp"}}
 	cases := []struct {
 		name          string
 		wantCanonical string
 		wantOK        bool
 	}{
-		{"HubX", "HubX", true}, // exact
-		{"hubX", "HubX", true}, // cwd basename with different case (macOS)
-		{"HUBX", "HubX", true}, // fold match
-		{"Other", "", false},   // genuinely absent
+		{"MyApp", "MyApp", true}, // exact
+		{"myApp", "MyApp", true}, // cwd basename with different case (macOS)
+		{"MYAPP", "MyApp", true}, // fold match
+		{"Other", "", false},     // genuinely absent
 	}
 	for _, c := range cases {
 		gotName, gotDir, ok := reg.FindProject(c.name)
@@ -343,8 +343,8 @@ func TestRegistryFindProjectCaseInsensitive(t *testing.T) {
 		if gotName != c.wantCanonical {
 			t.Errorf("FindProject(%q) canonical = %q, want %q", c.name, gotName, c.wantCanonical)
 		}
-		if c.wantOK && gotDir != "/cfg/HubX" {
-			t.Errorf("FindProject(%q) dir = %q, want /cfg/HubX", c.name, gotDir)
+		if c.wantOK && gotDir != "/cfg/MyApp" {
+			t.Errorf("FindProject(%q) dir = %q, want /cfg/MyApp", c.name, gotDir)
 		}
 	}
 }
