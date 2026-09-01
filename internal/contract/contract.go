@@ -123,7 +123,7 @@ func (c *Contract) validate(repoPath string) error {
 			if key == "" {
 				key = fmt.Sprintf("#%d", i)
 			}
-			return fmt.Errorf("frontDoor route %q: guestPort is required — set it to the port %q binds inside the guest (for a project resource, its launch-profile port; for a container, the port the app pins)", key, key)
+			return fmt.Errorf("frontDoor route %q: guestPort is required — set it to the port this route's resource listens on inside the guest (for a project resource, its launch-profile port; for a container, the port the app pins)", key)
 		}
 	}
 	seenImage := make(map[string]struct{}, len(c.PrebakeImages))

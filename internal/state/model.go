@@ -153,8 +153,9 @@ type PrebakeBuild struct {
 	BuildArgs  map[string]string `json:"buildArgs,omitempty"`
 }
 
-// Route is a stable front-door entry. The upstream target is NOT stored — it's
-// discovered live from the running Aspire app on each switch.
+// Route is a stable front-door entry. The upstream target is NOT stored: it is
+// rebuilt on each switch from the route's declared guestPort and the live
+// siding's current guest IP. Nothing is discovered from the running app.
 type Route struct {
 	Key        string `json:"key"`                 // logical name: frontend | api | db
 	Kind       string `json:"kind"`                // KindHTTP | KindLayer4
