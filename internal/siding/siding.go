@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,13 +55,34 @@ var (
 	guestCapabilityProbe     = probeGuestCapability
 	guestLivenessAttempts    = 20
 	guestLivenessPoll        = time.Second
-	prepareLifecycle         = PrepareGuest
-	stopLifecycleApp         = StopApp
-	startLifecycleApp        = StartApp
-	waitLifecycleReady       = WaitReady
+	// execGuestBounded backs the liveness probe: a bare `true` exec with its own
+	// deadline (livenessProbeTimeout), so a guest whose exec path has stopped
+	// answering fails fast with a diagnosable ExecStalledError instead of hanging
+	// EnsureGuestLive — and everything waiting on it — forever.
+	execGuestBounded = container.ExecBounded
+	// livenessProbeTimeout bounds each liveness exec independently of the
+	// caller's context. A bare `true` exec against a live, loaded guest answers
+	// in the low hundreds of milliseconds, so this bound sits orders of
+	// magnitude above the real cost and only trips on a genuine stall.
+	livenessProbeTimeout = 5 * time.Second
+	prepareLifecycle     = PrepareGuest
+	stopLifecycleApp     = StopApp
+	startLifecycleApp    = StartApp
+	waitLifecycleReady   = WaitReady
 	// probeExec is the readiness probe seam, so the port rules can be tested
-	// without a guest.
-	probeExec          = container.Exec
+	// without a guest. Its default adds routeProbeTimeout on top of whatever the
+	// caller's context carries, so a wedged guest fails the readiness probe
+	// diagnosably instead of hanging a caller that set no deadline of its own. A
+	// caller that cancels sooner still wins.
+	probeExec = func(ctx context.Context, name string, args ...string) (string, error) {
+		return container.ExecBounded(ctx, routeProbeTimeout, name, args...)
+	}
+	// routeProbeTimeout bounds ProbeRoutes' one-shot per-route socat check —
+	// shorter than the liveness bound, since it only ever runs a handful of
+	// non-blocking socket connects. Even a full multi-route probe against a loaded
+	// guest answers in the low hundreds of milliseconds, so this bound sits
+	// orders of magnitude above the real cost and only trips on a genuine stall.
+	routeProbeTimeout  = 3 * time.Second
 	upMaterialize      = materialize
 	ensureGuestRuntime = container.EnsureSystemStarted
 	upEnsureGuestLive  = EnsureGuestLive
@@ -458,7 +480,8 @@ const appLogPath = "/var/log/apphost.log"
 // re-runs the entrypoint (dockerd + dev cert). Returns an error only if the guest
 // genuinely can't be brought back (e.g. it no longer exists → the caller says new).
 func EnsureGuestLive(ctx context.Context, sd state.Siding) error {
-	if _, err := execGuest(ctx, sd.Container, "true"); err == nil {
+	_, err := execGuestBounded(ctx, livenessProbeTimeout, sd.Container, "true")
+	if err == nil {
 		match, err := guestCapabilityProbe(ctx, sd.Container)
 		if err != nil {
 			return fmt.Errorf("check guest capability for %q: %w", sd.Name, err)
@@ -467,6 +490,14 @@ func EnsureGuestLive(ctx context.Context, sd state.Siding) error {
 			return &GuestRecreateRequiredError{Name: sd.Name, Reason: "stale base image", Err: errors.New("capability predicate mismatch")}
 		}
 		return nil
+	}
+	var stalled *container.ExecStalledError
+	if errors.As(err, &stalled) {
+		// The exec path is wedged, not necessarily the guest itself — bouncing a
+		// possibly-healthy guest to fix a stall would cost the user their running
+		// stack for nothing, so surface it as-is instead of falling through to
+		// the stop/start recovery below.
+		return err
 	}
 	observation := observeGuest(ctx, sd.Container)
 	if observation.State == container.GuestAbsent {
@@ -485,7 +516,8 @@ func EnsureGuestLive(ctx context.Context, sd state.Siding) error {
 		return fmt.Errorf("guest for %q wouldn't restart: %w", sd.Name, err)
 	}
 	for i := 0; i < guestLivenessAttempts; i++ {
-		if _, err := execGuest(ctx, sd.Container, "true"); err == nil {
+		_, err := execGuestBounded(ctx, livenessProbeTimeout, sd.Container, "true")
+		if err == nil {
 			match, err := guestCapabilityProbe(ctx, sd.Container)
 			if err != nil {
 				return fmt.Errorf("check guest capability for %q after restart: %w", sd.Name, err)
@@ -494,6 +526,13 @@ func EnsureGuestLive(ctx context.Context, sd state.Siding) error {
 				return &GuestRecreateRequiredError{Name: sd.Name, Reason: "stale base image", Err: errors.New("capability predicate mismatch")}
 			}
 			return nil
+		}
+		if errors.As(err, &stalled) {
+			// Same reasoning as the pre-restart check: a stall here means the
+			// freshly-restarted guest's exec path is wedged, and looping until
+			// guestLivenessAttempts runs out would only replace this specific
+			// diagnosis with a vaguer "never became reachable" error.
+			return err
 		}
 		select {
 		case <-ctx.Done():
@@ -513,7 +552,11 @@ func probeGuestCapability(ctx context.Context, guest string) (bool, error) {
 	const mismatch = "shunt-capability:mismatch"
 	wrapped := "if " + args[2] + "; then printf '" + match + "'; else printf '" + mismatch + "'; fi"
 	probeArgs := append([]string{"sh", "-c", wrapped}, args[3:]...)
-	out, err := execGuest(ctx, guest, probeArgs...)
+	// Bounded like the liveness check that runs immediately before it. A guest
+	// can answer `true` and then wedge on the next command, and an unbounded
+	// probe there would hang the caller on the exact failure this whole path
+	// exists to detect.
+	out, err := execGuestBounded(ctx, livenessProbeTimeout, guest, probeArgs...)
 	if err != nil {
 		return false, err
 	}
@@ -1210,22 +1253,6 @@ func WaitReady(ctx context.Context, app state.App, sd state.Siding, timeout time
 	return fmt.Errorf("timed out waiting for %s to listen — %s", app.Runner, logHint)
 }
 
-// allPortsListening reports whether every front-door route's guestPort accepts a
-// connection inside the guest (socat is in the base image; sh has no /dev/tcp).
-func allPortsListening(ctx context.Context, app state.App, sd state.Siding) bool {
-	for _, r := range EffRoutes(app, sd) {
-		if r.Optional {
-			continue
-		}
-		out, _ := container.Exec(ctx, sd.Container, "sh", "-c",
-			fmt.Sprintf("socat -T1 /dev/null TCP:127.0.0.1:%d 2>/dev/null && echo up", r.GuestPort))
-		if !strings.Contains(out, "up") {
-			return false
-		}
-	}
-	return true
-}
-
 // HealthOK reports whether the app is actually serving, for the dashboard's
 // running/idle status. It hits the app's health endpoint from *inside* the guest
 // (container exec, not a guest-IP dial), so it works for any siding from the
@@ -1317,30 +1344,90 @@ func AppRunning(ctx context.Context, app state.App, sd state.Siding) bool {
 	return running
 }
 
-// ProbeAppRunning reports process state without treating a failed guest probe as
-// a stopped application.
-// ProbeAppRunning reports whether every required route is listening in the
-// guest. One rule for every runner: the contract states which port each resource
-// binds, so nothing here needs to know what kind of app it is. Routes marked
-// optional are skipped, so a slow dev server cannot hold the app back.
-func ProbeAppRunning(ctx context.Context, app state.App, sd state.Siding) (bool, error) {
+// RouteState is one front-door route's observed state in the guest. Optional
+// routes are reported like any other; only ProbeAppRunning ignores them.
+type RouteState struct {
+	Key       string `json:"key"`
+	GuestPort int    `json:"guestPort"`
+	Optional  bool   `json:"optional,omitempty"`
+	Listening bool   `json:"listening"`
+}
+
+// ProbeRoutes reports, per declared route, whether something is listening on
+// its guest port. One exec covers every route, so the cost matches the old
+// single boolean probe. A port the probe script doesn't report back for is a
+// probe failure, not a silent "down" — guessing there would hide exactly the
+// kind of unexplained "not running" this exists to fix.
+func ProbeRoutes(ctx context.Context, app state.App, sd state.Siding) ([]RouteState, error) {
 	routes := EffRoutes(app, sd)
-	checks := make([]string, 0, len(routes))
-	for _, route := range routes {
-		if route.Optional {
+	if len(routes) == 0 {
+		return nil, nil
+	}
+	var checks []string
+	probed := make(map[int]bool, len(routes))
+	for _, r := range routes {
+		// guestPort is required by the contract; GuestPort<=0 only happens for
+		// state saved before that requirement, and there's no port to dial.
+		if r.GuestPort <= 0 || probed[r.GuestPort] {
 			continue
 		}
-		checks = append(checks, fmt.Sprintf("socat -T1 /dev/null TCP:127.0.0.1:%d >/dev/null 2>&1", route.GuestPort))
+		probed[r.GuestPort] = true
+		checks = append(checks, fmt.Sprintf(
+			"if socat -T1 /dev/null TCP:127.0.0.1:%d >/dev/null 2>&1; then printf '%d up\\n'; else printf '%d down\\n'; fi",
+			r.GuestPort, r.GuestPort, r.GuestPort))
 	}
-	script := "if " + strings.Join(checks, " && ") + "; then echo up; else echo down; fi"
-	if len(checks) == 0 {
-		script = "echo up"
+	listening := make(map[int]bool, len(checks))
+	if len(checks) > 0 {
+		out, err := probeExec(ctx, sd.Container, "sh", "-c", strings.Join(checks, "\n"))
+		if err != nil {
+			return nil, fmt.Errorf("probe routes for %q: %w", sd.Name, err)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			fields := strings.Fields(line)
+			if len(fields) != 2 {
+				continue
+			}
+			port, perr := strconv.Atoi(fields[0])
+			if perr != nil {
+				continue
+			}
+			listening[port] = fields[1] == "up"
+		}
 	}
-	out, err := probeExec(ctx, sd.Container, "sh", "-c", script)
+	states := make([]RouteState, 0, len(routes))
+	for _, r := range routes {
+		rs := RouteState{Key: r.Key, GuestPort: r.GuestPort, Optional: r.Optional}
+		if r.GuestPort > 0 {
+			up, ok := listening[r.GuestPort]
+			if !ok {
+				return nil, fmt.Errorf("probe routes for %q: no result for %s (guest port %d)", sd.Name, r.Key, r.GuestPort)
+			}
+			rs.Listening = up
+		}
+		states = append(states, rs)
+	}
+	return states, nil
+}
+
+// ProbeAppRunning reports whether every non-optional route is listening in the
+// guest, derived from ProbeRoutes so the two can never disagree. One rule for
+// every runner: the contract states which port each resource binds, so nothing
+// here needs to know what kind of app it is. A route marked optional is
+// skipped, so a slow dev server cannot hold the app back.
+func ProbeAppRunning(ctx context.Context, app state.App, sd state.Siding) (bool, error) {
+	routes, err := ProbeRoutes(ctx, app, sd)
 	if err != nil {
 		return false, err
 	}
-	return strings.Contains(out, "up"), nil
+	for _, r := range routes {
+		if r.Optional {
+			continue
+		}
+		if !r.Listening {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // EnsureVolumeBaselines creates an explicit empty canonical generation when a

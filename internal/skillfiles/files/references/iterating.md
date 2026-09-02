@@ -46,6 +46,8 @@ Tests that spin up their own containers (Testcontainers and the like) are the ex
 
 `node_modules` is the other exception. The worktree is shared between macOS and the Linux guest, but npm installs native binaries for whichever platform it ran on, so `npm install` on the host leaves darwin binaries the guest cannot load and a Vite/rolldown build inside the guest dies with "Cannot find native binding". Install node dependencies where the app runs: `{{shunt-command}} run <siding> npm install`. One `node_modules` cannot serve both platforms, so that leaves the host unable to build the same tree until you reinstall there — worth saying to the user before you switch a project over.
 
+A .NET apphost is the same class of problem. Host builds stay the default because they cost no guest resources, but `bin` and `obj` are shared with the guest, and an apphost is a native per-platform executable, so a host `dotnet build` leaves macOS binaries where the guest expects Linux ones. Nothing fails at build time, so the first sign is the guest process dying with `Exec format error`. If that happens, rebuild in the guest with `{{shunt-command}} run <siding> dotnet build`, which is usually enough on its own. If it is not, delete the affected project's `bin` and `obj` and build again.
+
 Once it builds and the tests pass, bring it online without stealing the front door, then go live deliberately:
 
 1. **Ask the user first, then `{{shunt-command}} up <name> --no-bridge`** — starts the app in the guest but leaves the host alone: no socat bridges and no Caddy, so nothing is taken from whatever's currently live. Check the runner's guest output (the Aspire dashboard for an Aspire app) to confirm the app actually comes up ("would it work").
@@ -63,6 +65,30 @@ The guest, its Docker daemon, and the dependency containers (SQL etc.) are separ
 3. **`{{shunt-command}} up` → materialize / cold start / self-heal.** From `worktree`, `data`, or `parked`, `up` creates only the missing layers. If a guest is missing or wedged it recreates it from saved settings while keeping code and data, and if the app is up but not serving it rebuilds it. `rm` is the permanent teardown.
 
 So the loop is: `up` once, then edit-and-hot-reload, and reach for `restart` when watch falls short. You should rarely pay the cold start again on a warmed project.
+
+## When a guest command does not answer
+
+Guest commands are serialized per siding: `run`, `logs`, `git`, `sync`, and `playwright` take the same exclusive lock as `up`, `kill`, and `data promote`, so only one of them runs against a given siding at a time. A command against a different siding is unaffected. Whichever one is waiting on that lock says so on stderr after a couple of seconds, naming the pid holding it, that process's command line, and how long it has held it, then repeats every 15 seconds or so for as long as the wait continues. It never times out, because a legitimate `up` can hold the same lock for many minutes.
+
+So a command that looks hung is usually queued behind another command on the same siding, not a dead guest. Read the wait message: it names the exact process to go look at.
+
+That serialization is what turns one stuck command into what reads as a dead siding. `{{shunt-command}} logs` is the command an agent reaches for next to check on a hung `run`, and it takes the same lock, so it waits too. The wait message appears there as well: read it, rather than concluding the guest itself needs restarting.
+
+Before suspecting the guest, check it. `{{shunt-command}} active --json` gives the guest's IP. A guest that answers `ping` and reports a low load average is not a guest that needs restarting; it is idle and reachable, just behind the lock.
+
+The command most likely to hold the lock forever is one that waits on a condition the app itself cannot satisfy. `aspire resource <name> restart` blocks until that resource reports healthy, so a resource whose dependency has an unsatisfiable health gate never returns. Check the dependency chain before issuing a command like that, and once it is stuck, do not cancel it partway: cancelling on the host leaves the guest-side process running, and the lock stays held.
+
+Ending the stuck command releases the lock, and everything queued behind it proceeds immediately.
+
+If that is not enough, `{{shunt-command}} restart <siding>` reaps the app's own processes while leaving the guest, its Docker daemon, dependency containers, and data untouched. It is the cheap fix, and it comes before anything heavier.
+
+Recreating or killing the guest is the last resort, and it costs less than it sounds. The worktree, the data volumes and the output directory all survive: volumes are host bind mounts, so `kill` and `park` retain them and the next `up` picks them straight back up. What you lose is runtime state — the running app, the dependency containers and anything held only in the guest's memory — so the stack has to boot again, which is the real cost.
+
+## A guest resolves DNS through the host
+
+A guest's only nameserver is the host side of the container bridge, so it resolves exactly what the host resolves and nothing more. Turning off a VPN's DNS, or losing a split-horizon resolver, takes those names away from every guest at the same time.
+
+That failure surfaces a long way from its cause. A resource that cannot resolve a name never reports healthy, so anything gated on that resource waits forever. The command you ran then hangs on the gate rather than on the name. When a resource will not come up, check what the host can resolve before looking at the app.
 
 ## Cleaning up sidings without losing work
 
@@ -102,14 +128,16 @@ Shunt does not clone that store per siding. Mount `~/.microsoft/usersecrets` rea
 
 ## Reading `active --json` to decide the next move
 
+`appRunning` is all-or-nothing across every non-optional route, so a large app can report `appRunning: false` while most of it already serves. An agent that only needs one resource should read that route's own entry in `routes` (`guestPort`, `listening`) rather than wait on `appRunning`. When `probeError` is set, shunt could not tell: read that as unknown, not not-ready. Treating unknown as not-ready is what turns a readiness poll into a wait with no end.
+
 - `managed == false` → create a worktree with `{{shunt-command}} new <name>`
 - `managed == true` and `registered == false` → edit/test in a siding; add `.shunt.app.json` and run `{{shunt-command}} app add` before any guest operation
-- `registered == true` and `appRunning == false` → `{{shunt-command}} up <name>`
+- `registered == true` and `appRunning == false` → `{{shunt-command}} up <name>`, unless the task only needs one resource; check that route's entry in `routes` first, since it may already be listening
 - `registered == true`, `appRunning == true`, but `live == false` → `{{shunt-command}} switch <name>`
 - `registered`, `appRunning`, and `live` all `true` → it's already serving; nothing to do
 
 `active` retains its compatibility meaning of a registered app. New consumers should use `managed` to distinguish no state from worktree-only state, and `registered` before recommending guest commands.
-Use `--json` for that decision: it exits successfully whenever discovery succeeds. Plain `active` retains its legacy exit-status contract and exits non-zero for worktree-only as well as unmanaged directories, even though it prints the discovered worktree details.
+Use `--json` for that decision: it exits successfully whenever discovery succeeds. Plain `active` retains its legacy exit-status contract and exits non-zero for worktree-only as well as unmanaged directories, even though it prints the discovered worktree details; plain mode also names the routes a siding is waiting on.
 
 `scripts/status.sh` wraps this and prints the recommended next command.
 

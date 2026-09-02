@@ -90,11 +90,11 @@ func TestAssureImageCacheContinuesAfterCommittedCleanupWarning(t *testing.T) {
 }
 
 func TestEnsureGuestLiveRejectsStaleBaseWithoutRestartingIt(t *testing.T) {
-	originalExec, originalCapability, originalStop, originalStart := execGuest, guestCapabilityProbe, stopGuest, startGuest
+	originalExecBounded, originalCapability, originalStop, originalStart := execGuestBounded, guestCapabilityProbe, stopGuest, startGuest
 	defer func() {
-		execGuest, guestCapabilityProbe, stopGuest, startGuest = originalExec, originalCapability, originalStop, originalStart
+		execGuestBounded, guestCapabilityProbe, stopGuest, startGuest = originalExecBounded, originalCapability, originalStop, originalStart
 	}()
-	execGuest = func(_ context.Context, _ string, args ...string) (string, error) {
+	execGuestBounded = func(_ context.Context, _ time.Duration, _ string, args ...string) (string, error) {
 		if len(args) != 1 || args[0] != "true" {
 			t.Fatalf("liveness args = %#v", args)
 		}
@@ -114,11 +114,11 @@ func TestEnsureGuestLiveRejectsStaleBaseWithoutRestartingIt(t *testing.T) {
 }
 
 func TestEnsureGuestLiveFailsClosedOnTransientRuntimeObservation(t *testing.T) {
-	originalExec, originalObserve, originalStop, originalStart := execGuest, observeGuest, stopGuest, startGuest
+	originalExecBounded, originalObserve, originalStop, originalStart := execGuestBounded, observeGuest, stopGuest, startGuest
 	defer func() {
-		execGuest, observeGuest, stopGuest, startGuest = originalExec, originalObserve, originalStop, originalStart
+		execGuestBounded, observeGuest, stopGuest, startGuest = originalExecBounded, originalObserve, originalStop, originalStart
 	}()
-	execGuest = func(context.Context, string, ...string) (string, error) {
+	execGuestBounded = func(context.Context, time.Duration, string, ...string) (string, error) {
 		return "", errors.New("transient exec failure")
 	}
 	observeGuest = func(context.Context, string) container.GuestObservation {
@@ -136,10 +136,34 @@ func TestEnsureGuestLiveFailsClosedOnTransientRuntimeObservation(t *testing.T) {
 	}
 }
 
+func TestEnsureGuestLiveDoesNotRestartOnProbeStall(t *testing.T) {
+	originalExecBounded, originalStop, originalStart := execGuestBounded, stopGuest, startGuest
+	defer func() { execGuestBounded, stopGuest, startGuest = originalExecBounded, originalStop, originalStart }()
+	stall := &container.ExecStalledError{Guest: "guest", Timeout: time.Second}
+	execGuestBounded = func(context.Context, time.Duration, string, ...string) (string, error) {
+		return "", stall
+	}
+	restarted := false
+	stopGuest = func(context.Context, string) error { restarted = true; return nil }
+	startGuest = func(context.Context, string) error { restarted = true; return nil }
+	err := EnsureGuestLive(context.Background(), state.Siding{Name: "alpha", Container: "guest"})
+	var stalled *container.ExecStalledError
+	if !errors.As(err, &stalled) || stalled != stall {
+		t.Fatalf("EnsureGuestLive() = %v, want the stall surfaced unchanged", err)
+	}
+	if restarted {
+		t.Fatal("EnsureGuestLive restarted a guest whose liveness probe merely stalled")
+	}
+}
+
 func TestRestartDoesNotRecreateOnTransientLivenessFailure(t *testing.T) {
-	originalExec, originalObserve, originalRemove := execGuest, observeGuest, removeGuest
-	defer func() { execGuest, observeGuest, removeGuest = originalExec, originalObserve, originalRemove }()
-	execGuest = func(context.Context, string, ...string) (string, error) { return "", errors.New("permission denied") }
+	originalExecBounded, originalObserve, originalRemove := execGuestBounded, observeGuest, removeGuest
+	defer func() {
+		execGuestBounded, observeGuest, removeGuest = originalExecBounded, originalObserve, originalRemove
+	}()
+	execGuestBounded = func(context.Context, time.Duration, string, ...string) (string, error) {
+		return "", errors.New("permission denied")
+	}
 	observeGuest = func(context.Context, string) container.GuestObservation {
 		return container.GuestObservation{State: container.GuestUnavailable}
 	}
@@ -162,17 +186,26 @@ func TestRestartDoesNotRecreateOnTransientLivenessFailure(t *testing.T) {
 }
 
 func TestCapabilityPredicateMismatchDiffersFromTransportFailure(t *testing.T) {
-	originalExec, originalCapability := execGuest, guestCapabilityProbe
-	defer func() { execGuest, guestCapabilityProbe = originalExec, originalCapability }()
+	originalExecBounded, originalExec, originalCapability := execGuestBounded, execGuest, guestCapabilityProbe
+	defer func() {
+		execGuestBounded, execGuest, guestCapabilityProbe = originalExecBounded, originalExec, originalCapability
+	}()
 	guestCapabilityProbe = probeGuestCapability
+	// The liveness check always succeeds in both cases below; probeGuestCapability
+	// makes its own separate exec (via execGuest) for the predicate itself.
+	// Liveness and the capability predicate now share one bounded seam, so the
+	// stub answers on which command it was handed: a bare `true` is the liveness
+	// probe, anything else is the predicate.
+	var predicate func() (string, error)
+	execGuestBounded = func(_ context.Context, _ time.Duration, _ string, args ...string) (string, error) {
+		if len(args) == 1 && args[0] == "true" {
+			return "", nil
+		}
+		return predicate()
+	}
 
 	t.Run("predicate-mismatch-authorizes-recreation", func(t *testing.T) {
-		calls := 0
-		execGuest = func(context.Context, string, ...string) (string, error) {
-			calls++
-			if calls == 1 {
-				return "", nil
-			}
+		predicate = func() (string, error) {
 			return "shunt-capability:mismatch", nil
 		}
 		err := EnsureGuestLive(context.Background(), state.Siding{Name: "alpha", Container: "guest"})
@@ -183,12 +216,7 @@ func TestCapabilityPredicateMismatchDiffersFromTransportFailure(t *testing.T) {
 	})
 
 	t.Run("xpc-transport-fails-closed", func(t *testing.T) {
-		calls := 0
-		execGuest = func(context.Context, string, ...string) (string, error) {
-			calls++
-			if calls == 1 {
-				return "", nil
-			}
+		predicate = func() (string, error) {
 			return "", errors.New("XPC connection invalid")
 		}
 		err := EnsureGuestLive(context.Background(), state.Siding{Name: "alpha", Container: "guest"})
@@ -200,13 +228,13 @@ func TestCapabilityPredicateMismatchDiffersFromTransportFailure(t *testing.T) {
 }
 
 func TestLivenessRetryExhaustionFailsClosed(t *testing.T) {
-	originalExec, originalObserve, originalStop, originalStart := execGuest, observeGuest, stopGuest, startGuest
+	originalExecBounded, originalObserve, originalStop, originalStart := execGuestBounded, observeGuest, stopGuest, startGuest
 	originalAttempts, originalPoll := guestLivenessAttempts, guestLivenessPoll
 	defer func() {
-		execGuest, observeGuest, stopGuest, startGuest = originalExec, originalObserve, originalStop, originalStart
+		execGuestBounded, observeGuest, stopGuest, startGuest = originalExecBounded, originalObserve, originalStop, originalStart
 		guestLivenessAttempts, guestLivenessPoll = originalAttempts, originalPoll
 	}()
-	execGuest = func(context.Context, string, ...string) (string, error) {
+	execGuestBounded = func(context.Context, time.Duration, string, ...string) (string, error) {
 		return "", errors.New("transient exec failure")
 	}
 	observeGuest = func(context.Context, string) container.GuestObservation {
@@ -395,7 +423,7 @@ func TestProbeAppRunningWaitsForRequiredRoutesOnly(t *testing.T) {
 			routes:  []state.Route{{Key: "api", GuestPort: 7260}, {Key: "webapp", GuestPort: 5173, Optional: true}},
 			up:      map[int]bool{7260: true},
 			want:    true,
-			probing: []int{7260},
+			probing: []int{7260, 5173},
 		},
 		{
 			name:    "required route down blocks",
@@ -419,20 +447,15 @@ func TestProbeAppRunningWaitsForRequiredRoutesOnly(t *testing.T) {
 			defer func() { probeExec = restore }()
 			probeExec = func(_ context.Context, _ string, args ...string) (string, error) {
 				script = args[len(args)-1]
-				for port, listening := range tc.up {
-					if !listening && strings.Contains(script, fmt.Sprintf(":%d ", port)) {
-						return "down", nil
-					}
-				}
+				var lines []string
 				for _, r := range tc.routes {
-					if r.Optional {
-						continue
+					status := "down"
+					if tc.up[r.GuestPort] {
+						status = "up"
 					}
-					if !tc.up[r.GuestPort] {
-						return "down", nil
-					}
+					lines = append(lines, fmt.Sprintf("%d %s", r.GuestPort, status))
 				}
-				return "up", nil
+				return strings.Join(lines, "\n"), nil
 			}
 
 			app := state.App{Runner: runner.Custom, FrontDoor: tc.routes}
@@ -445,12 +468,7 @@ func TestProbeAppRunningWaitsForRequiredRoutesOnly(t *testing.T) {
 			}
 			for _, port := range tc.probing {
 				if !strings.Contains(script, fmt.Sprintf(":%d ", port)) {
-					t.Fatalf("required port %d was not probed:\n%s", port, script)
-				}
-			}
-			for _, r := range tc.routes {
-				if r.Optional && strings.Contains(script, fmt.Sprintf(":%d ", r.GuestPort)) {
-					t.Fatalf("optional port %d must not be probed:\n%s", r.GuestPort, script)
+					t.Fatalf("port %d was not probed:\n%s", port, script)
 				}
 			}
 		})

@@ -50,6 +50,64 @@ printf '%s\n' '{"active":false,"managed":true,"registered":false,"project":"samp
 	}
 }
 
+func TestRenderedStatusScriptListsWaitingOnRoutesForAGuestUpButNotServingSiding(t *testing.T) {
+	identity := config.Identity{Channel: "dev", BinaryName: "shunt-dev", ProjectDirName: ".shunt-dev"}
+	dest := t.TempDir()
+	if err := writeSkill(dest, identity); err != nil {
+		t.Fatal(err)
+	}
+	fakeBinary := filepath.Join(t.TempDir(), "shunt-dev")
+	fake := `#!/bin/sh
+printf '%s\n' '{"active":true,"managed":true,"registered":true,"project":"sample","sidings":[{"name":"one","live":false,"appRunning":false,"guestRunning":true,"src":"/work/one","ip":"10.0.0.2","dashboard":"","routes":[{"key":"storefront","guestPort":5100,"listening":false},{"key":"api","guestPort":7219,"listening":false},{"key":"gateway","guestPort":7022,"listening":true},{"key":"webapp","guestPort":5173,"optional":true,"listening":false}]}]}'
+`
+	if err := os.WriteFile(fakeBinary, []byte(fake), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", filepath.Join(dest, "scripts", "status.sh"))
+	cmd.Env = append(os.Environ(), "SHUNT_BIN="+fakeBinary)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("status script: %v\n%s", err, out)
+	}
+	text := string(out)
+	if !strings.Contains(text, "waiting on: storefront(5100), api(7219)") {
+		t.Fatalf("status output omits the routes still down:\n%s", text)
+	}
+	for _, unwanted := range []string{"gateway(7022)", "webapp(5173)"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("status output lists a listening or optional route as waiting-on (%q):\n%s", unwanted, text)
+		}
+	}
+}
+
+func TestRenderedStatusScriptPrintsProbeErrorInsteadOfWaitingOnRoutes(t *testing.T) {
+	identity := config.Identity{Channel: "dev", BinaryName: "shunt-dev", ProjectDirName: ".shunt-dev"}
+	dest := t.TempDir()
+	if err := writeSkill(dest, identity); err != nil {
+		t.Fatal(err)
+	}
+	fakeBinary := filepath.Join(t.TempDir(), "shunt-dev")
+	fake := `#!/bin/sh
+printf '%s\n' '{"active":true,"managed":true,"registered":true,"project":"sample","sidings":[{"name":"one","live":false,"appRunning":false,"guestRunning":true,"src":"/work/one","ip":"10.0.0.2","dashboard":"","probeError":"probe routes for \"one\": exec into guest did not answer within 5s"}]}'
+`
+	if err := os.WriteFile(fakeBinary, []byte(fake), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", filepath.Join(dest, "scripts", "status.sh"))
+	cmd.Env = append(os.Environ(), "SHUNT_BIN="+fakeBinary)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("status script: %v\n%s", err, out)
+	}
+	text := string(out)
+	if !strings.Contains(text, "probe error: probe routes for \"one\": exec into guest did not answer within 5s") {
+		t.Fatalf("status output omits the probe error:\n%s", text)
+	}
+	if strings.Contains(text, "waiting on:") {
+		t.Fatalf("status output printed waiting-on routes alongside a probe error:\n%s", text)
+	}
+}
+
 func TestRenderedStatusScriptAcceptsLegacyRegisteredJSON(t *testing.T) {
 	identity := config.Identity{Channel: "dev", BinaryName: "shunt-dev", ProjectDirName: ".shunt-dev"}
 	dest := t.TempDir()

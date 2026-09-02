@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/container"
 	"github.com/gordonbeeming/shunt/internal/resolve"
@@ -16,16 +17,17 @@ import (
 )
 
 // activeSiding is the machine-readable view of one siding for tooling/skills.
-// Live = it's the front-door traffic target; AppRunning = Aspire is started in
-// the guest (if false, `"+bin()+" up <name>`); GuestRunning = the container is up.
+// Live = it's the front-door traffic target; GuestRunning = the container is up.
 type activeSiding struct {
-	Name         string `json:"name"`
-	Live         bool   `json:"live"`         // currently the stable-port traffic target
-	AppRunning   bool   `json:"appRunning"`   // app started in the guest (else: `"+bin()+" up`)
-	GuestRunning bool   `json:"guestRunning"` // the container guest is up
-	Src          string `json:"src"`          // where to edit code for this siding
-	IP           string `json:"ip"`           // cached guest IP ("" if not activated)
-	Dashboard    string `json:"dashboard"`    // dashboard URL ("" if no IP)
+	Name         string              `json:"name"`
+	Live         bool                `json:"live"`                 // currently the stable-port traffic target
+	AppRunning   bool                `json:"appRunning"`           // every non-optional route is listening (all-or-nothing; see Routes for the holdout)
+	GuestRunning bool                `json:"guestRunning"`         // the container guest is up
+	Src          string              `json:"src"`                  // where to edit code for this siding
+	IP           string              `json:"ip"`                   // cached guest IP ("" if not activated)
+	Dashboard    string              `json:"dashboard"`            // dashboard URL ("" if no IP)
+	Routes       []siding.RouteState `json:"routes,omitempty"`     // per-route listening state; present only when the probe ran
+	ProbeError   string              `json:"probeError,omitempty"` // the probe couldn't run; AppRunning:false here means unknown, not not-ready
 }
 
 type activeResult struct {
@@ -80,6 +82,14 @@ func newActiveCmd() *cobra.Command {
 				fmt.Printf("  %s %-10s edit: %s\n", live, s.Name, s.Src)
 				if s.Dashboard != "" {
 					fmt.Printf("              dashboard: %s\n", s.Dashboard)
+				}
+				switch {
+				case s.ProbeError != "":
+					fmt.Printf("              probe error: %s\n", s.ProbeError)
+				case s.GuestRunning && !s.AppRunning:
+					if waiting := waitingOnRoutes(s.Routes); waiting != "" {
+						fmt.Printf("              waiting on: %s\n", waiting)
+					}
 				}
 			}
 			// Preserve the original command-level contract for existing shell
@@ -142,11 +152,29 @@ func activeResultForDir(ctx context.Context, cwd string) (activeResult, error) {
 				guestUp = st == "running"
 			}
 		}
-		// Reliable across runners: the log marker is Aspire-only (and even
-		// some Aspire apps never emit it), so reuse the shared helper.
+		// One probe covers both AppRunning and the per-route detail below, so the
+		// two can never disagree the way a single "appRunning" bool used to hide
+		// which route was actually the holdout.
 		appUp := false
+		var routes []siding.RouteState
+		var probeErr string
 		if guestUp {
-			appUp = siding.AppRunning(ctx, app, s)
+			rs, err := siding.ProbeRoutes(ctx, app, s)
+			if err != nil {
+				// A caller polling appRunning must be able to tell "not ready yet"
+				// from "shunt couldn't find out" — leave Routes nil and AppRunning
+				// false, and say why in ProbeError.
+				probeErr = err.Error()
+			} else {
+				routes = rs
+				appUp = true
+				for _, r := range rs {
+					if !r.Optional && !r.Listening {
+						appUp = false
+						break
+					}
+				}
+			}
 		}
 		res.Sidings = append(res.Sidings, activeSiding{
 			Name:         name,
@@ -156,9 +184,28 @@ func activeResultForDir(ctx context.Context, cwd string) (activeResult, error) {
 			Src:          src,
 			IP:           s.LastIP,
 			Dashboard:    siding.DashboardURL(app, s),
+			Routes:       routes,
+			ProbeError:   probeErr,
 		})
 	}
 	return res, nil
+}
+
+// waitingOnRoutes renders the non-optional routes that aren't listening yet, as
+// "key(port), key(port)", for a siding whose guest is up but whose app isn't.
+func waitingOnRoutes(routes []siding.RouteState) string {
+	var waiting []string
+	for _, r := range routes {
+		if r.Optional || r.Listening {
+			continue
+		}
+		port := fmt.Sprintf("%d", r.GuestPort)
+		if r.GuestPort <= 0 {
+			port = "no guestPort" // legacy state predating the required-guestPort contract
+		}
+		waiting = append(waiting, fmt.Sprintf("%s(%s)", r.Key, port))
+	}
+	return strings.Join(waiting, ", ")
 }
 
 func activeProjectForDir(ctx context.Context, cwd string) (resolve.Location, *state.App, error) {

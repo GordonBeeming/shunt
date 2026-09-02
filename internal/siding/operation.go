@@ -2,10 +2,13 @@ package siding
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gordonbeeming/shunt/internal/state"
@@ -13,6 +16,18 @@ import (
 )
 
 const operationLockName = ".shunt-operation.lock"
+
+var (
+	// lockWaitGracePeriod is how long a lock wait stays silent before the first
+	// report — a normal fast handoff (the common case) never prints anything.
+	lockWaitGracePeriod = 2 * time.Second
+	// lockWaitReportInterval is how often a wait past the grace period repeats
+	// its report, so a long wait keeps showing progress instead of going quiet.
+	lockWaitReportInterval = 15 * time.Second
+	// lockWaitReportWriter is the wait-report seam, so tests can capture it
+	// without redirecting the real os.Stderr.
+	lockWaitReportWriter = io.Writer(os.Stderr)
+)
 
 // EnsureNoRemovalInProgress prevents lifecycle work from racing a resumable
 // removal after it has published any destructive checkpoint. Callers load state
@@ -100,6 +115,8 @@ func withFileLock(ctx context.Context, path string, mode int, description string
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 
+	waitStart := time.Now()
+	var lastReport time.Time
 	for {
 		err = unix.Flock(int(lock.Fd()), mode|unix.LOCK_NB)
 		if err == nil {
@@ -108,6 +125,14 @@ func withFileLock(ctx context.Context, path string, mode int, description string
 		if !errors.Is(err, unix.EWOULDBLOCK) {
 			return fmt.Errorf("lock %s: %w", description, err)
 		}
+		// A guest command with no output for the whole time it holds this lock
+		// (the exact shape of the hang this exists to explain) must not leave a
+		// contending caller looking hung too — report the wait, not a deadline;
+		// legitimate long holds (a many-minute `up`) must never be cut off.
+		if waited := time.Since(waitStart); waited >= lockWaitGracePeriod && time.Since(lastReport) >= lockWaitReportInterval {
+			reportLockWait(path, description, waited)
+			lastReport = time.Now()
+		}
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("lock %s: %w", description, ctx.Err())
@@ -115,7 +140,122 @@ func withFileLock(ctx context.Context, path string, mode int, description string
 		}
 	}
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	if mode&unix.LOCK_EX != 0 {
+		// Only an exclusive holder writes the record: a shared lock can have
+		// several concurrent holders, and they'd only race each other's writes
+		// for a record that couldn't identify "the" holder anyway.
+		writeLockHolderRecord(lock)
+		// Defers run last-in-first-out, so this clears the record before the
+		// flock above is released — a stale record left past release would name
+		// this process for a lock it no longer holds, and a reused pid would then
+		// let a later, unrelated holder be named by an earlier one's leftovers.
+		// A crash still leaves the record behind; that's what processAlive guards.
+		defer clearLockHolderRecord(lock)
+	}
 	return operation()
+}
+
+// lockHolderRecord identifies the process holding an exclusive flock, so a
+// caller stuck waiting on it can say more than "waiting". It is written only
+// while that flock is held, so there is no race between the write and a
+// concurrent reader — the reader is, by definition, still blocked on the
+// same flock.
+type lockHolderRecord struct {
+	PID        int       `json:"pid"`
+	Command    string    `json:"command"`
+	AcquiredAt time.Time `json:"acquiredAt"`
+}
+
+// writeLockHolderRecord annotates lock (already flocked exclusively by this
+// process) with who's holding it. A lock that can't be annotated must still
+// work, so every failure here is swallowed rather than surfaced.
+// holderCommand names the holder well enough to identify it, without echoing
+// what it was given. The record is written to a file every contending caller
+// reads, so a full argv would publish anything a command was invoked with —
+// `run` in particular forwards arbitrary arguments into the guest, which is
+// exactly where a secret would appear. The binary and its subcommand answer
+// "who is holding this"; the rest cannot, and is not worth the exposure.
+func holderCommand(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	name := filepath.Base(args[0])
+	for _, a := range args[1:] {
+		// The first bare word after the binary is the subcommand. Anything
+		// following it is an argument or a flag value, and is dropped.
+		if !strings.HasPrefix(a, "-") {
+			return name + " " + a
+		}
+	}
+	return name
+}
+
+func writeLockHolderRecord(lock *os.File) {
+	data, err := json.Marshal(lockHolderRecord{
+		PID:        os.Getpid(),
+		Command:    holderCommand(os.Args),
+		AcquiredAt: time.Now(),
+	})
+	if err != nil {
+		return
+	}
+	if err := lock.Truncate(0); err != nil {
+		return
+	}
+	_, _ = lock.WriteAt(data, 0)
+}
+
+// clearLockHolderRecord truncates lock's holder record on release, so a
+// waiter that finds the file non-empty knows it names the *current* holder
+// (or, if the process crashed instead of returning normally, an evidenced but
+// unconfirmed one — never a departed holder whose pid has since been reused).
+// Same swallow-all-failures rule as writeLockHolderRecord: this is cleanup,
+// not part of the lock protocol, and must never fail the operation.
+func clearLockHolderRecord(lock *os.File) {
+	_ = lock.Truncate(0)
+}
+
+// readLockHolderRecord reads path's holder record with a fresh handle,
+// independent of the caller's own (still-blocked) lock attempt. A missing,
+// unparseable, or dead-pid record is reported as "no named holder" rather
+// than risking a wrong name — the record is only trustworthy evidence, never
+// proof, since nothing guarantees the writer cleaned up after a crash.
+func readLockHolderRecord(path string) (lockHolderRecord, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return lockHolderRecord{}, false
+	}
+	var record lockHolderRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return lockHolderRecord{}, false
+	}
+	if !processAlive(record.PID) {
+		return lockHolderRecord{}, false
+	}
+	return record, true
+}
+
+// processAlive uses the standard existence probe (signal 0): an error other
+// than "operation not permitted" means the pid isn't a live process.
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := unix.Kill(pid, 0)
+	return err == nil || errors.Is(err, unix.EPERM)
+}
+
+// reportLockWait prints one progress line to lockWaitReportWriter for a lock
+// wait that has passed the grace period. It never blocks and never fails the
+// caller — this is diagnostic output, not part of the lock protocol.
+func reportLockWait(path, description string, waited time.Duration) {
+	if record, ok := readLockHolderRecord(path); ok {
+		fmt.Fprintf(lockWaitReportWriter, "• waiting for the %s lock, held by pid %d (%s) for %s…\n",
+			description, record.PID, record.Command, waited.Round(time.Second))
+		return
+	}
+	fmt.Fprintf(lockWaitReportWriter, "• waiting for the %s lock, held by another process, for %s…\n",
+		description, waited.Round(time.Second))
 }
 
 // MergeSidingState changes one siding in the latest state snapshot.

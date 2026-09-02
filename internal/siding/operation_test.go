@@ -1,16 +1,20 @@
 package siding
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gordonbeeming/shunt/internal/state"
+	"golang.org/x/sys/unix"
 )
 
 func TestWithProjectOperationSerializesAndHonorsCancellation(t *testing.T) {
@@ -180,6 +184,220 @@ func TestProjectExclusiveOperationsBlockLifecycleAndEachOther(t *testing.T) {
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLockHolderRecordRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.lock")
+	lock, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+
+	writeLockHolderRecord(lock)
+
+	record, ok := readLockHolderRecord(path)
+	if !ok {
+		t.Fatal("readLockHolderRecord() = false, want a readable record right after writing it")
+	}
+	if record.PID != os.Getpid() {
+		t.Fatalf("record.PID = %d, want %d", record.PID, os.Getpid())
+	}
+	// The record names the holder without echoing what it was given: every
+	// contending caller reads this file, and `run` forwards arbitrary arguments
+	// into the guest.
+	if want := holderCommand(os.Args); record.Command != want {
+		t.Fatalf("record.Command = %q, want %q", record.Command, want)
+	}
+	if strings.Contains(record.Command, "-") && len(os.Args) > 1 {
+		t.Errorf("record.Command = %q, want no flags or their values", record.Command)
+	}
+	if record.AcquiredAt.IsZero() || time.Since(record.AcquiredAt) > time.Minute {
+		t.Fatalf("record.AcquiredAt = %v, want roughly now", record.AcquiredAt)
+	}
+}
+
+func TestFileLockWaitStaysSilentBelowGracePeriod(t *testing.T) {
+	originalGrace, originalWriter := lockWaitGracePeriod, lockWaitReportWriter
+	defer func() { lockWaitGracePeriod, lockWaitReportWriter = originalGrace, originalWriter }()
+	lockWaitGracePeriod = time.Hour // far past this test's short contention window
+	var out bytes.Buffer
+	lockWaitReportWriter = &out
+
+	path := filepath.Join(t.TempDir(), "siding.lock")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- withFileLock(context.Background(), path, unix.LOCK_EX, "siding beta", func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if err := withFileLock(ctx, path, unix.LOCK_EX, "siding beta", func() error { return nil }); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waiter error = %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	if out.Len() != 0 {
+		t.Fatalf("wait report fired below the grace period: %q", out.String())
+	}
+}
+
+func TestFileLockWaitReportsTheHolderAfterTheGracePeriod(t *testing.T) {
+	originalGrace, originalInterval, originalWriter := lockWaitGracePeriod, lockWaitReportInterval, lockWaitReportWriter
+	defer func() {
+		lockWaitGracePeriod, lockWaitReportInterval, lockWaitReportWriter = originalGrace, originalInterval, originalWriter
+	}()
+	lockWaitGracePeriod = 30 * time.Millisecond
+	lockWaitReportInterval = 30 * time.Millisecond
+	var out bytes.Buffer
+	lockWaitReportWriter = &out
+
+	path := filepath.Join(t.TempDir(), "siding.lock")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- withFileLock(context.Background(), path, unix.LOCK_EX, `siding "alpha"`, func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := withFileLock(ctx, path, unix.LOCK_EX, `siding "alpha"`, func() error { return nil }); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waiter error = %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	text := out.String()
+	if !strings.Contains(text, `waiting for the siding "alpha" lock`) {
+		t.Fatalf("wait report = %q, want it to name the lock", text)
+	}
+	if !strings.Contains(text, "pid "+strconv.Itoa(os.Getpid())) {
+		t.Fatalf("wait report = %q, want the holder's pid", text)
+	}
+}
+
+func TestReportLockWaitDegradesGracefullyOnAnUntrustworthyRecord(t *testing.T) {
+	originalWriter := lockWaitReportWriter
+	defer func() { lockWaitReportWriter = originalWriter }()
+
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, path string)
+	}{
+		{name: "missing record", setup: func(*testing.T, string) {}},
+		{name: "unparseable record", setup: func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "record names a dead pid", setup: func(t *testing.T, path string) {
+			// Larger than any real pid_max, so this can never collide with a live process.
+			data, err := json.Marshal(lockHolderRecord{PID: 2_000_000_000, Command: "ghost", AcquiredAt: time.Now()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "record.lock")
+			tt.setup(t, path)
+			var out bytes.Buffer
+			lockWaitReportWriter = &out
+
+			reportLockWait(path, "siding gamma", 3*time.Second)
+
+			text := out.String()
+			if !strings.Contains(text, "held by another process") {
+				t.Fatalf("degraded report = %q, want the unnamed-holder message", text)
+			}
+			if strings.Contains(text, "ghost") || strings.Contains(text, "pid ") {
+				t.Fatalf("degraded report named an untrustworthy holder: %q", text)
+			}
+		})
+	}
+}
+
+func TestWriteLockHolderRecordDoesNotFailOnAnUnwritableHandle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "readonly.lock")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ro, err := os.Open(path) // read-only handle: Truncate/WriteAt on it must fail
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+
+	writeLockHolderRecord(ro) // must not panic and must not surface an error
+
+	if _, ok := readLockHolderRecord(path); ok {
+		t.Fatal("a failed write should not leave a readable record behind")
+	}
+}
+
+func TestExclusiveLockClearsItsHolderRecordOnRelease(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "siding.lock")
+	if err := withFileLock(context.Background(), path, unix.LOCK_EX, "siding alpha", func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readLockHolderRecord(path); ok {
+		t.Fatal("holder record survived past the exclusive lock's release")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("lock file = %q, want truncated to empty after release", data)
+	}
+}
+
+// This is the exact defect shape reported: WithSidingOperation acquires the
+// project lock SHARED (so different sidings run together) and writes no
+// record for it. Without clearing on release, a shared waiter that reads the
+// file mid-wait would find a departed exclusive holder's leftover record and
+// could name a reused pid as though it still held the lock.
+func TestSharedLockWaiterNeverSeesADepartedExclusiveHoldersRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "project.lock")
+	if err := withFileLock(context.Background(), path, unix.LOCK_EX, "project lifecycle", func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	originalWriter := lockWaitReportWriter
+	defer func() { lockWaitReportWriter = originalWriter }()
+	var out bytes.Buffer
+	lockWaitReportWriter = &out
+
+	reportLockWait(path, "project lifecycle", 3*time.Second)
+
+	if strings.Contains(out.String(), "held by pid") {
+		t.Fatalf("report named the departed exclusive holder: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "held by another process") {
+		t.Fatalf("report = %q, want the unnamed-holder message", out.String())
 	}
 }
 
