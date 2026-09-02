@@ -80,6 +80,11 @@ type RemovalOperation struct {
 	ArchiveRef              string          `json:"archiveRef,omitempty"`
 	ArchiveOID              string          `json:"archiveOid,omitempty"`
 	ExplicitDiscard         bool            `json:"explicitDiscard,omitempty"`
+	// PromoteData records that the caller asked for this siding's volumes to
+	// become the durable baseline on the way out. It lives on the journal rather
+	// than in a parameter because the promotion stage is resumable: a crash
+	// between stages must not silently drop the request and remove the data.
+	PromoteData bool `json:"promoteData,omitempty"`
 }
 
 // RemovalTarget is an immutable local-ref witness captured before removal.
@@ -285,13 +290,19 @@ func EnsureV2(app *App) bool {
 }
 
 // NeedsBaseSelection reports the only migration decision state cannot infer:
-// multiple existing sidings with no designated source base.
+// several existing sidings with no source base that anyone chose.
+//
+// An empty BaseSiding alone does not mean that. It is also the deliberate
+// detached base, where the seed is a pinned commit and no siding is held open
+// merely to carry it. BaseCommit is what tells the two apart: legacy state that
+// predates the base concept has none, so it still asks, while a detached base
+// always has one because pinning is what detaching does.
 func NeedsBaseSelection(app App) bool {
 	if len(app.Sidings) == 0 {
 		return false
 	}
 	if app.BaseSiding == "" {
-		return len(app.Sidings) > 1
+		return app.BaseCommit == "" && len(app.Sidings) > 1
 	}
 	_, exists := app.Sidings[app.BaseSiding]
 	return !exists

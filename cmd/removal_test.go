@@ -448,7 +448,7 @@ func TestMissingWorktreeSnapshotReachesExplicitConfirmation(t *testing.T) {
 		t.Fatalf("protection = %t, %q, %v", protected, reason, err)
 	}
 	safety.ExplicitDiscard = true
-	if err := prepareRemovalStage(context.Background(), &fixture.app, "one", "", false, &safety, removalTestOperations()); err != nil {
+	if err := prepareRemovalStage(context.Background(), &fixture.app, "one", "", false, false, &safety, removalTestOperations()); err != nil {
 		t.Fatalf("confirmed missing removal did not journal: %v", err)
 	}
 }
@@ -1528,7 +1528,7 @@ func runRemovalWithPolicy(ctx context.Context, app *state.App, name, successor s
 			return err
 		}
 		*app = current
-		return removeSidingLocked(ctx, app, name, successor, force, safety, operations)
+		return removeSidingLocked(ctx, app, name, successor, force, false, safety, operations)
 	})
 }
 

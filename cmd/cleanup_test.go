@@ -566,3 +566,28 @@ func TestResolveSelectedRemovalRefsRejectsACollisionBetweenSelectedSidings(t *te
 		t.Errorf("error = %v, want it to name the colliding selected siding", err)
 	}
 }
+
+func TestBaseRemovalAcceptsDetachingInsteadOfASuccessor(t *testing.T) {
+	app := state.App{BaseSiding: "one", Sidings: map[string]state.Siding{"one": {Name: "one"}, "two": {Name: "two"}}}
+
+	// Non-interactive: the reserved value says detach without a terminal, which
+	// is what lets a script or cleanup choose it.
+	got, err := prepareBaseRemoval(app, []string{"one"}, detachedBaseChoice, bufio.NewReader(strings.NewReader("")))
+	if err != nil || got != detachedBaseChoice {
+		t.Fatalf("--next-base %s = %q, %v", detachedBaseChoice, got, err)
+	}
+
+	// The error for a bare removal has to name that option, or nobody finds it.
+	_, err = prepareBaseRemoval(app, []string{"one"}, "", bufio.NewReader(strings.NewReader("")))
+	if err == nil || !strings.Contains(err.Error(), detachedBaseChoice) {
+		t.Fatalf("error = %v, want it to name the detach option", err)
+	}
+}
+
+func TestDetachedBaseChoiceCannotCollideWithASidingName(t *testing.T) {
+	// The sentinel is only safe because a siding can never be called this. If
+	// that ever stops holding, --next-base becomes ambiguous.
+	if err := siding.ValidateName(detachedBaseChoice); err == nil {
+		t.Fatalf("ValidateName(%q) = nil, want a rejection so the sentinel stays unambiguous", detachedBaseChoice)
+	}
+}
