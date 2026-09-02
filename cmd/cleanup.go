@@ -151,10 +151,19 @@ func resolveSelectedRemovalRefs(ctx context.Context, app state.App, selected []s
 		if err != nil {
 			continue
 		}
-		for survivor, sd := range app.Sidings {
-			if !selectedSet[survivor] && sd.Branch == branch {
-				return nil, fmt.Errorf("checked-out branch %q for %q is owned by surviving siding %q", branch, name, survivor)
+		// A branch owned by any OTHER siding is a collision, whether that siding
+		// survives or is selected too. Checking only survivors let a selected pair
+		// through: removing the first deletes the ref the second's worktree is
+		// still on, and the second then cannot resolve HEAD, so the batch aborts
+		// half-done with some sidings already gone.
+		for owner, sd := range app.Sidings {
+			if owner == name || sd.Branch != branch {
+				continue
 			}
+			if selectedSet[owner] {
+				return nil, fmt.Errorf("checked-out branch %q for %q is also owned by selected siding %q; remove them one at a time so the ref is not deleted while the other worktree is still on it", branch, name, owner)
+			}
+			return nil, fmt.Errorf("checked-out branch %q for %q is owned by surviving siding %q", branch, name, owner)
 		}
 		refs["refs/heads/"+branch] = true
 	}

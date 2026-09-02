@@ -526,3 +526,43 @@ func runGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 }
+
+// TestResolveSelectedRemovalRefsRejectsACollisionBetweenSelectedSidings covers
+// the case where two sidings in the same batch share one branch: A's worktree is
+// checked out on the branch recorded for B, and both are selected.
+//
+// The check used to look at surviving sidings only, so this pair went through.
+// Removing A then deleted the ref B's worktree was still on, B could no longer
+// resolve HEAD, and the batch aborted with A already gone — the worst outcome,
+// because it is half-applied and not obviously recoverable.
+func TestResolveSelectedRemovalRefsRejectsACollisionBetweenSelectedSidings(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "tracked"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "tracked")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "base")
+
+	config := t.TempDir()
+	app := state.App{ConfigDir: config, RepoPath: repo, Sidings: map[string]state.Siding{}}
+	for _, name := range []string{"one", "two"} {
+		src := filepath.Join(config, name, "src")
+		if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, repo, "worktree", "add", "-b", name, src, "main")
+		app.Sidings[name] = state.Siding{Name: name, Branch: name, WorktreeRepoPath: repo}
+	}
+	// "one" is recorded against branch "one" but sits on "two"'s branch, which is
+	// what `git checkout --ignore-other-worktrees` produces.
+	app.Sidings["one"] = state.Siding{Name: "one", Branch: "two", WorktreeRepoPath: repo}
+
+	_, err := resolveSelectedRemovalRefs(context.Background(), app, []string{"one", "two"})
+	if err == nil {
+		t.Fatal("resolveSelectedRemovalRefs() = nil error, want a refusal: removing one would delete the ref two is on")
+	}
+	if !strings.Contains(err.Error(), "selected siding") {
+		t.Errorf("error = %v, want it to name the colliding selected siding", err)
+	}
+}
