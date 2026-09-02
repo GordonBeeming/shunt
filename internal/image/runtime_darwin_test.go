@@ -47,7 +47,15 @@ func TestAppleContainerGuestDockerAdmission(t *testing.T) {
 		}
 		t.Errorf("delete disposable guest %s: %v\n%s", guest, lastErr, lastOutput)
 	})
-	runHost(t, ctx, "container", "run", "--detach", "--cap-add", "ALL", "--name", guest, baseTag, "sleep", "600")
+	// Keep this fixture aligned with production guest creation: Apple Container
+	// 1.2.2 makes /proc/sys read-only unless the defaults are explicitly reset.
+	runHost(t, ctx, "container", "run", "--detach", "--cap-add", "ALL",
+		"--read-only-path", "NONE",
+		"--read-only-path", "/proc/bus",
+		"--read-only-path", "/proc/fs",
+		"--read-only-path", "/proc/irq",
+		"--read-only-path", "/proc/sysrq-trigger",
+		"--name", guest, baseTag, "sleep", "600")
 
 	deadline := time.Now().Add(90 * time.Second)
 	for {

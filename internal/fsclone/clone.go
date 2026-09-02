@@ -4,15 +4,261 @@ package fsclone
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/proc"
+	"github.com/gordonbeeming/shunt/internal/state"
 )
+
+// EnsureRemovalRecoveryRefs creates deterministic Shunt-owned refs at the exact
+// witnessed OIDs in one update-ref transaction. Explicitly absent targets need
+// no recovery ref.
+func EnsureRemovalRecoveryRefs(ctx context.Context, repoPath, operationID string, targets []state.RemovalTarget) ([]string, error) {
+	lines := []string{"start"}
+	refs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target.ExpectedOID == "" {
+			continue
+		}
+		digest := sha256.Sum256([]byte(target.Ref))
+		ref := fmt.Sprintf("refs/shunt/recovery/%s/%x", safeOperationID(operationID), digest[:8])
+		refs = append(refs, ref)
+		lines = append(lines, "update "+ref+" "+target.ExpectedOID)
+	}
+	if len(refs) == 0 {
+		return refs, nil
+	}
+	lines = append(lines, "prepare", "commit")
+	tmp, err := os.CreateTemp("", "shunt-update-ref-*.stdin")
+	if err != nil {
+		return nil, err
+	}
+	path := tmp.Name()
+	defer os.Remove(path)
+	if _, err := tmp.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	if err := proc.RunStdin(ctx, path, "git", "-C", repoPath, "update-ref", "--stdin"); err != nil {
+		return nil, fmt.Errorf("create removal recovery refs: %w", err)
+	}
+	sort.Strings(refs)
+	return refs, nil
+}
+
+func EnsureRemovalWitnessArchive(ctx context.Context, repoPath string, targets []state.RemovalTarget) (string, string, error) {
+	set := map[string]bool{}
+	for _, target := range targets {
+		if target.Preserved && target.MatchingCommit != "" {
+			set[target.MatchingCommit] = true
+		}
+	}
+	if len(set) == 0 {
+		return "", "", nil
+	}
+	commits := make([]string, 0, len(set))
+	for oid := range set {
+		commits = append(commits, oid)
+	}
+	sort.Strings(commits)
+	const ref = "refs/shunt/witness/archive"
+	old := ""
+	if result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", ref+"^{commit}"); err == nil {
+		old = strings.TrimSpace(result.Stdout)
+	}
+	tree, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", commits[0]+"^{tree}")
+	if err != nil {
+		return "", "", err
+	}
+	args := []string{"-C", repoPath, "-c", "user.name=Shunt", "-c", "user.email=shunt@localhost", "commit-tree", strings.TrimSpace(tree.Stdout), "-m", "shunt preservation witness archive"}
+	if old != "" {
+		args = append(args, "-p", old)
+	}
+	for _, oid := range commits {
+		if oid != old {
+			args = append(args, "-p", oid)
+		}
+	}
+	created, err := proc.Run(ctx, "git", args...)
+	if err != nil {
+		return "", "", err
+	}
+	oid := strings.TrimSpace(created.Stdout)
+	update := []string{"-C", repoPath, "update-ref", ref, oid}
+	if old != "" {
+		update = append(update, old)
+	}
+	if _, err := proc.Run(ctx, "git", update...); err != nil {
+		return "", "", err
+	}
+	return ref, oid, nil
+}
+
+func CompleteRemovalRecoveryHandoff(ctx context.Context, repoPath, archiveRef, archiveOID string, targets []state.RemovalTarget, recoveryRefs []string) error {
+	expected := map[string]int{}
+	for _, target := range targets {
+		if target.ExpectedOID != "" {
+			expected[target.ExpectedOID]++
+		}
+	}
+	seen := map[string]int{}
+	lines := []string{"start"}
+	present := 0
+	for _, ref := range recoveryRefs {
+		exists, err := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", ref)
+		if err != nil {
+			if exists.ExitCode == 1 {
+				continue
+			}
+			return fmt.Errorf("inspect recovery ref %q: %w", ref, err)
+		}
+		result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", ref+"^{commit}")
+		if err != nil {
+			return fmt.Errorf("resolve recovery ref %q: %w", ref, err)
+		}
+		oid := strings.TrimSpace(result.Stdout)
+		seen[oid]++
+		present++
+		lines = append(lines, "delete "+ref+" "+oid)
+	}
+	if present == 0 {
+		if archiveRef == "" {
+			return nil
+		}
+		result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", archiveRef+"^{commit}")
+		if err != nil || strings.TrimSpace(result.Stdout) != archiveOID {
+			return fmt.Errorf("recovery handoff archive moved or disappeared")
+		}
+		return nil
+	}
+	if present != len(recoveryRefs) {
+		return fmt.Errorf("recovery refs are in a mixed present/absent state")
+	}
+	if !maps.Equal(expected, seen) {
+		return fmt.Errorf("recovery refs do not retain exact target OIDs")
+	}
+	if archiveRef != "" {
+		lines = append(lines, "verify "+archiveRef+" "+archiveOID)
+	}
+	lines = append(lines, "prepare", "commit")
+	tmp, err := os.CreateTemp("", "shunt-handoff-*.stdin")
+	if err != nil {
+		return err
+	}
+	path := tmp.Name()
+	defer os.Remove(path)
+	if _, err := tmp.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := proc.RunStdin(ctx, path, "git", "-C", repoPath, "update-ref", "--stdin"); err != nil {
+		return fmt.Errorf("complete recovery handoff: %w", err)
+	}
+	return nil
+}
+
+func RemoveRecoveryRefs(ctx context.Context, repoPath string, refs []string) error {
+	for _, ref := range refs {
+		if !strings.HasPrefix(ref, "refs/shunt/recovery/") {
+			return fmt.Errorf("refuse to remove non-recovery ref %q", ref)
+		}
+		if _, err := proc.Run(ctx, "git", "-C", repoPath, "update-ref", "-d", ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ValidateRecoveryRefs(ctx context.Context, repoPath string, refs []string) error {
+	for _, ref := range refs {
+		if !strings.HasPrefix(ref, "refs/shunt/recovery/") {
+			return fmt.Errorf("invalid recovery ref %q", ref)
+		}
+		if _, err := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", ref); err != nil {
+			return fmt.Errorf("recovery ref %q is missing: %w", ref, err)
+		}
+	}
+	return nil
+}
+
+func ValidateRemovalTargets(ctx context.Context, repoPath string, targets []state.RemovalTarget) error {
+	for _, target := range targets {
+		present, presentErr := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", target.Ref)
+		if target.ExpectedOID == "" {
+			if presentErr == nil {
+				return fmt.Errorf("removal target %q appeared after confirmation", target.Ref)
+			}
+			if present.ExitCode != 1 {
+				return fmt.Errorf("inspect expected-absent removal target %q: %w", target.Ref, presentErr)
+			}
+			continue
+		}
+		if presentErr != nil {
+			return fmt.Errorf("removal target %q disappeared after confirmation: %w", target.Ref, presentErr)
+		}
+		result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", target.Ref+"^{commit}")
+		if err != nil || strings.TrimSpace(result.Stdout) != target.ExpectedOID {
+			return fmt.Errorf("removal target %q moved after confirmation", target.Ref)
+		}
+	}
+	return nil
+}
+
+func RemovalTargetsAbsent(ctx context.Context, repoPath string, targets []state.RemovalTarget) (bool, error) {
+	absent := 0
+	for _, target := range targets {
+		result, err := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", target.Ref)
+		if err != nil {
+			if result.ExitCode != 1 {
+				return false, err
+			}
+			absent++
+			continue
+		}
+		if target.ExpectedOID == "" {
+			return false, fmt.Errorf("expected-absent target %q appeared", target.Ref)
+		}
+		oid, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", target.Ref+"^{commit}")
+		if err != nil || strings.TrimSpace(oid.Stdout) != target.ExpectedOID {
+			return false, fmt.Errorf("target %q moved", target.Ref)
+		}
+	}
+	if absent == 0 {
+		return false, nil
+	}
+	if absent != len(targets) {
+		return false, fmt.Errorf("removal targets are in a mixed present/absent state")
+	}
+	return true, nil
+}
+
+func safeOperationID(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	if b.Len() == 0 {
+		return "operation"
+	}
+	return b.String()
+}
 
 // AddWorktree creates a git worktree of repoPath at dest, on a fresh branch
 // (newBranch) based on baseBranch. An explicit baseBranch is always honoured.
@@ -148,6 +394,27 @@ func RemoveWorktree(ctx context.Context, repoPath, dest, branch string) error {
 	return nil
 }
 
+// RemoveLocalBranchRef retires one exact local branch ref after its preservation
+// evidence has been validated by the caller. Missing refs are idempotent.
+func RemoveLocalBranchRef(ctx context.Context, repoPath, ref string) error {
+	const prefix = "refs/heads/"
+	if !strings.HasPrefix(ref, prefix) || strings.TrimPrefix(ref, prefix) == "" {
+		return fmt.Errorf("refuse to remove non-local-branch ref %q", ref)
+	}
+	branch := strings.TrimPrefix(ref, prefix)
+	result, err := proc.Run(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", ref)
+	if err != nil && result.ExitCode != 1 {
+		return fmt.Errorf("inspect branch %q: %w", branch, err)
+	}
+	if err != nil {
+		return nil
+	}
+	if _, err := proc.Run(ctx, "git", "-C", repoPath, "branch", "-D", branch); err != nil {
+		return fmt.Errorf("delete branch %q: %w", branch, err)
+	}
+	return nil
+}
+
 // WorktreeQuarantine identifies a worktree that has been atomically moved out
 // of its live path while its Git registration is still intact.
 type WorktreeQuarantine struct {
@@ -155,6 +422,7 @@ type WorktreeQuarantine struct {
 	OriginalPath string
 	RecoveryPath string
 	Branch       string
+	RetainBranch bool
 }
 
 // WorktreeQuarantineFor returns the deterministic recovery location for an
@@ -272,7 +540,7 @@ func retireQuarantinedWorktree(ctx context.Context, quarantine WorktreeQuarantin
 	if err := syncDirectory(metadataRoot); err != nil {
 		return fmt.Errorf("durably retire exact worktree registration %q: %w", adminPath, err)
 	}
-	if quarantine.Branch != "" {
+	if quarantine.Branch != "" && !quarantine.RetainBranch {
 		result, err := proc.Run(ctx, "git", "-C", quarantine.OwnerPath, "show-ref", "--verify", "--quiet", "refs/heads/"+quarantine.Branch)
 		if err != nil && result.ExitCode != 1 {
 			return fmt.Errorf("inspect branch %q after deleting its worktree: %w", quarantine.Branch, err)
@@ -284,6 +552,78 @@ func retireQuarantinedWorktree(ctx context.Context, quarantine WorktreeQuarantin
 		}
 	}
 	return nil
+}
+
+// RetireRemovalTargetRefs verifies every durable recovery archive and deletes
+// all existing target refs at their exact witnessed OIDs in one transaction.
+func RetireRemovalTargetRefs(ctx context.Context, repoPath string, targets []state.RemovalTarget, recoveryRefs []string) error {
+	expected := map[string]int{}
+	for _, target := range targets {
+		if target.ExpectedOID != "" {
+			expected[target.ExpectedOID]++
+		}
+	}
+	lines := []string{"start"}
+	seen := map[string]int{}
+	for _, ref := range recoveryRefs {
+		if !strings.HasPrefix(ref, "refs/shunt/recovery/") {
+			return fmt.Errorf("invalid recovery ref %q", ref)
+		}
+		result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--verify", ref+"^{commit}")
+		if err != nil {
+			return fmt.Errorf("resolve recovery ref %q: %w", ref, err)
+		}
+		oid := strings.TrimSpace(result.Stdout)
+		seen[oid]++
+		lines = append(lines, "verify "+ref+" "+oid)
+	}
+	if !maps.Equal(expected, seen) {
+		return fmt.Errorf("recovery refs do not retain the exact target OIDs")
+	}
+	zeroOID, err := repositoryZeroOID(ctx, repoPath)
+	if err != nil {
+		return err
+	}
+	for _, target := range targets {
+		if target.ExpectedOID == "" {
+			lines = append(lines, "verify "+target.Ref+" "+zeroOID)
+			continue
+		}
+		lines = append(lines, "delete "+target.Ref+" "+target.ExpectedOID)
+	}
+	lines = append(lines, "prepare", "commit")
+	tmp, err := os.CreateTemp("", "shunt-retire-refs-*.stdin")
+	if err != nil {
+		return err
+	}
+	path := tmp.Name()
+	defer os.Remove(path)
+	if _, err := tmp.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := proc.RunStdin(ctx, path, "git", "-C", repoPath, "update-ref", "--stdin"); err != nil {
+		return fmt.Errorf("retire removal target refs: %w", err)
+	}
+	return nil
+}
+
+func repositoryZeroOID(ctx context.Context, repoPath string) (string, error) {
+	result, err := proc.Run(ctx, "git", "-C", repoPath, "rev-parse", "--show-object-format")
+	if err != nil {
+		return "", err
+	}
+	switch strings.TrimSpace(result.Stdout) {
+	case "sha1":
+		return strings.Repeat("0", 40), nil
+	case "sha256":
+		return strings.Repeat("0", 64), nil
+	default:
+		return "", fmt.Errorf("unsupported Git object format %q", strings.TrimSpace(result.Stdout))
+	}
 }
 
 // repairQuarantinedWorktreeRegistration updates only the named linked

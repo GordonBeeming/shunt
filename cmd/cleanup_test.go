@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gordonbeeming/shunt/internal/gitpreservation"
+	"github.com/gordonbeeming/shunt/internal/resolve"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
@@ -50,6 +54,143 @@ func TestOrderBaseLast(t *testing.T) {
 	want := []string{"alpha", "beta", "base"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("orderBaseLast() = %v, want %v", got, want)
+	}
+}
+
+func TestUnrelatedRemovalDoesNotRequireLegacyBaseSelection(t *testing.T) {
+	app := state.App{Sidings: map[string]state.Siding{"one": {Name: "one"}, "two": {Name: "two"}}}
+	got, err := prepareBaseRemoval(app, []string{"one"}, "", bufio.NewReader(strings.NewReader("")))
+	if err != nil || got != "" {
+		t.Fatalf("unrelated removal = %q, %v", got, err)
+	}
+}
+
+func TestConfiguredBaseRemovalStillRequiresSuccessor(t *testing.T) {
+	app := state.App{BaseSiding: "one", Sidings: map[string]state.Siding{"one": {Name: "one"}, "two": {Name: "two"}}}
+	_, err := prepareBaseRemoval(app, []string{"one"}, "", bufio.NewReader(strings.NewReader("")))
+	if err == nil || !strings.Contains(err.Error(), "requires --next-base") {
+		t.Fatalf("base removal error = %v", err)
+	}
+}
+
+func TestRmCommandLegacyNoBaseDoesNotPromptForBase(t *testing.T) {
+	app := persistedLegacyNoBaseApp(t)
+	withRemovalCommandSeams(t, app, func(removed *[]string) error {
+		command := newRmCmd()
+		command.SetArgs([]string{"one", "--force"})
+		return command.ExecuteContext(context.Background())
+	}, "")
+}
+
+func TestCleanupCommandLegacyNoBaseConsumesOnlySidingSelection(t *testing.T) {
+	app := persistedLegacyNoBaseApp(t)
+	withRemovalCommandSeams(t, app, func(removed *[]string) error {
+		command := newCleanupCmd()
+		command.SetArgs([]string{"--force"})
+		return command.ExecuteContext(context.Background())
+	}, "1\n")
+}
+
+func TestAnalyzerFactoryCreatesOnePerOwnerPerObservationPhase(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "tracked"), []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "tracked")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "base")
+	config := t.TempDir()
+	app := state.App{ConfigDir: config, RepoPath: repo, Sidings: map[string]state.Siding{}}
+	for _, name := range []string{"one", "two"} {
+		src := filepath.Join(config, name, "src")
+		if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, repo, "worktree", "add", "-b", name, src, "main")
+		app.Sidings[name] = state.Siding{Name: name, Branch: name, WorktreeRepoPath: repo}
+	}
+	old := newCommandAnalyzer
+	t.Cleanup(func() { newCommandAnalyzer = old })
+	calls := 0
+	newCommandAnalyzer = func(owner string) *gitpreservation.Analyzer {
+		calls++
+		return gitpreservation.NewAnalyzer(owner, gitpreservation.Options{})
+	}
+	if _, err := buildCleanupCandidates(context.Background(), app, true); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("candidate analyzer creations = %d", calls)
+	}
+	calls = 0
+	selected := []string{"one", "two"}
+	refs, err := resolveSelectedRemovalRefs(context.Background(), app, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureSelectedRemovalSafety(context.Background(), app, selected, refs); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("snapshot analyzer creations = %d", calls)
+	}
+}
+
+func persistedLegacyNoBaseApp(t *testing.T) state.App {
+	t.Helper()
+	dir := t.TempDir()
+	app := state.App{Name: "legacy", ConfigDir: dir, Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "one"}, "two": {Name: "two", Branch: "two"}}}
+	if err := state.SaveApp(app); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := state.LoadApp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.BaseSiding = ""
+	return loaded
+}
+
+func withRemovalCommandSeams(t *testing.T, app state.App, run func(*[]string) error, input string) {
+	t.Helper()
+	oldLoad, oldRemove, oldStdin, oldStdout := commandLoadCurrentApp, commandRemoveSiding, os.Stdin, os.Stdout
+	t.Cleanup(func() {
+		commandLoadCurrentApp, commandRemoveSiding, os.Stdin, os.Stdout = oldLoad, oldRemove, oldStdin, oldStdout
+	})
+	commandLoadCurrentApp = func() (state.App, resolve.Location, error) { return app, resolve.Location{}, nil }
+	removed := []string{}
+	commandRemoveSiding = func(_ context.Context, _ *state.App, name string, _ bool, successor string, _ ...*removalSafety) error {
+		if successor != "" {
+			return fmt.Errorf("unexpected base successor %q", successor)
+		}
+		removed = append(removed, name)
+		return nil
+	}
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inW.WriteString(input); err != nil {
+		t.Fatal(err)
+	}
+	inW.Close()
+	os.Stdin = inR
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = outW
+	err = run(&removed)
+	outW.Close()
+	output, _ := io.ReadAll(outR)
+	if err != nil {
+		t.Fatalf("command: %v; output=%s", err, output)
+	}
+	if len(removed) != 1 || removed[0] != "one" {
+		t.Fatalf("removed = %v; output=%s", removed, output)
+	}
+	if strings.Contains(string(output), "Select a siding") || strings.Contains(string(output), "successor source base") {
+		t.Fatalf("unexpected base/siding prompt: %s", output)
 	}
 }
 
@@ -118,6 +259,85 @@ func TestConfirmDirtyCleanupAcceptsYes(t *testing.T) {
 	}
 	if !confirmed {
 		t.Fatal("yes confirmation was rejected")
+	}
+}
+
+func TestProtectionReasonsNameDirtyOwnershipAndUnprovenWork(t *testing.T) {
+	t.Run("dirty untracked", func(t *testing.T) {
+		config := t.TempDir()
+		src := filepath.Join(config, "one", "src")
+		if err := os.MkdirAll(src, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, src, "init", "-b", "main")
+		if err := os.WriteFile(filepath.Join(src, "new.txt"), []byte("new\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		app := state.App{ConfigDir: config, Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "main"}}}
+		protected, reason, err := sidingWorktreeProtection(context.Background(), app, "one", []string{"one"})
+		if err != nil || !protected || !strings.Contains(reason, "untracked") {
+			t.Fatalf("protection = %t, %q, %v", protected, reason, err)
+		}
+	})
+	t.Run("surviving owner", func(t *testing.T) {
+		config := t.TempDir()
+		src := filepath.Join(config, "one", "src")
+		if err := os.MkdirAll(src, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, src, "init", "-b", "shared")
+		app := state.App{ConfigDir: config, Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "recorded"}, "two": {Name: "two", Branch: "shared"}}}
+		protected, reason, err := sidingWorktreeProtection(context.Background(), app, "one", []string{"one"})
+		if err != nil || !protected || !strings.Contains(reason, "owned by surviving siding") {
+			t.Fatalf("protection = %t, %q, %v", protected, reason, err)
+		}
+	})
+	t.Run("unproven commit", func(t *testing.T) {
+		config := t.TempDir()
+		src := filepath.Join(config, "one", "src")
+		if err := os.MkdirAll(src, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, src, "init", "-b", "topic")
+		if err := os.WriteFile(filepath.Join(src, "tracked.txt"), []byte("topic\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, src, "add", "tracked.txt")
+		runGit(t, src, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "topic")
+		app := state.App{ConfigDir: config, Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "topic"}}}
+		protected, reason, err := sidingWorktreeProtection(context.Background(), app, "one", []string{"one"})
+		if err != nil || !protected || !strings.Contains(reason, "not proven preserved") || !strings.Contains(reason, "no surviving origin/HEAD") {
+			t.Fatalf("protection = %t, %q, %v", protected, reason, err)
+		}
+	})
+}
+
+func TestTruncateTerminalRowTinyAndNormalWidths(t *testing.T) {
+	for _, width := range []int{0, 1} {
+		if got := truncateTerminalRow("long reason", width); got != "…" {
+			t.Fatalf("width %d = %q", width, got)
+		}
+	}
+	if got := truncateTerminalRow("long", 2); got != "l…" {
+		t.Fatalf("width 2 = %q", got)
+	}
+	if got := truncateTerminalRow("long", 4); got != "long" {
+		t.Fatalf("width 4 = %q", got)
+	}
+	if got := truncateTerminalRow("short", 10); got != "short" {
+		t.Fatalf("normal = %q", got)
+	}
+	if got := truncateTerminalRow("e\u0301x", 2); got != "e\u0301x" {
+		t.Fatalf("combining width = %q", got)
+	}
+	if got := truncateTerminalRow("界x", 2); got != "…" {
+		t.Fatalf("wide width = %q", got)
+	}
+	if got := terminalRuneWidth('界'); got != 2 {
+		t.Fatalf("wide rune cells = %d", got)
+	}
+	if got := terminalRuneWidth('Ａ'); got != 2 {
+		t.Fatalf("fullwidth form cells = %d", got)
 	}
 }
 
@@ -193,6 +413,60 @@ func TestWorktreeHasChangesDetectsOnlyReachableFromSidingBranch(t *testing.T) {
 	}
 }
 
+func TestWorktreeHasChangesAcceptsWholeBranchSquash(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "tracked.txt")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "initial")
+	runGit(t, repo, "checkout", "-b", "siding")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("squashed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "tracked.txt")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "topic")
+	runGit(t, repo, "checkout", "main")
+	runGit(t, repo, "merge", "--squash", "siding")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "squash")
+	runGit(t, repo, "update-ref", "refs/remotes/origin/main", "main")
+	runGit(t, repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	runGit(t, repo, "checkout", "siding")
+	protected, err := worktreeHasChanges(context.Background(), repo, "siding", []string{"siding"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protected {
+		t.Fatal("squash-preserved branch was marked protected")
+	}
+}
+
+func TestSidingWorktreeChecksRecordedAndObservedBranches(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "tracked.txt")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "initial")
+	runGit(t, repo, "branch", "recorded")
+	configDir := filepath.Join(t.TempDir(), "config")
+	src := filepath.Join(configDir, "one", "src")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "worktree", "add", "-b", "observed", src, "main")
+	app := state.App{ConfigDir: configDir, RepoPath: repo, Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "recorded", WorktreeRepoPath: repo}}}
+	protected, err := sidingWorktreeHasChanges(context.Background(), app, "one", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protected {
+		t.Fatal("independently preserved recorded and observed branches were marked protected")
+	}
+}
+
 func TestWorktreeHasChangesDetectsUntrackedFile(t *testing.T) {
 	repo := t.TempDir()
 	runGit(t, repo, "init", "-b", "main")
@@ -250,5 +524,45 @@ func runGit(t *testing.T, dir string, args ...string) {
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// TestResolveSelectedRemovalRefsRejectsACollisionBetweenSelectedSidings covers
+// the case where two sidings in the same batch share one branch: A's worktree is
+// checked out on the branch recorded for B, and both are selected.
+//
+// The check used to look at surviving sidings only, so this pair went through.
+// Removing A then deleted the ref B's worktree was still on, B could no longer
+// resolve HEAD, and the batch aborted with A already gone — the worst outcome,
+// because it is half-applied and not obviously recoverable.
+func TestResolveSelectedRemovalRefsRejectsACollisionBetweenSelectedSidings(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "tracked"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "tracked")
+	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "base")
+
+	config := t.TempDir()
+	app := state.App{ConfigDir: config, RepoPath: repo, Sidings: map[string]state.Siding{}}
+	for _, name := range []string{"one", "two"} {
+		src := filepath.Join(config, name, "src")
+		if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, repo, "worktree", "add", "-b", name, src, "main")
+		app.Sidings[name] = state.Siding{Name: name, Branch: name, WorktreeRepoPath: repo}
+	}
+	// "one" is recorded against branch "one" but sits on "two"'s branch, which is
+	// what `git checkout --ignore-other-worktrees` produces.
+	app.Sidings["one"] = state.Siding{Name: "one", Branch: "two", WorktreeRepoPath: repo}
+
+	_, err := resolveSelectedRemovalRefs(context.Background(), app, []string{"one", "two"})
+	if err == nil {
+		t.Fatal("resolveSelectedRemovalRefs() = nil error, want a refusal: removing one would delete the ref two is on")
+	}
+	if !strings.Contains(err.Error(), "selected siding") {
+		t.Errorf("error = %v, want it to name the colliding selected siding", err)
 	}
 }

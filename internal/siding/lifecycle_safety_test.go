@@ -328,6 +328,26 @@ func TestRecreateStopsReplacementWhenRunningStateCannotBeSaved(t *testing.T) {
 	}
 }
 
+func TestRecreateEnablesWritableProcSysOnlyForDockerdReplacement(t *testing.T) {
+	originalEnsureBase, originalRemove, originalRun, originalMerge := ensureBaseImage, removeGuest, runGuest, mergeSiding
+	defer func() {
+		ensureBaseImage, removeGuest, runGuest, mergeSiding = originalEnsureBase, originalRemove, originalRun, originalMerge
+	}()
+	ensureBaseImage = func(context.Context, bool) error { return nil }
+	removeGuest = func(context.Context, string) error { return nil }
+	mergeSiding = func(context.Context, string, state.Siding, bool) (state.App, error) { return state.App{}, nil }
+	stop := errors.New("captured replacement options")
+	var got container.RunOpts
+	runGuest = func(_ context.Context, options container.RunOpts) error { got = options; return stop }
+	_, err := recreate(context.Background(), state.App{ConfigDir: t.TempDir()}, state.Siding{Name: "alpha", Container: "guest"}, false)
+	if !errors.Is(err, stop) {
+		t.Fatalf("recreate error = %v", err)
+	}
+	if !got.CapAddAll || !got.WritableProcSys {
+		t.Fatalf("replacement opts = %#v", got)
+	}
+}
+
 func TestRecreateKeepsReplacementWhenStatePublicationIsVisible(t *testing.T) {
 	originalEnsureBase, originalRemove, originalRun, originalStop, originalMerge := ensureBaseImage, removeGuest, runGuest, stopGuest, mergeSiding
 	defer func() {

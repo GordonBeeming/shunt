@@ -145,6 +145,314 @@ func TestRemovalReusesPromotionWhenCheckpointPublicationFails(t *testing.T) {
 	}
 }
 
+func TestCaptureRemovalSafetyJournalsUnprovenCommittedWork(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	sourceRoot, _, err := siding.Paths(fixture.app, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "unmatched.txt"), []byte("unmatched\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, sourceRoot, "add", "unmatched.txt")
+	runGit(t, sourceRoot, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "unmatched")
+	safety, err := captureRemovalSafety(context.Background(), fixture.app, "one", []string{"one"})
+	if err != nil {
+		t.Fatalf("capture unproven work: %v", err)
+	}
+	if safety.Fingerprint == "" || safety.PreservationFingerprint == "" || safety.ObservedBranch == "" {
+		t.Fatalf("incomplete safety = %#v", safety)
+	}
+}
+
+func TestCaptureRemovalSafetyTreatsDetachedHEADAsExplicitDiscardWork(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	sourceRoot, _, err := siding.Paths(fixture.app, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, sourceRoot, "switch", "--detach", "HEAD")
+
+	safety, err := captureRemovalSafety(context.Background(), fixture.app, "one", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if safety.ObservedBranch != "" {
+		t.Fatalf("observed branch = %q, want empty for detached HEAD", safety.ObservedBranch)
+	}
+	if !hasUnpreservedTargets(safety.Targets) {
+		t.Fatalf("detached HEAD targets = %+v, want explicit discard confirmation", safety.Targets)
+	}
+	if len(safety.Targets) != 1 || !strings.Contains(safety.Targets[0].Reason, "HEAD is detached") {
+		t.Fatalf("detached HEAD targets = %+v", safety.Targets)
+	}
+}
+
+func TestConfirmedUnprovenRemovalJournalsExactEvidence(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	sourceRoot, _, err := siding.Paths(fixture.app, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "unmatched.txt"), []byte("unmatched\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, sourceRoot, "add", "unmatched.txt")
+	runGit(t, sourceRoot, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "unmatched")
+	safety, err := captureRemovalSafety(context.Background(), fixture.app, "one", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	safety.ExplicitDiscard = true
+	stop := errors.New("stop after journal")
+	operations := removalTestOperations()
+	operations.afterCheckpoint = func(stage state.RemovalStage) error {
+		if stage == state.RemovalBasePinned {
+			return stop
+		}
+		return nil
+	}
+	app := fixture.app
+	if err := runRemovalWithPolicy(context.Background(), &app, "one", "", false, &safety, operations); !errors.Is(err, stop) {
+		t.Fatalf("remove = %v", err)
+	}
+	if app.Removal == nil || app.Removal.ObservedWorktreeBranch != safety.ObservedBranch || app.Removal.PreservationFingerprint != safety.PreservationFingerprint || len(app.Removal.Removing) == 0 {
+		t.Fatalf("journaled evidence = %#v; safety = %#v", app.Removal, safety)
+	}
+}
+
+func TestLegacyRemovalResumeUpgradesMismatchAndRetiresExactBranches(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	sourceRoot, _, err := siding.Paths(fixture.app, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded := fixture.app.Sidings["one"].Branch
+	observed := "shunt/observed-one"
+	runGit(t, sourceRoot, "checkout", "-b", observed)
+	legacySafety, err := captureRemovalSafety(context.Background(), fixture.app, "one", []string{"refs/heads/" + recorded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.app.Removal = &state.RemovalOperation{
+		ID: "remove-one-legacy", Siding: "one", Stage: state.RemovalBaselinePromoted,
+		StartedAt: time.Now().UTC().Format(time.RFC3339Nano), Safety: legacySafety.Fingerprint,
+		Removing: []string{"refs/heads/" + recorded},
+	}
+	if err := state.SaveApp(fixture.app); err != nil {
+		t.Fatal(err)
+	}
+
+	reproduced, err := captureRemovalSafety(context.Background(), fixture.app, "one", fixture.app.Removal.Removing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reproduced.Fingerprint != fixture.app.Removal.Safety {
+		t.Fatal("legacy safety fingerprint did not reproduce")
+	}
+	upgraded, err := upgradeRemovalPreservation(context.Background(), fixture.app, reproduced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upgraded.Removal == nil || upgraded.Removal.ObservedWorktreeBranch != observed || upgraded.Removal.PreservationFingerprint == "" || !containsName(upgraded.Removal.Removing, "refs/heads/"+recorded) || !containsName(upgraded.Removal.Removing, "refs/heads/"+observed) {
+		t.Fatalf("upgraded journal = %#v", upgraded.Removal)
+	}
+	if err := runRemovalWithPolicy(context.Background(), &upgraded, "one", "", false, nil, removalTestOperations()); err != nil {
+		t.Fatal(err)
+	}
+	for _, branch := range []string{recorded, observed} {
+		command := exec.Command("git", "-C", fixture.control, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+		if err := command.Run(); err == nil {
+			t.Fatalf("branch %q remains after legacy resume", branch)
+		}
+	}
+}
+
+func TestTerminalPreservationFailureKeepsRecoveryAuthorizationRequired(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	sourceRoot, _, pathErr := siding.Paths(fixture.app, "one")
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "terminal.txt"), []byte("unique\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, sourceRoot, "add", "terminal.txt")
+	runGit(t, sourceRoot, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "terminal unique")
+	oid := removalGitOutput(t, fixture.control, "rev-parse", "refs/heads/shunt/one")
+	targets := []state.RemovalTarget{{Ref: "refs/heads/shunt/one", ExpectedOID: oid, Preserved: true, Kind: "reachable", Reason: "was preserved"}}
+	refs, err := fsclone.EnsureRemovalRecoveryRefs(context.Background(), fixture.control, "terminal-check", targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := &state.RemovalOperation{RecoveryRepo: fixture.control, RecoveryRefs: refs, Removing: []string{"refs/heads/shunt/one"}, Targets: targets}
+	if err := validateTerminalPreservation(context.Background(), journal); err == nil {
+		t.Fatal("lost preservation witness was accepted")
+	}
+	if err := fsclone.ValidateRecoveryRefs(context.Background(), fixture.control, refs); err != nil {
+		t.Fatalf("recovery refs were not retained: %v", err)
+	}
+	journal.ExplicitDiscard = true
+	if err := validateTerminalPreservation(context.Background(), journal); err != nil {
+		t.Fatalf("explicit discard did not permit terminal clear: %v", err)
+	}
+}
+
+func TestSuccessfulNonForceRemovalClearsTargetsRecoveriesAndArchivesWitness(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	safety, err := captureRemovalSafety(context.Background(), fixture.app, "one", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matching := ""
+	for _, target := range safety.Targets {
+		if target.Preserved {
+			matching = target.MatchingCommit
+			break
+		}
+	}
+	if matching == "" {
+		t.Fatal("fixture target was not preserved")
+	}
+	app := fixture.app
+	if err := runRemovalWithPolicy(context.Background(), &app, "one", "", false, &safety, removalTestOperations()); err != nil {
+		t.Fatal(err)
+	}
+	if app.Removal != nil {
+		t.Fatalf("journal remains: %#v", app.Removal)
+	}
+	assertRefAbsent(t, fixture.control, "refs/heads/shunt/one")
+	if refs := removalRefsWithPrefix(t, fixture.control, "refs/shunt/recovery"); len(refs) != 0 {
+		t.Fatalf("recoveries remain: %v", refs)
+	}
+	archive := removalGitOutput(t, fixture.control, "rev-parse", "refs/shunt/witness/archive^{commit}")
+	runGit(t, fixture.control, "merge-base", "--is-ancestor", matching, archive)
+}
+
+func TestSuccessfulForceRemovalClearsWithoutArchiveParent(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	before := removalOptionalRef(t, fixture.control, "refs/shunt/witness/archive")
+	app := fixture.app
+	if err := removeSiding(context.Background(), &app, "one", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if app.Removal != nil {
+		t.Fatalf("journal remains: %#v", app.Removal)
+	}
+	assertRefAbsent(t, fixture.control, "refs/heads/shunt/one")
+	if refs := removalRefsWithPrefix(t, fixture.control, "refs/shunt/recovery"); len(refs) != 0 {
+		t.Fatalf("recoveries remain: %v", refs)
+	}
+	if after := removalOptionalRef(t, fixture.control, "refs/shunt/witness/archive"); after != before {
+		t.Fatalf("discard advanced archive: before=%q after=%q", before, after)
+	}
+}
+
+func TestRemovalRetryAfterHandoffBeforeJournalClearIsIdempotent(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	safety, err := captureRemovalSafety(context.Background(), fixture.app, "one", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations := removalTestOperations()
+	original := operations.updateApp
+	injected := errors.New("injected clear publication failure")
+	failed := false
+	operations.updateApp = func(ctx context.Context, dir string, update func(*state.App) error) (state.App, error) {
+		current, err := state.LoadApp(dir)
+		if err != nil {
+			return state.App{}, err
+		}
+		if !failed && current.Removal != nil && current.Removal.Stage == state.RemovalOperationForgotten {
+			failed = true
+			return current, injected
+		}
+		return original(ctx, dir, update)
+	}
+	app := fixture.app
+	if err := runRemovalWithPolicy(context.Background(), &app, "one", "", false, &safety, operations); !errors.Is(err, injected) {
+		t.Fatalf("first removal = %v", err)
+	}
+	if refs := removalRefsWithPrefix(t, fixture.control, "refs/shunt/recovery"); len(refs) != 0 {
+		t.Fatalf("handoff did not remove recoveries: %v", refs)
+	}
+	operations.updateApp = original
+	if err := runRemovalWithPolicy(context.Background(), &app, "one", "", false, nil, operations); err != nil {
+		t.Fatalf("retry = %v", err)
+	}
+	if app.Removal != nil {
+		t.Fatalf("journal remains: %#v", app.Removal)
+	}
+}
+
+func assertRefAbsent(t *testing.T, repo, ref string) {
+	t.Helper()
+	command := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", ref)
+	if err := command.Run(); err == nil {
+		t.Fatalf("ref %q remains", ref)
+	}
+}
+func removalOptionalRef(t *testing.T, repo, ref string) string {
+	t.Helper()
+	command := exec.Command("git", "-C", repo, "rev-parse", "--verify", ref+"^{commit}")
+	output, err := command.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+func removalRefsWithPrefix(t *testing.T, repo, prefix string) []string {
+	t.Helper()
+	output := removalGitOutput(t, repo, "for-each-ref", "--format=%(refname)", prefix)
+	return strings.Fields(output)
+}
+
+func TestLegacyUpgradeDoesNotInferDiscardWhenWitnessIsLost(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	fixture.app.Removal = &state.RemovalOperation{ID: "legacy", Siding: "one", Stage: state.RemovalBaselinePromoted, StartedAt: time.Now().UTC().Format(time.RFC3339Nano), Safety: "old-safe"}
+	if err := state.SaveApp(fixture.app); err != nil {
+		t.Fatal(err)
+	}
+	safety := removalSafety{Fingerprint: "old-safe", PreservationFingerprint: "new", Targets: []state.RemovalTarget{{Ref: "refs/heads/shunt/one", ExpectedOID: fixture.sourceCommit, Preserved: false, Kind: "unproven", Reason: "witness moved"}}}
+	if _, err := upgradeRemovalPreservation(context.Background(), fixture.app, safety); err == nil || !strings.Contains(err.Error(), "fresh confirmation") {
+		t.Fatalf("upgrade error = %v", err)
+	}
+	loaded, err := state.LoadApp(fixture.app.ConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Removal == nil || loaded.Removal.ExplicitDiscard {
+		t.Fatalf("legacy journal became discard-authorized: %#v", loaded.Removal)
+	}
+}
+
+func TestMissingWorktreeSnapshotReachesExplicitConfirmation(t *testing.T) {
+	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
+	sd := fixture.app.Sidings["one"]
+	sourceRoot, _, err := siding.Paths(fixture.app, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsclone.RemoveWorktree(context.Background(), fixture.control, sourceRoot, ""); err != nil {
+		t.Fatal(err)
+	}
+	safety, err := captureRemovalSafety(context.Background(), fixture.app, "one", []string{"refs/heads/" + sd.Branch})
+	if err != nil {
+		t.Fatalf("missing snapshot: %v", err)
+	}
+	if safety.Fingerprint == "" || len(safety.Targets) != 1 {
+		t.Fatalf("missing safety = %#v", safety)
+	}
+	protected, reason, err := sidingWorktreeProtection(context.Background(), fixture.app, "one", []string{"one"})
+	if err != nil || !protected || !strings.Contains(reason, "worktree is missing") {
+		t.Fatalf("protection = %t, %q, %v", protected, reason, err)
+	}
+	safety.ExplicitDiscard = true
+	if err := prepareRemovalStage(context.Background(), &fixture.app, "one", "", false, &safety, removalTestOperations()); err != nil {
+		t.Fatalf("confirmed missing removal did not journal: %v", err)
+	}
+}
+
 func TestRemovalRechecksGuestAfterCheckpointPublicationFails(t *testing.T) {
 	fixture := newRemovalFixture(t, state.PhaseGuest, nil, false)
 	guest := filepath.Join(fixture.app.ConfigDir, "guest-resource")

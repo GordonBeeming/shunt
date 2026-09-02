@@ -22,26 +22,47 @@ type Mount struct {
 
 // RunOpts describes a guest to launch.
 type RunOpts struct {
-	Name      string
-	Image     string
-	Init      bool              // --init (signal forwarding / reaping)
-	CapAddAll bool              // --cap-add ALL (dockerd in the guest needs it)
-	Mounts    []Mount           // bind mounts
-	Env       map[string]string // -e KEY=VALUE
-	Memory    string            // -m (e.g. "6g"); empty uses the runtime default
-	CPUs      string            // -c (e.g. "4"); empty uses the runtime default
-	Rosetta   bool              // --rosetta: x86 translation so amd64 images (e.g. SQL Server) run on arm64
-	Cmd       []string          // command + args appended after the image
+	Name            string
+	Image           string
+	Init            bool              // --init (signal forwarding / reaping)
+	CapAddAll       bool              // --cap-add ALL (dockerd in the guest needs it)
+	WritableProcSys bool              // Apple container: clear default read-only paths, then leave /proc/sys writable (dockerd only)
+	Mounts          []Mount           // bind mounts
+	Env             map[string]string // -e KEY=VALUE
+	Memory          string            // -m (e.g. "6g"); empty uses the runtime default
+	CPUs            string            // -c (e.g. "4"); empty uses the runtime default
+	Rosetta         bool              // --rosetta: x86 translation so amd64 images (e.g. SQL Server) run on arm64
+	Cmd             []string          // command + args appended after the image
 }
 
 // Run launches a detached guest. Returns an error if the run fails.
 func Run(ctx context.Context, o RunOpts) error {
+	args := runArgs(o)
+
+	if _, err := proc.Run(ctx, Bin, args...); err != nil {
+		return fmt.Errorf("container run %s: %w", o.Name, err)
+	}
+	return nil
+}
+
+func runArgs(o RunOpts) []string {
 	args := []string{"run", "-d", "--name", o.Name}
 	if o.Init {
 		args = append(args, "--init")
 	}
 	if o.CapAddAll {
 		args = append(args, "--cap-add", "ALL")
+	}
+	if o.WritableProcSys {
+		// Apple container supplies a default read-only path set. NONE clears it;
+		// restore every default path except /proc/sys for dockerd's sysctl setup.
+		args = append(args,
+			"--read-only-path", "NONE",
+			"--read-only-path", "/proc/bus",
+			"--read-only-path", "/proc/fs",
+			"--read-only-path", "/proc/irq",
+			"--read-only-path", "/proc/sysrq-trigger",
+		)
 	}
 	if o.Memory != "" {
 		args = append(args, "-m", o.Memory)
@@ -70,11 +91,7 @@ func Run(ctx context.Context, o RunOpts) error {
 	}
 	args = append(args, o.Image)
 	args = append(args, o.Cmd...)
-
-	if _, err := proc.Run(ctx, Bin, args...); err != nil {
-		return fmt.Errorf("container run %s: %w", o.Name, err)
-	}
-	return nil
+	return args
 }
 
 // inspectDoc mirrors the parts of `container inspect` shunt reads.
@@ -161,7 +178,21 @@ func inspectErrorNamesAbsentGuest(err error, name string) bool {
 	if err == nil || strings.TrimSpace(name) == "" {
 		return false
 	}
-	message, target := strings.ToLower(err.Error()), strings.ToLower(name)
+	message, target := strings.TrimSpace(err.Error()), strings.TrimSpace(name)
+	// Apple container currently reports absence as either
+	// `container not found: <name>` or `Error: container not found: <name>`.
+	// This form is deliberately parsed as a complete message so a similarly
+	// named guest (for example, target-older) cannot prove target absent.
+	normalized := message
+	if len(normalized) >= len("Error:") && strings.EqualFold(normalized[:len("Error:")], "Error:") {
+		normalized = strings.TrimSpace(normalized[len("Error:"):])
+	}
+	const notFoundPrefix = "container not found:"
+	if len(normalized) >= len(notFoundPrefix) && strings.EqualFold(normalized[:len(notFoundPrefix)], notFoundPrefix) {
+		return strings.EqualFold(strings.TrimSpace(normalized[len(notFoundPrefix):]), target)
+	}
+
+	message, target = strings.ToLower(message), strings.ToLower(target)
 	patterns := []string{
 		"container " + target + " not found",
 		"container \"" + target + "\" not found",
@@ -181,7 +212,10 @@ func inspectErrorNamesAbsentGuest(err error, name string) bool {
 func inspect(ctx context.Context, name string) (inspectDoc, error) {
 	res, err := proc.Run(ctx, Bin, "inspect", name)
 	if err != nil {
-		if inspectErrorNamesAbsentGuest(err, name) {
+		// proc.Run wraps command failures with the executable and exit status.
+		// Classify absence from the raw stderr captured in Result so the
+		// container-specific parser sees the runtime's exact message.
+		if inspectErrorNamesAbsentGuest(errors.New(res.Stderr), name) {
 			return inspectDoc{}, &guestNotFoundError{name: name, err: err}
 		}
 		return inspectDoc{}, fmt.Errorf("container inspect %s: %w", name, err)

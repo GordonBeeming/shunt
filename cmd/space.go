@@ -97,6 +97,16 @@ func printSpace(out io.Writer, report storage.Report) error {
 			}
 			fmt.Fprintf(out, "  %s %s (logical; not reclaimable): %s\n", protection, managed.Name, formatMeasurement(managed))
 		}
+		if project.GitArchives.Observation == "observed" {
+			archive := "none"
+			if project.GitArchives.ArchiveTip != "" {
+				archive = project.GitArchives.ArchiveTip
+				if len(archive) > 12 {
+					archive = archive[:12]
+				}
+			}
+			fmt.Fprintf(out, "  managed Git refs: %d recovery; witness archive %s\n", project.GitArchives.RecoveryRefs, archive)
+		}
 		for _, unknown := range project.Unclassified {
 			fmt.Fprintf(out, "  unclassified %s (logical; ownership/reclaimability unverified): %s\n", unknown.Name, formatMeasurement(unknown))
 		}
@@ -168,6 +178,13 @@ func printGitEvidence(out io.Writer, label string, evidence storage.GitEvidence)
 	}
 	fmt.Fprintf(out, "  git %-12s branch %s; HEAD %s; upstream %s (+%d/-%d); %s; unique %d; last %s\n",
 		label+":", evidence.Branch, head, upstream, evidence.Ahead, evidence.Behind, dirty, evidence.UniqueCommits, last)
+	if evidence.Preservation != nil {
+		status := "protected"
+		if evidence.Preservation.Preserved {
+			status = "preserved"
+		}
+		fmt.Fprintf(out, "    committed work: %s (%s)\n", status, evidence.Preservation.Reason)
+	}
 }
 
 func formatBytes(bytes int64) string {
