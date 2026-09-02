@@ -46,6 +46,7 @@ var (
 	execGuestStdinFileDigest = container.ExecStdinFileDigest
 	removeGuest              = container.Remove
 	runGuest                 = container.Run
+	containerVersionCheck    = container.CheckMinimum
 	ensureBaseImage          = image.EnsureBuilt
 	stopGuest                = container.Stop
 	startGuest               = container.Start
@@ -1759,6 +1760,13 @@ func recreate(ctx context.Context, app state.App, sd state.Siding, freshData boo
 		if _, statErr := os.Stat(nugetHost); statErr == nil {
 			mounts = append(mounts, container.Mount{Host: nugetHost, Guest: "/root/.nuget/packages"})
 		}
+	}
+	// The host CLI has to accept the flags a guest needs before anything is torn
+	// down. Checked later, a `reapply --fresh-data` on an unsupported CLI would
+	// remove the guest and discard the volume data first, then fail — costing the
+	// user real state to learn that their host tooling is too old.
+	if err := containerVersionCheck(ctx); err != nil {
+		return sd, err
 	}
 	// Everything that can be checked without disrupting the current guest is now
 	// ready. Fresh data is reset only after removal because the guest bind-mounts
