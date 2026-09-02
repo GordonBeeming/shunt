@@ -280,6 +280,55 @@ func TestActiveCommandExitStatusCompatibility(t *testing.T) {
 	}
 }
 
+func TestActiveResultForDirReportsFrontDoorReleased(t *testing.T) {
+	repo, configDir, _ := newShellOnlyCommandRepo(t)
+	withWorkingDirectory(t, repo)
+	cmd := newNewCmd()
+	cmd.SetArgs([]string{"shell"})
+	if err := cmd.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	app, err := state.LoadApp(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.LiveSiding = "shell"
+	app.FrontDoorReleased = true
+	if err := state.SaveApp(app); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := activeResultForDir(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.FrontDoorReleased {
+		t.Fatalf("active result = %#v, want frontDoorReleased true", got)
+	}
+	payload, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current struct {
+		FrontDoorReleased bool `json:"frontDoorReleased"`
+	}
+	if err := json.Unmarshal(payload, &current); err != nil || !current.FrontDoorReleased {
+		t.Fatalf("active JSON = %s, want frontDoorReleased true (err %v)", payload, err)
+	}
+}
+
+func TestLiveSidingNoteMarksOnlyTheLiveSidingOfAReleasedApp(t *testing.T) {
+	if got := liveSidingNote(true, true); got == "" {
+		t.Fatalf("live siding of a released app = %q, want a released note", got)
+	}
+	if got := liveSidingNote(false, true); got != "" {
+		t.Fatalf("non-live siding of a released app = %q, want no note", got)
+	}
+	if got := liveSidingNote(true, false); got != "" {
+		t.Fatalf("live siding of a non-released app = %q, want no note", got)
+	}
+}
+
 func TestActiveCommandExitStatusHelper(t *testing.T) {
 	mode := os.Getenv("SHUNT_ACTIVE_EXIT_HELPER")
 	if mode == "" {

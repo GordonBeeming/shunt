@@ -163,6 +163,21 @@ async function main() {
   if (!unfenced.includes('Stop') || unfenced.includes('Removal in progress')) {
     throw new Error(`actions were not restored after removal cleared: ${JSON.stringify(unfenced)}`);
   }
+  const releasedResult = await page.evaluate(apps => {
+    renderApps(apps);
+    const siding = document.querySelector('.app[data-app="released-app"] .siding');
+    return {
+      releasedBadge: siding.querySelector('.badge.released')?.textContent,
+      liveBadge: siding.querySelector('.badge.live')?.textContent
+    };
+  }, [{
+    name: 'released-app', liveSiding: 'one', frontDoorReleased: true, routes: [],
+    sidings: [{ name: 'one', live: true, released: true, base: false, phase: 'guest', runtime: 'running', serving: false, status: '', progress: [], guest: 'running' }]
+  }]);
+  if (releasedResult.releasedBadge !== 'released' || releasedResult.liveBadge) {
+    throw new Error(`released badge = ${JSON.stringify(releasedResult)}, want a released badge and no live badge`);
+  }
+
   if (consoleErrors.length) throw new Error(`console errors: ${consoleErrors.join('; ')}`);
   await browser.close();
   console.log('dashboard DOM reconciliation: ok');

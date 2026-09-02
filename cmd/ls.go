@@ -27,9 +27,13 @@ type lsSiding struct {
 }
 
 type lsApp struct {
-	SchemaVersion int        `json:"schemaVersion"`
-	Name          string     `json:"name"`
-	Sidings       []lsSiding `json:"sidings"`
+	SchemaVersion int    `json:"schemaVersion"`
+	Name          string `json:"name"`
+	// FrontDoorReleased mirrors state.App.FrontDoorReleased: the app's fixed
+	// ports are deliberately free even though a siding still shows as live
+	// below. Additive to schemaVersion 2 — existing consumers ignore it.
+	FrontDoorReleased bool       `json:"frontDoorReleased,omitempty"`
+	Sidings           []lsSiding `json:"sidings"`
 }
 
 const lsSchemaVersion = 2
@@ -83,7 +87,7 @@ func newLsCmd() *cobra.Command {
 					apps = append(apps, lsApp{SchemaVersion: lsSchemaVersion, Name: n})
 					continue
 				}
-				la := lsApp{SchemaVersion: lsSchemaVersion, Name: app.Name, Sidings: []lsSiding{}}
+				la := lsApp{SchemaVersion: lsSchemaVersion, Name: app.Name, FrontDoorReleased: app.FrontDoorReleased, Sidings: []lsSiding{}}
 				if app.LiveSiding == state.HostTarget {
 					app.LiveSiding = ""
 				}
@@ -143,7 +147,7 @@ func newLsCmd() *cobra.Command {
 					// Plain text (no colour): tabwriter counts ANSI bytes as width
 					// and would misalign the columns.
 					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-						a.Name, s.Name, s.Status, s.Guest, s.IP, s.Dashboard)
+						a.Name, s.Name, lsTableStatus(a, s), s.Guest, s.IP, s.Dashboard)
 				}
 			}
 			return w.Flush()
@@ -181,6 +185,17 @@ func effectiveLsPhase(s state.Siding) state.MaterializationPhase {
 		return state.PhaseGuest
 	}
 	return s.MaterializationPhase
+}
+
+// lsTableStatus is the plain-table STATUS column. Unlike the deprecated-
+// compatible JSON status field, it surfaces a released front door instead of
+// claiming the siding is still live — a released app still points LiveSiding
+// there, but nothing answers on its ports.
+func lsTableStatus(a lsApp, s lsSiding) string {
+	if a.FrontDoorReleased && s.Live {
+		return "released"
+	}
+	return s.Status
 }
 
 func compatibilityLsStatus(app state.App, name string, sd state.Siding, guest string) string {

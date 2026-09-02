@@ -466,6 +466,53 @@ func TestStateReportsRemovalAndPreservesLegacyGuestEnum(t *testing.T) {
 	}
 }
 
+func TestStateMarksOnlyTheLiveSidingOfAReleasedAppAsReleased(t *testing.T) {
+	app := state.App{Name: "app", LiveSiding: "one", FrontDoorReleased: true, Sidings: map[string]state.Siding{
+		"one": {Name: "one", MaterializationPhase: state.PhaseGuest, Container: "one-guest"},
+		"two": {Name: "two", MaterializationPhase: state.PhaseGuest, Container: "two-guest"},
+	}}
+	server := newServerWithDeps(testServerDeps(app))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, stateRequest())
+	var view stateView
+	if err := json.Unmarshal(response.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Apps) != 1 || !view.Apps[0].FrontDoorReleased {
+		t.Fatalf("app view = %+v, want frontDoorReleased true", view.Apps)
+	}
+	rows := make(map[string]sidingView)
+	for _, row := range view.Apps[0].Sidings {
+		rows[row.Name] = row
+	}
+	if !rows["one"].Live || !rows["one"].Released {
+		t.Fatalf("live siding of a released app = %+v, want live and released", rows["one"])
+	}
+	if rows["two"].Live || rows["two"].Released {
+		t.Fatalf("non-live siding of a released app = %+v, want neither live nor released", rows["two"])
+	}
+}
+
+func TestStateLeavesAnUnreleasedAppsLiveSidingUnmarked(t *testing.T) {
+	app := state.App{Name: "app", LiveSiding: "one", Sidings: map[string]state.Siding{
+		"one": {Name: "one", MaterializationPhase: state.PhaseGuest, Container: "one-guest"},
+	}}
+	server := newServerWithDeps(testServerDeps(app))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, stateRequest())
+	var view stateView
+	if err := json.Unmarshal(response.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Apps[0].FrontDoorReleased {
+		t.Fatalf("app view = %+v, want frontDoorReleased false", view.Apps[0])
+	}
+	row := view.Apps[0].Sidings[0]
+	if !row.Live || row.Released {
+		t.Fatalf("live siding of an unreleased app = %+v, want live but not released", row)
+	}
+}
+
 func TestRemovalFencesEveryDashboardAction(t *testing.T) {
 	app := state.App{Name: "app", Removal: &state.RemovalOperation{ID: "remove-one", Siding: "one", Stage: state.RemovalGuestRemoved, StartedAt: time.Now().UTC().Format(time.RFC3339Nano)}, Sidings: map[string]state.Siding{
 		"one": {Name: "one", MaterializationPhase: state.PhaseGuest},

@@ -46,12 +46,16 @@ type removalHealth struct {
 }
 
 type appHealth struct {
-	Name       string         `json:"name"`
-	LiveSiding string         `json:"liveSiding"`
-	CurrentIP  string         `json:"currentIp,omitempty"` // the live siding's guest IP right now
-	Drift      []driftView    `json:"drift,omitempty"`
-	Fixed      bool           `json:"fixed,omitempty"` // --fix re-pointed it this run
-	Removal    *removalHealth `json:"removal,omitempty"`
+	Name       string      `json:"name"`
+	LiveSiding string      `json:"liveSiding"`
+	CurrentIP  string      `json:"currentIp,omitempty"` // the live siding's guest IP right now
+	Drift      []driftView `json:"drift,omitempty"`
+	Fixed      bool        `json:"fixed,omitempty"` // --fix re-pointed it this run
+	// FrontDoorReleased mirrors state.App.FrontDoorReleased: LiveSiding still
+	// names where a later claim would point, but there is no Caddy binding to
+	// check for drift, so the scan below and --fix both skip this app.
+	FrontDoorReleased bool           `json:"frontDoorReleased,omitempty"`
+	Removal           *removalHealth `json:"removal,omitempty"`
 }
 
 type driftView struct {
@@ -105,8 +109,8 @@ func newStatusCmd() *cobra.Command {
 						return err
 					}
 				}
-				ah := appHealth{Name: app.Name, LiveSiding: app.LiveSiding, Removal: makeRemovalHealth(app.Removal)}
-				if app.LiveSiding != "" && h.CaddyAdmin {
+				ah := appHealth{Name: app.Name, LiveSiding: app.LiveSiding, FrontDoorReleased: app.FrontDoorReleased, Removal: makeRemovalHealth(app.Removal)}
+				if appFrontDoorBound(app, h.CaddyAdmin) {
 					if sd, ok := app.Sidings[app.LiveSiding]; ok {
 						ip, _ := container.IP(ctx, sd.Container)
 						ah.CurrentIP = ip
@@ -146,6 +150,15 @@ func newStatusCmd() *cobra.Command {
 	return c
 }
 
+// appFrontDoorBound reports whether an app currently has a Caddy binding worth
+// drift-checking, and worth re-pointing under --fix. A released front door
+// has deliberately given its ports back, so there is no binding: every route
+// would read as drifted, and --fix would try to re-point servers that no
+// longer exist.
+func appFrontDoorBound(app state.App, caddyAdminUp bool) bool {
+	return app.LiveSiding != "" && caddyAdminUp && !app.FrontDoorReleased
+}
+
 func printStatus(h healthView) error {
 	fmt.Print(statusText(h))
 	return nil
@@ -180,6 +193,9 @@ func statusText(h healthView) string {
 			live = "(nothing live)"
 		}
 		fmt.Fprintf(&out, "    %-16s live: %s\n", a.Name, live)
+		if a.FrontDoorReleased {
+			fmt.Fprintln(&out, "      front door released — ports are free, no drift check")
+		}
 		if a.Removal != nil {
 			fmt.Fprintf(&out, "      removal in progress: %s (siding %s, stage %s, generation %s, started %s ago)\n", a.Removal.ID, a.Removal.Siding, a.Removal.Stage, a.Removal.Generation, a.Removal.Age)
 			fmt.Fprintf(&out, "        resume: `%s`\n", a.Removal.Resume)

@@ -45,6 +45,16 @@ func NewAdmin() *Admin {
 	}
 }
 
+// NewAdminAt points an admin client at an arbitrary base URL. NewAdmin resolves
+// the channel's real admin port, which a test cannot substitute, so this is how
+// callers outside this package drive a stand-in admin API.
+func NewAdminAt(base string) *Admin {
+	return &Admin{
+		base: base,
+		http: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
 // Ping reports whether the admin API is up (GET /config/ returns 2xx).
 func (a *Admin) Ping(ctx context.Context) error {
 	return a.do(ctx, http.MethodGet, "/config/", nil)

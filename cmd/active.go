@@ -31,14 +31,18 @@ type activeSiding struct {
 }
 
 type activeResult struct {
-	Active     bool           `json:"active"`              // is cwd a registered shunt app? Kept for existing consumers.
-	Managed    bool           `json:"managed"`             // does cwd belong to a project with durable Shunt state?
-	Registered bool           `json:"registered"`          // has app add published runtime state to the registry?
-	Project    string         `json:"project"`             // project (repo folder) name
-	ConfigDir  string         `json:"configDir,omitempty"` // <repos>/.shunt[-ch]/<project>
-	RepoPath   string         `json:"repoPath,omitempty"`  // the original repo
-	Siding     string         `json:"cwdSiding,omitempty"` // siding name if cwd is inside one
-	Sidings    []activeSiding `json:"sidings,omitempty"`
+	Active     bool   `json:"active"`              // is cwd a registered shunt app? Kept for existing consumers.
+	Managed    bool   `json:"managed"`             // does cwd belong to a project with durable Shunt state?
+	Registered bool   `json:"registered"`          // has app add published runtime state to the registry?
+	Project    string `json:"project"`             // project (repo folder) name
+	ConfigDir  string `json:"configDir,omitempty"` // <repos>/.shunt[-ch]/<project>
+	RepoPath   string `json:"repoPath,omitempty"`  // the original repo
+	Siding     string `json:"cwdSiding,omitempty"` // siding name if cwd is inside one
+	// FrontDoorReleased mirrors state.App.FrontDoorReleased: the live siding
+	// below still names where a later claim would point, but its ports answer
+	// nothing right now.
+	FrontDoorReleased bool           `json:"frontDoorReleased,omitempty"`
+	Sidings           []activeSiding `json:"sidings,omitempty"`
 }
 
 func newActiveCmd() *cobra.Command {
@@ -79,7 +83,7 @@ func newActiveCmd() *cobra.Command {
 				if s.Live {
 					live = "*"
 				}
-				fmt.Printf("  %s %-10s edit: %s\n", live, s.Name, s.Src)
+				fmt.Printf("  %s %-10s edit: %s%s\n", live, s.Name, s.Src, liveSidingNote(s.Live, res.FrontDoorReleased))
 				if s.Dashboard != "" {
 					fmt.Printf("              dashboard: %s\n", s.Dashboard)
 				}
@@ -141,6 +145,7 @@ func activeResultForDir(ctx context.Context, cwd string) (activeResult, error) {
 	res.Active = registered
 	res.ConfigDir = app.ConfigDir
 	res.RepoPath = app.RepoPath
+	res.FrontDoorReleased = app.FrontDoorReleased
 	for name, s := range app.Sidings {
 		src, _, err := siding.Paths(app, name)
 		if err != nil {
@@ -189,6 +194,16 @@ func activeResultForDir(ctx context.Context, cwd string) (activeResult, error) {
 		})
 	}
 	return res, nil
+}
+
+// liveSidingNote is the trailing text on a live siding's plain-output line. The
+// `*` marker normally means "the front-door traffic target"; once the front
+// door is released that is no longer true, so the note has to say so.
+func liveSidingNote(live, frontDoorReleased bool) string {
+	if live && frontDoorReleased {
+		return "  (front door released)"
+	}
+	return ""
 }
 
 // waitingOnRoutes renders the non-optional routes that aren't listening yet, as

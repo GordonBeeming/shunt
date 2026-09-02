@@ -1036,17 +1036,22 @@ func extraRoutes(app state.App, sd state.Siding) []state.Route {
 	return extra
 }
 
-// ensureSidingRoutes creates Caddy front-door servers for any route this siding
-// adds beyond the app-level set, so PointCaddy has a server to aim at. It touches
-// ONLY the extra routes — the shared app-level servers (from `app add`) are left
-// as-is, so a re-up/switch never resets the routes another live siding depends on.
-func ensureSidingRoutes(ctx context.Context, admin *caddy.Admin, app state.App, sd state.Siding) error {
-	for _, r := range extraRoutes(app, sd) {
-		// Skip a route whose server already exists — EnsureFrontDoor does delete-then-put,
-		// which would reset a live route's upstream dial to the placeholder (a brief drop,
-		// and it clobbers PointCaddy's rollback capture). Only CREATE the missing ones.
-		if _, err := admin.GetID(ctx, r.CaddyID); err == nil {
+// createMissingRoutes creates a Caddy server for each route that does not have one
+// yet, and leaves an existing server alone. EnsureFrontDoor is delete-then-put, so
+// re-creating a live route would reset its upstream to the placeholder: a brief
+// outage, and it clobbers PointCaddy's rollback capture.
+func createMissingRoutes(ctx context.Context, admin *caddy.Admin, app state.App, routes []state.Route) error {
+	for _, r := range routes {
+		_, err := admin.GetID(ctx, r.CaddyID)
+		if err == nil {
 			continue
+		}
+		// Only a genuine 404 proves the server is absent. Treating a timeout or a
+		// 500 as "missing" would send a live route through EnsureFrontDoor's
+		// delete-then-put and cause exactly the outage and upstream clobber this
+		// guard exists to prevent, on the transient failure where it hurts most.
+		if !caddy.IsNotFound(err) {
+			return fmt.Errorf("look up front-door route %q: %w", r.Key, err)
 		}
 		ea := app
 		ea.FrontDoor = []state.Route{r}
@@ -1055,6 +1060,14 @@ func ensureSidingRoutes(ctx context.Context, admin *caddy.Admin, app state.App, 
 		}
 	}
 	return nil
+}
+
+// ensureSidingRoutes creates Caddy front-door servers for any route this siding
+// adds beyond the app-level set, so PointCaddy has a server to aim at. It touches
+// ONLY the extra routes — the shared app-level servers (from `app add`) are left
+// as-is, so a re-up/switch never resets the routes another live siding depends on.
+func ensureSidingRoutes(ctx context.Context, admin *caddy.Admin, app state.App, sd state.Siding) error {
+	return createMissingRoutes(ctx, admin, app, extraRoutes(app, sd))
 }
 
 // routesToRemove returns front-door routes currently bound for the outgoing target
@@ -1540,6 +1553,13 @@ func switchLocked(ctx context.Context, app *state.App, target string) error {
 		return fmt.Errorf("switch to %q: %w", target, ferr)
 	}
 	sd.FrontDoor = fd
+	// `app switch --release` deletes every app-level server; recreate any that's
+	// missing before the teardown/ensure block below, so RemoveFrontDoor and
+	// PointCaddy always have a complete front door to act on rather than failing
+	// on a route whose @id no longer exists.
+	if err := createMissingRoutes(ctx, admin, *app, app.FrontDoor); err != nil {
+		return fmt.Errorf("recreate released front-door routes: %w", err)
+	}
 	{
 		// Already on a siding: the shared app-level servers are up. First tear down any
 		// server the target no longer wants — the previously-live siding's extra routes,
@@ -1569,6 +1589,7 @@ func switchLocked(ctx context.Context, app *state.App, target string) error {
 	}
 	app.LiveSiding = target
 	app.Sidings[target] = sd
+	app.FrontDoorReleased = false
 	return state.SaveApp(*app)
 }
 
