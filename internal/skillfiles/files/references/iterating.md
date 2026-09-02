@@ -82,7 +82,7 @@ Ending the stuck command releases the lock, and everything queued behind it proc
 
 If that is not enough, `{{shunt-command}} restart <siding>` reaps the app's own processes while leaving the guest, its Docker daemon, dependency containers, and data untouched. It is the cheap fix, and it comes before anything heavier.
 
-Recreating or killing the guest is the last resort. It works, but it costs you the running stack: data, dependency containers, all of it.
+Recreating or killing the guest is the last resort, and it costs less than it sounds. The worktree, the data volumes and the output directory all survive: volumes are host bind mounts, so `kill` and `park` retain them and the next `up` picks them straight back up. What you lose is runtime state — the running app, the dependency containers and anything held only in the guest's memory — so the stack has to boot again, which is the real cost.
 
 ## A guest resolves DNS through the host
 
