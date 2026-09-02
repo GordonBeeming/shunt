@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -271,4 +272,78 @@ func containsAll(value string, values ...string) bool {
 		}
 	}
 	return true
+}
+
+func TestSidingReclaimableNeverOffersLiveBaseOrARunningGuest(t *testing.T) {
+	app := state.App{
+		Name:       "Alpha",
+		LiveSiding: "live",
+		BaseSiding: "base",
+		Sidings: map[string]state.Siding{
+			"live": {Name: "live"}, "base": {Name: "base"}, "busy": {Name: "busy"},
+		},
+	}
+	// Each of these is excluded before any Git work happens, so the analyzer is
+	// never reached and the answer cannot depend on the worktree's state.
+	for _, c := range []struct {
+		name  string
+		guest container.GuestObservationState
+	}{
+		{"live", container.GuestAbsent},  // the front-door target: switch away first
+		{"base", container.GuestAbsent},  // removing the base needs a successor
+		{"busy", container.GuestRunning}, // a run inside leaves no trace in Git
+	} {
+		got := sidingReclaimable(context.Background(), app, c.name, container.GuestObservation{State: c.guest})
+		if got == nil || *got {
+			t.Errorf("sidingReclaimable(%q, guest=%s) = %v, want a definite false", c.name, c.guest, got)
+		}
+	}
+}
+
+func TestReclaimableFooterIsSilentUnlessAsked(t *testing.T) {
+	yes := true
+	apps := []lsApp{{Name: "Alpha", Sidings: []lsSiding{{Name: "one", Reclaimable: &yes}}}}
+
+	var quiet strings.Builder
+	printReclaimableFooter(&quiet, false, apps)
+	if quiet.String() != "" {
+		t.Errorf("footer printed without --reclaimable: %q", quiet.String())
+	}
+
+	var asked strings.Builder
+	printReclaimableFooter(&asked, true, apps)
+	if !strings.Contains(asked.String(), "Alpha/one") {
+		t.Errorf("footer did not name the reclaimable siding:\n%s", asked.String())
+	}
+}
+
+func TestReclaimableFooterSeparatesHeldFromUnchecked(t *testing.T) {
+	no := false
+
+	// Every siding was checked and none is free: a definite answer is safe.
+	var definite strings.Builder
+	printReclaimableFooter(&definite, true, []lsApp{{Name: "Alpha", Sidings: []lsSiding{
+		{Name: "held", Reclaimable: &no},
+	}}})
+	if !strings.Contains(definite.String(), "no siding is reclaimable") {
+		t.Errorf("expected the definite nothing-free line, got:\n%s", definite.String())
+	}
+
+	// One check failed, so the same claim would overstate what is known. An
+	// unchecked siding is named on its own line rather than folded into either
+	// answer, because calling it held is a guess and calling it free is worse.
+	var partial strings.Builder
+	printReclaimableFooter(&partial, true, []lsApp{{Name: "Alpha", Sidings: []lsSiding{
+		{Name: "held", Reclaimable: &no}, {Name: "unchecked"},
+	}}})
+	out := partial.String()
+	if !strings.Contains(out, "could not be checked") {
+		t.Errorf("expected the hedged line when a check failed, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Alpha/unchecked") {
+		t.Errorf("expected the unchecked siding to be named, got:\n%s", out)
+	}
+	if strings.Contains(out, "no siding is reclaimable") {
+		t.Errorf("stated a definite answer despite a failed check:\n%s", out)
+	}
 }
