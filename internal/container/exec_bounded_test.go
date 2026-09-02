@@ -105,3 +105,27 @@ func TestSidingNameHintDerivesShortNameFromPrefixedGuest(t *testing.T) {
 		t.Fatalf("sidingNameHint() fallback = %q", got)
 	}
 }
+
+func TestExecCommandTargetsGuestMatchesOnlyTheTargetPosition(t *testing.T) {
+	const guest = "shuntdev_Alpha_one"
+	cases := []struct {
+		name    string
+		command string
+		want    bool
+	}{
+		{"plain exec", "container exec " + guest + " sh -c true", true},
+		{"interactive exec", "container exec -i " + guest + " sh -c true", true},
+		{"absolute binary path", "/usr/local/bin/container exec -i " + guest + " sh", true},
+		// The regression: the guest name appears, but as an argument to a command
+		// running inside a different guest. Blaming it would point the user at an
+		// unrelated process and tell them to end it.
+		{"named as an argument to another guest's command", "container exec other printf " + guest, false},
+		{"different guest entirely", "container exec shuntdev_Alpha_two sh", false},
+		{"not an exec at all", "container run " + guest, false},
+	}
+	for _, c := range cases {
+		if got := execCommandTargetsGuest(c.command, guest); got != c.want {
+			t.Errorf("%s: execCommandTargetsGuest(%q) = %v, want %v", c.name, c.command, got, c.want)
+		}
+	}
+}

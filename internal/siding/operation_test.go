@@ -204,8 +204,14 @@ func TestLockHolderRecordRoundTrips(t *testing.T) {
 	if record.PID != os.Getpid() {
 		t.Fatalf("record.PID = %d, want %d", record.PID, os.Getpid())
 	}
-	if record.Command != strings.Join(os.Args, " ") {
-		t.Fatalf("record.Command = %q, want the process's own command line", record.Command)
+	// The record names the holder without echoing what it was given: every
+	// contending caller reads this file, and `run` forwards arbitrary arguments
+	// into the guest.
+	if want := holderCommand(os.Args); record.Command != want {
+		t.Fatalf("record.Command = %q, want %q", record.Command, want)
+	}
+	if strings.Contains(record.Command, "-") && len(os.Args) > 1 {
+		t.Errorf("record.Command = %q, want no flags or their values", record.Command)
 	}
 	if record.AcquiredAt.IsZero() || time.Since(record.AcquiredAt) > time.Minute {
 		t.Fatalf("record.AcquiredAt = %v, want roughly now", record.AcquiredAt)

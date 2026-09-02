@@ -169,10 +169,31 @@ type lockHolderRecord struct {
 // writeLockHolderRecord annotates lock (already flocked exclusively by this
 // process) with who's holding it. A lock that can't be annotated must still
 // work, so every failure here is swallowed rather than surfaced.
+// holderCommand names the holder well enough to identify it, without echoing
+// what it was given. The record is written to a file every contending caller
+// reads, so a full argv would publish anything a command was invoked with —
+// `run` in particular forwards arbitrary arguments into the guest, which is
+// exactly where a secret would appear. The binary and its subcommand answer
+// "who is holding this"; the rest cannot, and is not worth the exposure.
+func holderCommand(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	name := filepath.Base(args[0])
+	for _, a := range args[1:] {
+		// The first bare word after the binary is the subcommand. Anything
+		// following it is an argument or a flag value, and is dropped.
+		if !strings.HasPrefix(a, "-") {
+			return name + " " + a
+		}
+	}
+	return name
+}
+
 func writeLockHolderRecord(lock *os.File) {
 	data, err := json.Marshal(lockHolderRecord{
 		PID:        os.Getpid(),
-		Command:    strings.Join(os.Args, " "),
+		Command:    holderCommand(os.Args),
 		AcquiredAt: time.Now(),
 	})
 	if err != nil {

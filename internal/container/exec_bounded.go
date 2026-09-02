@@ -50,8 +50,10 @@ type HostProcess struct {
 // stall path can be tested without shelling out to the real `ps`.
 var attachedExecProbe = discoverAttachedExecs
 
-// ExecBounded runs a short guest command under its own deadline, independent of
-// the caller's context, and reports a stall as ExecStalledError. Only a
+// ExecBounded runs a short guest command under a deadline of its own, added to
+// whatever the caller's context already carries rather than replacing it: the
+// caller can still cancel earlier, but a caller with no deadline can no longer
+// wait forever. It reports a stall as ExecStalledError. Only a
 // genuinely short, idempotent probe belongs here — Exec stays unbounded for
 // slow, legitimate work such as image loads and the app start/stop scripts.
 func ExecBounded(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error) {
@@ -118,19 +120,29 @@ func parseAttachedExecs(psOutput, guest string) []HostProcess {
 }
 
 // execCommandTargetsGuest reports whether command is a `container exec …` line
-// naming guest — matched on exact tokens so a guest name that's a substring of
-// another guest's (or of an unrelated argument) can't produce a false match.
+// whose target is guest. The guest is matched only in the target position, not
+// anywhere on the line: `container exec other printf my-guest` names "other",
+// and treating it as a match would blame an unrelated process for a stall and
+// advise ending it.
+//
+// shunt only ever emits `exec <name>` or `exec -i <name>` (see ops.go), so the
+// first non-flag token after the subcommand is the target.
 func execCommandTargetsGuest(command, guest string) bool {
-	sawBinary, sawExec, sawGuest := false, false, false
-	for _, field := range strings.Fields(command) {
-		switch {
-		case filepath.Base(field) == Bin:
-			sawBinary = true
-		case field == "exec":
-			sawExec = true
-		case field == guest:
-			sawGuest = true
+	fields := strings.Fields(command)
+	for i, field := range fields {
+		if filepath.Base(field) != Bin {
+			continue
+		}
+		rest := fields[i+1:]
+		if len(rest) == 0 || rest[0] != "exec" {
+			continue
+		}
+		for _, arg := range rest[1:] {
+			if strings.HasPrefix(arg, "-") {
+				continue
+			}
+			return arg == guest // the target position, and nothing after it
 		}
 	}
-	return sawBinary && sawExec && sawGuest
+	return false
 }

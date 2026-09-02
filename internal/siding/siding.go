@@ -70,9 +70,10 @@ var (
 	startLifecycleApp    = StartApp
 	waitLifecycleReady   = WaitReady
 	// probeExec is the readiness probe seam, so the port rules can be tested
-	// without a guest. Its default bounds every probe on routeProbeTimeout,
-	// independent of the caller's context, so a wedged guest fails the readiness
-	// probe diagnosably instead of hanging every caller that waits on it.
+	// without a guest. Its default adds routeProbeTimeout on top of whatever the
+	// caller's context carries, so a wedged guest fails the readiness probe
+	// diagnosably instead of hanging a caller that set no deadline of its own. A
+	// caller that cancels sooner still wins.
 	probeExec = func(ctx context.Context, name string, args ...string) (string, error) {
 		return container.ExecBounded(ctx, routeProbeTimeout, name, args...)
 	}
@@ -551,7 +552,11 @@ func probeGuestCapability(ctx context.Context, guest string) (bool, error) {
 	const mismatch = "shunt-capability:mismatch"
 	wrapped := "if " + args[2] + "; then printf '" + match + "'; else printf '" + mismatch + "'; fi"
 	probeArgs := append([]string{"sh", "-c", wrapped}, args[3:]...)
-	out, err := execGuest(ctx, guest, probeArgs...)
+	// Bounded like the liveness check that runs immediately before it. A guest
+	// can answer `true` and then wedge on the next command, and an unbounded
+	// probe there would hang the caller on the exact failure this whole path
+	// exists to detect.
+	out, err := execGuestBounded(ctx, livenessProbeTimeout, guest, probeArgs...)
 	if err != nil {
 		return false, err
 	}

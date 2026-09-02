@@ -193,10 +193,19 @@ func TestCapabilityPredicateMismatchDiffersFromTransportFailure(t *testing.T) {
 	guestCapabilityProbe = probeGuestCapability
 	// The liveness check always succeeds in both cases below; probeGuestCapability
 	// makes its own separate exec (via execGuest) for the predicate itself.
-	execGuestBounded = func(context.Context, time.Duration, string, ...string) (string, error) { return "", nil }
+	// Liveness and the capability predicate now share one bounded seam, so the
+	// stub answers on which command it was handed: a bare `true` is the liveness
+	// probe, anything else is the predicate.
+	var predicate func() (string, error)
+	execGuestBounded = func(_ context.Context, _ time.Duration, _ string, args ...string) (string, error) {
+		if len(args) == 1 && args[0] == "true" {
+			return "", nil
+		}
+		return predicate()
+	}
 
 	t.Run("predicate-mismatch-authorizes-recreation", func(t *testing.T) {
-		execGuest = func(context.Context, string, ...string) (string, error) {
+		predicate = func() (string, error) {
 			return "shunt-capability:mismatch", nil
 		}
 		err := EnsureGuestLive(context.Background(), state.Siding{Name: "alpha", Container: "guest"})
@@ -207,7 +216,7 @@ func TestCapabilityPredicateMismatchDiffersFromTransportFailure(t *testing.T) {
 	})
 
 	t.Run("xpc-transport-fails-closed", func(t *testing.T) {
-		execGuest = func(context.Context, string, ...string) (string, error) {
+		predicate = func() (string, error) {
 			return "", errors.New("XPC connection invalid")
 		}
 		err := EnsureGuestLive(context.Background(), state.Siding{Name: "alpha", Container: "guest"})
