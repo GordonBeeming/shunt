@@ -30,6 +30,13 @@ func newBaseCmd() *cobra.Command {
 					fmt.Println("no source base is configured")
 					return nil
 				}
+				// Detached: the seed is the commit itself, so no siding is held
+				// open to carry it. Say which case this is, because "no siding is
+				// base" reads as broken otherwise.
+				if len(app.Sidings) > 0 {
+					fmt.Printf("source base: detached at %s (no siding is the base)\n", app.BaseCommit)
+					return nil
+				}
 				fmt.Printf("source base: saved commit %s (no sidings remain)\n", app.BaseCommit)
 				return nil
 			}

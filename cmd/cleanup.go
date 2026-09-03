@@ -129,7 +129,7 @@ func newCleanupCmd() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVarP(&force, "force", "f", false, "skip live-siding and uncommitted-change safety checks")
-	c.Flags().StringVar(&nextBase, "next-base", "", "successor source base when the current base is selected")
+	c.Flags().StringVar(&nextBase, "next-base", "", "successor source base when the current base is selected, or `-` to keep the commit and leave no siding as base")
 	return c
 }
 

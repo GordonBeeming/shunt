@@ -366,3 +366,29 @@ func TestRegistryFindProjectCaseInsensitive(t *testing.T) {
 		}
 	}
 }
+
+func TestNeedsBaseSelectionSeparatesLegacyStateFromADetachedBase(t *testing.T) {
+	two := map[string]Siding{"one": {Name: "one"}, "two": {Name: "two"}}
+	cases := []struct {
+		name string
+		app  App
+		want bool
+	}{
+		// The migration case this exists for: several sidings, and nothing on
+		// record saying which one was the base. Only a person can answer that.
+		{"legacy multi-siding with no commit", App{Sidings: two}, true},
+		// The detached base. Pinning the commit is what detaching does, so a
+		// commit with no base siding is a deliberate state, not an unmigrated one.
+		{"detached with a pinned commit", App{Sidings: two, BaseCommit: "abc123"}, false},
+		// One siding and no base was already unambiguous.
+		{"single siding with no commit", App{Sidings: map[string]Siding{"one": {Name: "one"}}}, false},
+		// A base naming a siding that is gone is corrupt either way.
+		{"base names a missing siding", App{Sidings: two, BaseSiding: "gone", BaseCommit: "abc123"}, true},
+		{"no sidings at all", App{BaseCommit: "abc123"}, false},
+	}
+	for _, c := range cases {
+		if got := NeedsBaseSelection(c.app); got != c.want {
+			t.Errorf("%s: NeedsBaseSelection() = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
