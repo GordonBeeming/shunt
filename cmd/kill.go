@@ -1411,6 +1411,12 @@ func validateFinalVolumeSet(sd state.Siding, volRoot string, volumes []string) (
 // siding. It is a reserved --next-base value so a script can choose it without
 // a terminal, and "-" cannot collide with a siding name because ValidateName
 // rejects it.
+// baseRemovalIsInteractive is a seam so a test can pin which path it exercises.
+// Reading os.Stdin directly made the choice depend on how `go test` was invoked,
+// which is exactly the kind of environment dependence that turns into a flake
+// nobody can reproduce.
+var baseRemovalIsInteractive = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
+
 const detachedBaseChoice = "-"
 
 func prepareBaseRemoval(app state.App, removing []string, requested string, in *bufio.Reader) (string, error) {
@@ -1427,7 +1433,7 @@ func prepareBaseRemoval(app state.App, removing []string, requested string, in *
 	}
 	choice := requested
 	if choice == "" {
-		if !term.IsTerminal(int(os.Stdin.Fd())) {
+		if !baseRemovalIsInteractive() {
 			return "", fmt.Errorf("removing base %q requires --next-base <siding>, or --next-base %s to keep the commit and leave no siding as base", app.BaseSiding, detachedBaseChoice)
 		}
 		fmt.Println("Choose the successor source base:")
