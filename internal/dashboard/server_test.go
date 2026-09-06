@@ -73,7 +73,7 @@ func TestStateIsHostlessAndSeparatesPhaseFromRuntime(t *testing.T) {
 		}
 		rows[row.Name] = row
 	}
-	if !rows["work"].Base || rows["work"].Phase != string(state.PhaseWorktree) || rows["work"].Runtime != "missing" {
+	if rows["work"].Phase != string(state.PhaseWorktree) || rows["work"].Runtime != "missing" {
 		t.Fatalf("worktree row = %+v", rows["work"])
 	}
 	if rows["parked"].Phase != string(state.PhaseParked) || rows["parked"].Runtime != "missing" {
@@ -352,7 +352,6 @@ func TestDashboardHTMLShowsHostlessLifecycleControls(t *testing.T) {
 	html := response.Body.String()
 	for _, want := range []string{
 		`rel="icon" href="data:image/svg+xml,`,
-		"badge base",
 		"persisted siding phase",
 		"runtime-unavailable",
 		"onclick=\"doPark",

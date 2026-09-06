@@ -68,7 +68,7 @@ func TestFinalRemovalRetriesAfterEveryJournalCheckpoint(t *testing.T) {
 				t.Fatalf("operation %q remains protected at terminal stage: %v", persisted.Removal.ID, operationsMap)
 			}
 
-			if err := removeSiding(context.Background(), &persisted, "one", true, ""); err != nil {
+			if err := removeSiding(context.Background(), &persisted, "one", true); err != nil {
 				t.Fatalf("retry after %s: %v", stage, err)
 			}
 			completed, err := state.LoadApp(fixture.app.ConfigDir)
@@ -333,7 +333,7 @@ func TestSuccessfulForceRemovalClearsWithoutArchiveParent(t *testing.T) {
 	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
 	before := removalOptionalRef(t, fixture.control, "refs/shunt/witness/archive")
 	app := fixture.app
-	if err := removeSiding(context.Background(), &app, "one", true, ""); err != nil {
+	if err := removeSiding(context.Background(), &app, "one", true); err != nil {
 		t.Fatal(err)
 	}
 	if app.Removal != nil {
@@ -448,7 +448,7 @@ func TestMissingWorktreeSnapshotReachesExplicitConfirmation(t *testing.T) {
 		t.Fatalf("protection = %t, %q, %v", protected, reason, err)
 	}
 	safety.ExplicitDiscard = true
-	if err := prepareRemovalStage(context.Background(), &fixture.app, "one", "", false, false, &safety, removalTestOperations()); err != nil {
+	if err := prepareRemovalStage(context.Background(), &fixture.app, "one", false, false, &safety, removalTestOperations()); err != nil {
 		t.Fatalf("confirmed missing removal did not journal: %v", err)
 	}
 }
@@ -500,43 +500,6 @@ func TestRemovalRechecksGuestAfterCheckpointPublicationFails(t *testing.T) {
 	}
 	if removeCalls != 1 {
 		t.Fatalf("guest remove calls after exact absence recheck = %d, want one", removeCalls)
-	}
-}
-
-func TestRemovalDoesNotResolveDeletedWorktreeWhenCheckpointPublicationFails(t *testing.T) {
-	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
-	operations := removalTestOperations()
-	resolveCalls := 0
-	originalResolve := operations.resolveCommit
-	operations.resolveCommit = func(ctx context.Context, source string) (string, error) {
-		resolveCalls++
-		return originalResolve(ctx, source)
-	}
-	failure := errors.New("injected worktree checkpoint publication failure")
-	restore := failRemovalPublicationBeforeUpdate(t, &operations, state.RemovalGuestRemoved, failure)
-	app := fixture.app
-	if err := runRemovalWithOperations(context.Background(), &app, "one", "", operations); !errors.Is(err, failure) {
-		t.Fatalf("remove = %v, want publication failure", err)
-	}
-	restore()
-	if resolveCalls != 1 {
-		t.Fatalf("source resolutions before retry = %d, want one", resolveCalls)
-	}
-	if _, err := os.Lstat(filepath.Join(app.ConfigDir, "one", "src")); !os.IsNotExist(err) {
-		t.Fatalf("worktree remains after remove: %v", err)
-	}
-	persisted, err := state.LoadApp(app.ConfigDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if persisted.Removal == nil || persisted.Removal.Stage != state.RemovalGuestRemoved {
-		t.Fatalf("persisted removal = %#v, want guest-removed", persisted.Removal)
-	}
-	if err := runRemovalWithOperations(context.Background(), &persisted, "one", "", operations); err != nil {
-		t.Fatalf("retry removal: %v", err)
-	}
-	if resolveCalls != 1 {
-		t.Fatalf("retry resolved the deleted worktree %d times", resolveCalls-1)
 	}
 }
 
@@ -608,7 +571,7 @@ func TestRemovalStopsAfterCommittedDurabilityCheckpoint(t *testing.T) {
 	if persisted.Removal == nil || persisted.Removal.Stage != state.RemovalWorktreeRemoved {
 		t.Fatalf("persisted removal = %#v", persisted.Removal)
 	}
-	if err := removeSiding(context.Background(), &persisted, "one", true, ""); err != nil {
+	if err := removeSiding(context.Background(), &persisted, "one", true); err != nil {
 		t.Fatalf("explicit recovery after committed checkpoint: %v", err)
 	}
 }
@@ -630,7 +593,7 @@ func TestFinalWorktreeOnlyRemovalPreservesExistingBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	app := fixture.app
-	if err := removeSiding(context.Background(), &app, "one", true, ""); err != nil {
+	if err := removeSiding(context.Background(), &app, "one", true); err != nil {
 		t.Fatal(err)
 	}
 	after, err := os.ReadFile(fixture.baselineState)
@@ -664,7 +627,7 @@ func TestForcedStopThenFinalRemovePromotesRawHostVolumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := removeSiding(context.Background(), &persisted, "one", true, ""); err != nil {
+	if err := removeSiding(context.Background(), &persisted, "one", true); err != nil {
 		t.Fatal(err)
 	}
 	if got := removalGenerationCount(t, filepath.Dir(fixture.baselineState)); got != 1 {
@@ -718,7 +681,7 @@ func TestFinalRemovalRejectsPartialDataBeforeDeletingResources(t *testing.T) {
 	fixture := newRemovalFixture(t, state.PhaseData, []string{"db", "cache"}, false)
 	writeRemovalVolume(t, filepath.Join(fixture.app.ConfigDir, "one", "vol"), "db", "partial")
 	app := fixture.app
-	err := removeSiding(context.Background(), &app, "one", true, "")
+	err := removeSiding(context.Background(), &app, "one", true)
 	if err == nil || !strings.Contains(err.Error(), "volume \"cache\" is incomplete") {
 		t.Fatalf("remove partial data = %v", err)
 	}
@@ -731,45 +694,6 @@ func TestFinalRemovalRejectsPartialDataBeforeDeletingResources(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(app.ConfigDir, "one", "src")); err != nil {
 		t.Fatalf("worktree was removed after partial-data rejection: %v", err)
-	}
-}
-
-func TestSuccessorPinAndRemovalJournalPublishTogether(t *testing.T) {
-	fixture := newRemovalFixture(t, state.PhaseWorktree, nil, false)
-	addRemovalSiding(t, &fixture.app, "two", state.PhaseWorktree, false)
-	if err := state.SaveApp(fixture.app); err != nil {
-		t.Fatal(err)
-	}
-	crashed := errors.New("stop after preparation")
-	operations := removalTestOperations()
-	operations.afterCheckpoint = func(stage state.RemovalStage) error {
-		if stage == state.RemovalBasePinned {
-			return crashed
-		}
-		return nil
-	}
-	app := fixture.app
-	err := runRemovalWithOperations(context.Background(), &app, "one", "two", operations)
-	if !errors.Is(err, crashed) {
-		t.Fatalf("prepare base removal = %v", err)
-	}
-	persisted, err := state.LoadApp(app.ConfigDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if persisted.BaseSiding != "two" || persisted.BaseCommit == "" || persisted.Removal == nil || persisted.Removal.Stage != state.RemovalBasePinned {
-		t.Fatalf("prepared state = %#v", persisted)
-	}
-	assertRemovalSourceCommit(t, fixture.control, persisted.BaseCommit)
-	if err := removeSiding(context.Background(), &persisted, "one", true, ""); err != nil {
-		t.Fatal(err)
-	}
-	completed, err := state.LoadApp(app.ConfigDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if completed.BaseSiding != "two" || len(completed.Sidings) != 1 {
-		t.Fatalf("completed successor state = %#v", completed)
 	}
 }
 
@@ -795,7 +719,7 @@ func TestConcurrentRemovalIsSerializedByProjectJournal(t *testing.T) {
 	secondApp := fixture.app
 	second := make(chan error, 1)
 	go func() {
-		second <- removeSiding(context.Background(), &secondApp, "one", true, "")
+		second <- removeSiding(context.Background(), &secondApp, "one", true)
 	}()
 	select {
 	case err := <-second:
@@ -830,7 +754,7 @@ func TestRemoveRevalidatesGitIdentityAfterWaitingForLifecycleLock(t *testing.T) 
 	<-entered
 	result := make(chan error, 1)
 	app := fixture.app
-	go func() { result <- removeSiding(context.Background(), &app, "one", false, "", &expected) }()
+	go func() { result <- removeSiding(context.Background(), &app, "one", false, &expected) }()
 	select {
 	case err := <-result:
 		t.Fatalf("remove escaped lifecycle lock: %v", err)
@@ -875,7 +799,7 @@ func TestCleanupRevalidatesSelectedSidingAfterWaitingForLifecycleLock(t *testing
 	<-entered
 	result := make(chan error, 1)
 	app := fixture.app
-	go func() { result <- removeSiding(context.Background(), &app, "two", false, "", &expected) }()
+	go func() { result <- removeSiding(context.Background(), &app, "two", false, &expected) }()
 	select {
 	case err := <-result:
 		t.Fatalf("cleanup removal escaped lifecycle lock: %v", err)
@@ -915,11 +839,11 @@ func TestCleanupFingerprintsRemainStableAcrossEarlierPlannedRemoval(t *testing.T
 
 	app := fixture.app
 	twoSafety := safety["two"]
-	if err := removeSiding(context.Background(), &app, "two", false, "", &twoSafety); err != nil {
+	if err := removeSiding(context.Background(), &app, "two", false, &twoSafety); err != nil {
 		t.Fatalf("remove first selected siding: %v", err)
 	}
 	oneSafety := safety["one"]
-	if err := removeSiding(context.Background(), &app, "one", false, "", &oneSafety); err != nil {
+	if err := removeSiding(context.Background(), &app, "one", false, &oneSafety); err != nil {
 		t.Fatalf("remove final selected siding after planned ref disappeared: %v", err)
 	}
 	if app.Removal != nil || len(app.Sidings) != 0 {
@@ -943,14 +867,14 @@ func TestCleanupFingerprintStillRejectsExternalChangeAfterEarlierRemoval(t *test
 		t.Fatal(err)
 	}
 	app := fixture.app
-	if err := removeSiding(context.Background(), &app, "two", false, "", &twoSafety); err != nil {
+	if err := removeSiding(context.Background(), &app, "two", false, &twoSafety); err != nil {
 		t.Fatal(err)
 	}
 	sourceRoot := filepath.Join(app.ConfigDir, "one", "src")
 	if err := os.WriteFile(filepath.Join(sourceRoot, "tracked.txt"), []byte("external change\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err = removeSiding(context.Background(), &app, "one", false, "", &oneSafety)
+	err = removeSiding(context.Background(), &app, "one", false, &oneSafety)
 	if err == nil || !strings.Contains(err.Error(), "changed while waiting") {
 		t.Fatalf("remove after external change = %v", err)
 	}
@@ -1373,10 +1297,10 @@ func TestNonForceRemovalResumeRevalidatesJournaledSafetyAndForceCanUpgrade(t *te
 	if persisted.Removal == nil || persisted.Removal.Force || persisted.Removal.Safety != safety.Fingerprint {
 		t.Fatalf("journaled policy = %#v", persisted.Removal)
 	}
-	if err := removeSiding(context.Background(), &persisted, "one", false, ""); err == nil || !strings.Contains(err.Error(), "changed after removal began") {
+	if err := removeSiding(context.Background(), &persisted, "one", false); err == nil || !strings.Contains(err.Error(), "changed after removal began") {
 		t.Fatalf("plain resume after edit = %v", err)
 	}
-	if err := removeSiding(context.Background(), &persisted, "one", true, ""); err != nil {
+	if err := removeSiding(context.Background(), &persisted, "one", true); err != nil {
 		t.Fatalf("explicit force upgrade = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(app.ConfigDir, "one", "src")); !os.IsNotExist(err) {
@@ -1423,7 +1347,7 @@ func TestForceUpgradeRetiresRegisteredRecoveryAfterByteDeletionFailure(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := removeSiding(context.Background(), &persisted, "one", true, ""); err != nil {
+	if err := removeSiding(context.Background(), &persisted, "one", true); err != nil {
 		t.Fatalf("force resume from registered recovery = %v", err)
 	}
 	if _, err := os.Lstat(recovery.RecoveryPath); !os.IsNotExist(err) {
@@ -1528,7 +1452,7 @@ func runRemovalWithPolicy(ctx context.Context, app *state.App, name, successor s
 			return err
 		}
 		*app = current
-		return removeSidingLocked(ctx, app, name, successor, force, false, safety, operations)
+		return removeSidingLocked(ctx, app, name, force, false, safety, operations)
 	})
 }
 

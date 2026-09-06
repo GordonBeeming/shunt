@@ -183,7 +183,6 @@ func newAppAddCmd() *cobra.Command {
 				}
 				if updating {
 					app.Sidings = existing.Sidings
-					app.BaseSiding = existing.BaseSiding
 					if existing.BaseCommit != "" {
 						app.BaseCommit = existing.BaseCommit
 					}

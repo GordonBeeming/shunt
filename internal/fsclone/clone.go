@@ -305,7 +305,17 @@ func implicitWorktreeBase(ctx context.Context, repoPath string) (string, error) 
 	if !strings.HasPrefix(strings.TrimSpace(head.Stdout), "refs/heads/gitbutler/") {
 		return "HEAD", nil
 	}
+	return RemoteDefaultBranch(ctx, repoPath)
+}
 
+// RemoteDefaultBranch resolves the branch a new siding starts from: origin/HEAD
+// when the remote publishes one, else origin/main when it verifies.
+//
+// It deliberately never falls back to the local HEAD. Whatever the checkout
+// happens to be sitting on is not a base anybody chose, and seeding from it
+// silently is worse than refusing — the siding would carry work nobody asked
+// for and nothing would say so.
+func RemoteDefaultBranch(ctx context.Context, repoPath string) (string, error) {
 	remoteHead, err := proc.Run(ctx, "git", "-C", repoPath,
 		"symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
 	if err == nil {
@@ -319,16 +329,20 @@ func implicitWorktreeBase(ctx context.Context, repoPath string) (string, error) 
 		return base, nil
 	}
 	if remoteHead.ExitCode != 1 {
-		return "", fmt.Errorf("resolve origin/HEAD for GitButler siding: %w", err)
+		return "", fmt.Errorf("resolve origin/HEAD: %w", err)
 	}
 
-	// Clones occasionally lack origin/HEAD. origin/main is a safe conventional
-	// fallback only when it actually exists; never fall back to volatile HEAD.
-	const fallback = "origin/main"
-	if err := verifyCommit(ctx, repoPath, fallback); err != nil {
-		return "", fmt.Errorf("GitButler workspace HEAD requires origin/HEAD (or %s); configure the remote default or pass --branch: %w", fallback, err)
+	// Clones occasionally lack origin/HEAD, and a project may have no remote at
+	// all. Try the conventional names in order, taking each only when it actually
+	// verifies. None of these is the local HEAD: whatever the checkout happens to
+	// be sitting on is not a base anybody chose, and seeding from it silently
+	// would give the siding work nobody asked for.
+	for _, candidate := range []string{"origin/main", "origin/master", "main", "master"} {
+		if err := verifyCommit(ctx, repoPath, candidate); err == nil {
+			return candidate, nil
+		}
 	}
-	return fallback, nil
+	return "", fmt.Errorf("cannot resolve a default branch: origin/HEAD is unset and none of origin/main, origin/master, main or master exists; set the remote default or pass --branch <ref>")
 }
 
 func verifyCommit(ctx context.Context, repoPath, ref string) error {

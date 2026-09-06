@@ -24,7 +24,6 @@ import (
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 func newKillCmd() *cobra.Command {
@@ -96,7 +95,6 @@ func newParkCmd() *cobra.Command {
 
 func newRmCmd() *cobra.Command {
 	var force bool
-	var nextBase string
 	var promoteData bool
 	c := &cobra.Command{
 		Use:   "rm [name]",
@@ -113,7 +111,7 @@ func newRmCmd() *cobra.Command {
 				if len(args) == 1 && args[0] != app.Removal.Siding {
 					return ensureNoRemovalInProgress(app, "remove siding "+args[0])
 				}
-				return commandRemoveSiding(ctx, &app, app.Removal.Siding, force, "")
+				return commandRemoveSiding(ctx, &app, app.Removal.Siding, force)
 			}
 			name, err := sidingArgWithReader(ctx, app, args, in)
 			if err != nil {
@@ -156,15 +154,10 @@ func newRmCmd() *cobra.Command {
 					safety.ExplicitDiscard = true
 				}
 			}
-			successor, err := prepareBaseRemoval(app, []string{name}, nextBase, in)
-			if err != nil {
-				return err
-			}
-			return removeSidingWithOptions(ctx, &app, name, force, successor, promoteData, safety)
+			return removeSidingWithOptions(ctx, &app, name, force, promoteData, safety)
 		},
 	}
 	c.Flags().BoolVarP(&force, "force", "f", false, "remove even if the siding is live or its worktree has uncommitted changes")
-	c.Flags().StringVar(&nextBase, "next-base", "", "successor source base when removing the current base, or `-` to keep the commit and leave no siding as base")
 	c.Flags().BoolVar(&promoteData, "promote-data", false, "promote this siding's data as the project baseline before removing it")
 	return c
 }
@@ -512,9 +505,6 @@ func writeFingerprintField(digest hash.Hash, values ...string) {
 type removalOperations struct {
 	now                func() time.Time
 	updateApp          func(context.Context, string, func(*state.App) error) (state.App, error)
-	resolveCommit      func(context.Context, string) (string, error)
-	ensureControl      func(context.Context, *state.App, string, string) error
-	pinBaseCommit      func(context.Context, string, string, string) (string, error)
 	promoteBaseline    func(context.Context, state.App, state.Siding, string, string) (databaseline.Result, error)
 	observeGuest       func(context.Context, string) container.GuestObservation
 	removeGuest        func(context.Context, string) error
@@ -531,11 +521,6 @@ func defaultRemovalOperations() removalOperations {
 	return removalOperations{
 		now:       time.Now,
 		updateApp: state.UpdateApp,
-		resolveCommit: func(ctx context.Context, source string) (string, error) {
-			return gitText(ctx, source, "rev-parse", "--verify", "HEAD^{commit}")
-		},
-		ensureControl: ensureControlRepository,
-		pinBaseCommit: fsclone.PinBaseCommit,
 		promoteBaseline: func(ctx context.Context, app state.App, sd state.Siding, operationID, sourceRoot string) (databaseline.Result, error) {
 			manager, err := databaseline.New(app.ConfigDir, app.Volumes)
 			if err != nil {
@@ -563,13 +548,13 @@ func defaultRemovalOperations() removalOperations {
 	}
 }
 
-func removeSiding(ctx context.Context, app *state.App, name string, force bool, successor string, expected ...*removalSafety) error {
-	return removeSidingWithOptions(ctx, app, name, force, successor, false, expected...)
+func removeSiding(ctx context.Context, app *state.App, name string, force bool, expected ...*removalSafety) error {
+	return removeSidingWithOptions(ctx, app, name, force, false, expected...)
 }
 
 // removeSidingWithOptions is removeSiding plus the flags that only some callers
 // set, kept separate so the common call stays short.
-func removeSidingWithOptions(ctx context.Context, app *state.App, name string, force bool, successor string, promoteData bool, expected ...*removalSafety) error {
+func removeSidingWithOptions(ctx context.Context, app *state.App, name string, force, promoteData bool, expected ...*removalSafety) error {
 	return siding.WithProjectSidingOperation(ctx, app.ConfigDir, name, func() error {
 		current, err := state.LoadApp(app.ConfigDir)
 		if err != nil {
@@ -677,7 +662,7 @@ func removeSidingWithOptions(ctx context.Context, app *state.App, name string, f
 			}
 			lockedSafety = &currentSafety
 		}
-		return removeSidingLocked(ctx, app, name, successor, force, promoteData, lockedSafety, defaultRemovalOperations())
+		return removeSidingLocked(ctx, app, name, force, promoteData, lockedSafety, defaultRemovalOperations())
 	})
 }
 
@@ -730,8 +715,8 @@ func upgradeRemovalPreservation(ctx context.Context, app state.App, safety remov
 	})
 }
 
-func removeSidingLocked(ctx context.Context, app *state.App, name, successor string, force, promoteData bool, safety *removalSafety, operations removalOperations) error {
-	if err := prepareRemovalStage(ctx, app, name, successor, force, promoteData, safety, operations); err != nil {
+func removeSidingLocked(ctx context.Context, app *state.App, name string, force, promoteData bool, safety *removalSafety, operations removalOperations) error {
+	if err := prepareRemovalStage(ctx, app, name, force, promoteData, safety, operations); err != nil {
 		return err
 	}
 	if err := ensureRemovalRecoveryRefs(ctx, app, operations); err != nil {
@@ -804,7 +789,7 @@ func ensureRemovalRecoveryRefs(ctx context.Context, app *state.App, operations r
 	return nil
 }
 
-func prepareRemovalStage(ctx context.Context, app *state.App, name, successor string, force, promoteData bool, safety *removalSafety, operations removalOperations) error {
+func prepareRemovalStage(ctx context.Context, app *state.App, name string, force, promoteData bool, safety *removalSafety, operations removalOperations) error {
 	if app == nil {
 		return errors.New("app is required")
 	}
@@ -829,66 +814,6 @@ func prepareRemovalStage(ctx context.Context, app *state.App, name, successor st
 		operationID = app.Removal.ID
 		startedAt = app.Removal.StartedAt
 	}
-	baseSiding := app.BaseSiding
-	baseCommit := app.BaseCommit
-	if baseSiding == name {
-		excluded := map[string]bool{name: true}
-		survivors := sortedSidingNames(*app, excluded)
-		sourceName := name
-		if len(survivors) > 0 {
-			switch {
-			case successor == "":
-				return fmt.Errorf("removing base %q requires a successor siding", name)
-			case successor == detachedBaseChoice:
-				// Detaching keeps this siding's commit as the seed and leaves no
-				// siding as base, so nothing has to stay alive merely to carry it.
-				// sourceName stays as the siding being removed: its HEAD is what
-				// gets pinned below, exactly as in the no-survivors case.
-				baseSiding = ""
-			case successor == name:
-				return fmt.Errorf("successor base %q is being removed", successor)
-			default:
-				if _, exists := app.Sidings[successor]; !exists {
-					return fmt.Errorf("no successor siding %q", successor)
-				}
-				sourceName = successor
-				baseSiding = successor
-			}
-		}
-		sourceSiding := app.Sidings[sourceName]
-		sourceRoot, _, err := siding.Paths(*app, sourceName)
-		if err != nil {
-			return err
-		}
-		if sourceName != name {
-			branch, err := gitText(ctx, sourceRoot, "symbolic-ref", "--quiet", "--short", "HEAD")
-			if err != nil || branch != sourceSiding.Branch {
-				return fmt.Errorf("successor base %q is not on its recorded branch %q", sourceName, sourceSiding.Branch)
-			}
-		}
-		commit, err := operations.resolveCommit(ctx, sourceRoot)
-		if err != nil && safety != nil {
-			for _, target := range safety.Targets {
-				if target.Ref == "refs/heads/"+sourceSiding.Branch && target.ExpectedOID != "" {
-					commit, err = target.ExpectedOID, nil
-					break
-				}
-			}
-		}
-		if err != nil {
-			return fmt.Errorf("resolve source commit for %q: %w", sourceName, err)
-		}
-		prepared := *app
-		owner := state.WorktreeOwner(*app, sourceSiding)
-		if err := operations.ensureControl(ctx, &prepared, owner, commit); err != nil {
-			return err
-		}
-		pinned, err := operations.pinBaseCommit(ctx, prepared.ControlRepoPath, owner, commit)
-		if err != nil {
-			return err
-		}
-		baseCommit = pinned
-	}
 	updated, err := operations.updateApp(ctx, app.ConfigDir, func(current *state.App) error {
 		if current.Removal != nil && (current.Removal.ID != operationID || current.Removal.Siding != name || current.Removal.Stage != state.RemovalStarted) {
 			return ensureNoRemovalInProgress(*current, "remove siding "+name)
@@ -896,8 +821,6 @@ func prepareRemovalStage(ctx context.Context, app *state.App, name, successor st
 		if _, exists := current.Sidings[name]; !exists {
 			return fmt.Errorf("no siding %q", name)
 		}
-		current.BaseSiding = baseSiding
-		current.BaseCommit = baseCommit
 		journalForce := force
 		journalSafety := ""
 		journalRemoving := []string(nil)
@@ -960,7 +883,7 @@ func promoteRemovalBaselineStage(ctx context.Context, app *state.App, operations
 	// The final base siding promotes automatically, because its data would
 	// otherwise be the last copy and vanish with it. Any other siding promotes
 	// only when the caller asked, which is what --promote-data records.
-	if journal.PromoteData || (len(app.Sidings) == 1 && app.BaseSiding == journal.Siding) {
+	if journal.PromoteData || len(app.Sidings) == 1 {
 		promote, err := validateFinalVolumeSet(sd, volumeRoot, app.Volumes)
 		if err != nil {
 			return err
@@ -1196,9 +1119,6 @@ func removeFilesStage(ctx context.Context, app *state.App, operations removalOpe
 		if current.LiveSiding == journal.Siding || current.LiveSiding == state.HostTarget {
 			current.LiveSiding = ""
 		}
-		if current.BaseSiding == journal.Siding {
-			current.BaseSiding = ""
-		}
 	})
 }
 
@@ -1405,68 +1325,4 @@ func validateFinalVolumeSet(sd state.Siding, volRoot string, volumes []string) (
 		}
 	}
 	return true, nil
-}
-
-// detachedBaseChoice asks for a base that is a pinned commit rather than a
-// siding. It is a reserved --next-base value so a script can choose it without
-// a terminal, and "-" cannot collide with a siding name because ValidateName
-// rejects it.
-// baseRemovalIsInteractive is a seam so a test can pin which path it exercises.
-// Reading os.Stdin directly made the choice depend on how `go test` was invoked,
-// which is exactly the kind of environment dependence that turns into a flake
-// nobody can reproduce.
-var baseRemovalIsInteractive = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
-
-const detachedBaseChoice = "-"
-
-func prepareBaseRemoval(app state.App, removing []string, requested string, in *bufio.Reader) (string, error) {
-	if app.Removal != nil || app.BaseSiding == "" || !containsName(removing, app.BaseSiding) {
-		return "", nil
-	}
-	excluded := map[string]bool{}
-	for _, name := range removing {
-		excluded[name] = true
-	}
-	survivors := sortedSidingNames(app, excluded)
-	if len(survivors) == 0 {
-		return "", nil
-	}
-	choice := requested
-	if choice == "" {
-		if !baseRemovalIsInteractive() {
-			return "", fmt.Errorf("removing base %q requires --next-base <siding>, or --next-base %s to keep the commit and leave no siding as base", app.BaseSiding, detachedBaseChoice)
-		}
-		fmt.Println("Choose the successor source base:")
-		for i, name := range survivors {
-			fmt.Printf("  %d) %s\n", i+1, name)
-		}
-		// Detaching is the option that stops a siding being kept alive purely to
-		// carry the seed. It is listed last so the numbering of the survivors
-		// above is unchanged.
-		fmt.Printf("  %d) none — keep the commit as the base and hold no siding open for it\n", len(survivors)+1)
-		var index int
-		if _, err := fmt.Fscan(in, &index); err != nil || index < 1 || index > len(survivors)+1 {
-			return "", fmt.Errorf("invalid successor base selection")
-		}
-		if index == len(survivors)+1 {
-			return detachedBaseChoice, nil
-		}
-		choice = survivors[index-1]
-	}
-	if choice == detachedBaseChoice {
-		return detachedBaseChoice, nil
-	}
-	if excluded[choice] {
-		return "", fmt.Errorf("successor base %q is also being removed", choice)
-	}
-	if _, ok := app.Sidings[choice]; !ok {
-		return "", fmt.Errorf("no successor siding %q", choice)
-	}
-	return choice, nil
-}
-
-func orderBaseLast(selected []string, base string) []string {
-	ordered := append([]string(nil), selected...)
-	sort.SliceStable(ordered, func(i, j int) bool { return ordered[j] == base && ordered[i] != base })
-	return ordered
 }

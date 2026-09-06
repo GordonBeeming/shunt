@@ -274,13 +274,12 @@ func containsAll(value string, values ...string) bool {
 	return true
 }
 
-func TestSidingReclaimableNeverOffersLiveBaseOrARunningGuest(t *testing.T) {
+func TestSidingReclaimableNeverOffersTheLiveSidingOrARunningGuest(t *testing.T) {
 	app := state.App{
 		Name:       "Alpha",
 		LiveSiding: "live",
-		BaseSiding: "base",
 		Sidings: map[string]state.Siding{
-			"live": {Name: "live"}, "base": {Name: "base"}, "busy": {Name: "busy"},
+			"live": {Name: "live"}, "busy": {Name: "busy"},
 		},
 	}
 	// Each of these is excluded before any Git work happens, so the analyzer is
@@ -290,7 +289,6 @@ func TestSidingReclaimableNeverOffersLiveBaseOrARunningGuest(t *testing.T) {
 		guest container.GuestObservationState
 	}{
 		{"live", container.GuestAbsent},  // the front-door target: switch away first
-		{"base", container.GuestAbsent},  // removing the base needs a successor
 		{"busy", container.GuestRunning}, // a run inside leaves no trace in Git
 	} {
 		got := sidingReclaimable(context.Background(), app, c.name, container.GuestObservation{State: c.guest})

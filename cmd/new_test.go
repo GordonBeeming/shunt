@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gordonbeeming/shunt/internal/config"
+	"github.com/gordonbeeming/shunt/internal/fsclone"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
@@ -334,72 +335,6 @@ func initializeCommandRepoAt(t *testing.T, repo string) string {
 	return sourceGitOutput(t, repo, "rev-parse", "HEAD")
 }
 
-func TestCreateSidingPinsLatestCleanBaseCommit(t *testing.T) {
-	app := newSourceStateTestApp(t, true)
-	baseSource, _, err := siding.Paths(app, app.BaseSiding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(baseSource, "source.txt"), []byte("new base\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	sourceGitOutput(t, baseSource, "add", "source.txt")
-	sourceGitOutput(t, baseSource, "commit", "-m", "advance base")
-	want := sourceGitOutput(t, baseSource, "rev-parse", "HEAD")
-	if want == app.BaseCommit {
-		t.Fatal("test setup did not advance the selected base")
-	}
-
-	app, _, err = createSiding(context.Background(), app.ConfigDir, "next", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	nextSource, _, err := siding.Paths(app, "next")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if head := sourceGitOutput(t, nextSource, "rev-parse", "HEAD"); head != want || app.BaseCommit != want {
-		t.Fatalf("new siding HEAD = %q, BaseCommit = %q, want %q", head, app.BaseCommit, want)
-	}
-	loaded, err := state.LoadApp(app.ConfigDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loaded.BaseCommit != want {
-		t.Fatalf("persisted BaseCommit = %q, want %q", loaded.BaseCommit, want)
-	}
-}
-
-func TestCreateSidingRejectsDirtyBaseBeforeCreatingWorktree(t *testing.T) {
-	app := newSourceStateTestApp(t, true)
-	baseSource, _, err := siding.Paths(app, app.BaseSiding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(baseSource, "untracked.txt"), []byte("dirty\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, _, err = createSiding(context.Background(), app.ConfigDir, "blocked", "", "")
-	if err == nil || !strings.Contains(err.Error(), "uncommitted or untracked") {
-		t.Fatalf("createSiding() error = %v", err)
-	}
-	blockedSource, _, pathErr := siding.Paths(app, "blocked")
-	if pathErr != nil {
-		t.Fatal(pathErr)
-	}
-	if _, statErr := os.Stat(blockedSource); !os.IsNotExist(statErr) {
-		t.Fatalf("dirty-base creation left worktree %q: %v", blockedSource, statErr)
-	}
-	loaded, loadErr := state.LoadApp(app.ConfigDir)
-	if loadErr != nil {
-		t.Fatal(loadErr)
-	}
-	if _, exists := loaded.Sidings["blocked"]; exists {
-		t.Fatal("dirty-base creation published siding state")
-	}
-}
-
 func TestCreateSidingDoesNotCompensateCommittedDurabilityError(t *testing.T) {
 	app := newSourceStateTestApp(t, true)
 	sentinel := errors.New("directory sync denied")
@@ -456,17 +391,6 @@ func TestCreateSidingCleansUpUnpublishedStateFailure(t *testing.T) {
 	}
 }
 
-func TestCreateFirstSidingSelectsItAsBase(t *testing.T) {
-	app := newSourceStateTestApp(t, false)
-	app, created, err := createSiding(context.Background(), app.ConfigDir, "first", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if app.BaseSiding != "first" || app.BaseCommit == "" || created.MaterializationPhase != state.PhaseWorktree {
-		t.Fatalf("first siding state = %#v, app base = %q @ %q", created, app.BaseSiding, app.BaseCommit)
-	}
-}
-
 func TestCreateSidingFencesRemovalFromCurrentState(t *testing.T) {
 	app := newSourceStateTestApp(t, true)
 	blockedControl := filepath.Join(app.ConfigDir, "blocked-control.git")
@@ -496,5 +420,39 @@ func TestCreateSidingFencesRemovalFromCurrentState(t *testing.T) {
 	}
 	if _, exists := loaded.Sidings["blocked"]; exists {
 		t.Fatal("removal-fenced create changed siding state")
+	}
+}
+
+// TestNewSucceedsWhileAnotherSidingIsDirty is the whole change stated as
+// behaviour. Creating a siding used to seed from a designated base siding's
+// HEAD and refuse outright when that siding had uncommitted or untracked files,
+// so an unrelated worktree someone else was mid-edit in blocked you. A siding
+// now starts from the repository's default branch, which nobody is editing.
+func TestNewSucceedsWhileAnotherSidingIsDirty(t *testing.T) {
+	app := newSourceStateTestApp(t, true)
+
+	first := t.TempDir()
+	_ = first
+	// Dirty every existing siding's worktree. Under the old rule the one that
+	// happened to be the base would have failed the next `new` outright.
+	for name := range app.Sidings {
+		src, _, err := siding.Paths(app, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(src, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(src, "uncommitted.txt"), []byte("in flight"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start, err := fsclone.RemoteDefaultBranch(context.Background(), app.RepoPath)
+	if err != nil {
+		t.Fatalf("resolving the default branch must not depend on any siding being clean: %v", err)
+	}
+	if start == "HEAD" {
+		t.Fatalf("start = %q, want a named branch: seeding from whatever HEAD points at is not a base anybody chose", start)
 	}
 }

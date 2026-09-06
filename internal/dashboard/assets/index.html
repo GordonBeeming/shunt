@@ -85,7 +85,6 @@
      register (removal-in-progress banner, transient action status) — reused
      here rather than --up (green reads as healthy/serving, which this isn't). */
   .badge.released { background: var(--busy); color: var(--on-primary); }
-  .badge.base { background: var(--primary); color: var(--on-primary); }
   .badge.phase { background: var(--ui); color: var(--text); }
   .guest { font-size: 11px; color: var(--text2); }
   .siding .runtime { font-size: 11px; color: var(--text2); }
@@ -185,7 +184,6 @@ function sidingHTML(appName, s, removalActive){
   // know where to point), but nothing is actually bound — badging it "live"
   // would read as serving when it isn't, so "released" takes precedence.
   const liveBadge = s.released ? '<span class="badge released">released</span>' : (s.live ? '<span class="badge live">live</span>' : '');
-  const baseBadge = s.base ? '<span class="badge base">base</span>' : '';
   const phaseBadge = `<span class="badge phase" title="persisted siding phase">${esc(s.phase || 'worktree')}</span>`;
   const status = `<span class="status terminal-status" role="status" aria-live="polite">${esc(s.status || '')}</span>`;
   const runtimeBad = s.runtime === 'runtime-unavailable' ? ' bad' : '';
@@ -207,7 +205,7 @@ function sidingHTML(appName, s, removalActive){
   }
   return `<div class="siding" id="${sidingKey(appName, s)}">
     <div class="sinfo">
-      <div class="sline1"><span class="nm">${esc(s.name)}</span> ${liveBadge} ${baseBadge} ${phaseBadge} ${status}</div>
+      <div class="sline1"><span class="nm">${esc(s.name)}</span> ${liveBadge} ${phaseBadge} ${status}</div>
       <div class="sline2">${runtime} ${runtimeDetail}</div>
       ${progress}
       ${line2}

@@ -76,9 +76,6 @@ func TestEnsureV2AndBaseSelection(t *testing.T) {
 		"one": {Name: "one"},
 		"two": {Name: "two", WorktreeRepoPath: "/managed", MaterializationPhase: PhaseParked},
 	}}
-	if !NeedsBaseSelection(app) {
-		t.Fatal("multiple legacy sidings should require base selection")
-	}
 	if !EnsureV2(&app) || app.Version != StateVersion {
 		t.Fatalf("EnsureV2() app = %#v", app)
 	}
@@ -102,9 +99,6 @@ func TestV2SidingDefaultsToManagedWorktreeOwner(t *testing.T) {
 		t.Fatalf("v2 worktree owner = %q, want %q", got, app.ControlRepoPath)
 	}
 	app.BaseSiding = "missing"
-	if !NeedsBaseSelection(app) {
-		t.Fatal("missing designated base should require selection")
-	}
 }
 
 func TestSaveLoadAppRoundTrip(t *testing.T) {
@@ -363,32 +357,6 @@ func TestRegistryFindProjectCaseInsensitive(t *testing.T) {
 		}
 		if c.wantOK && gotDir != "/cfg/MyApp" {
 			t.Errorf("FindProject(%q) dir = %q, want /cfg/MyApp", c.name, gotDir)
-		}
-	}
-}
-
-func TestNeedsBaseSelectionSeparatesLegacyStateFromADetachedBase(t *testing.T) {
-	two := map[string]Siding{"one": {Name: "one"}, "two": {Name: "two"}}
-	cases := []struct {
-		name string
-		app  App
-		want bool
-	}{
-		// The migration case this exists for: several sidings, and nothing on
-		// record saying which one was the base. Only a person can answer that.
-		{"legacy multi-siding with no commit", App{Sidings: two}, true},
-		// The detached base. Pinning the commit is what detaching does, so a
-		// commit with no base siding is a deliberate state, not an unmigrated one.
-		{"detached with a pinned commit", App{Sidings: two, BaseCommit: "abc123"}, false},
-		// One siding and no base was already unambiguous.
-		{"single siding with no commit", App{Sidings: map[string]Siding{"one": {Name: "one"}}}, false},
-		// A base naming a siding that is gone is corrupt either way.
-		{"base names a missing siding", App{Sidings: two, BaseSiding: "gone", BaseCommit: "abc123"}, true},
-		{"no sidings at all", App{BaseCommit: "abc123"}, false},
-	}
-	for _, c := range cases {
-		if got := NeedsBaseSelection(c.app); got != c.want {
-			t.Errorf("%s: NeedsBaseSelection() = %v, want %v", c.name, got, c.want)
 		}
 	}
 }

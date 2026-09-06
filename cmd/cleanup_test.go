@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -47,39 +46,6 @@ func TestParseCleanupSelection(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestOrderBaseLast(t *testing.T) {
-	got := orderBaseLast([]string{"base", "alpha", "beta"}, "base")
-	want := []string{"alpha", "beta", "base"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("orderBaseLast() = %v, want %v", got, want)
-	}
-}
-
-func TestUnrelatedRemovalDoesNotRequireLegacyBaseSelection(t *testing.T) {
-	app := state.App{Sidings: map[string]state.Siding{"one": {Name: "one"}, "two": {Name: "two"}}}
-	got, err := prepareBaseRemoval(app, []string{"one"}, "", bufio.NewReader(strings.NewReader("")))
-	if err != nil || got != "" {
-		t.Fatalf("unrelated removal = %q, %v", got, err)
-	}
-}
-
-func TestConfiguredBaseRemovalStillRequiresSuccessor(t *testing.T) {
-	app := state.App{BaseSiding: "one", Sidings: map[string]state.Siding{"one": {Name: "one"}, "two": {Name: "two"}}}
-	_, err := prepareBaseRemoval(app, []string{"one"}, "", bufio.NewReader(strings.NewReader("")))
-	if err == nil || !strings.Contains(err.Error(), "requires --next-base") {
-		t.Fatalf("base removal error = %v", err)
-	}
-}
-
-func TestRmCommandLegacyNoBaseDoesNotPromptForBase(t *testing.T) {
-	app := persistedLegacyNoBaseApp(t)
-	withRemovalCommandSeams(t, app, func(removed *[]string) error {
-		command := newRmCmd()
-		command.SetArgs([]string{"one", "--force"})
-		return command.ExecuteContext(context.Background())
-	}, "")
 }
 
 func TestCleanupCommandLegacyNoBaseConsumesOnlySidingSelection(t *testing.T) {
@@ -159,10 +125,7 @@ func withRemovalCommandSeams(t *testing.T, app state.App, run func(*[]string) er
 	})
 	commandLoadCurrentApp = func() (state.App, resolve.Location, error) { return app, resolve.Location{}, nil }
 	removed := []string{}
-	commandRemoveSiding = func(_ context.Context, _ *state.App, name string, _ bool, successor string, _ ...*removalSafety) error {
-		if successor != "" {
-			return fmt.Errorf("unexpected base successor %q", successor)
-		}
+	commandRemoveSiding = func(_ context.Context, _ *state.App, name string, _ bool, _ ...*removalSafety) error {
 		removed = append(removed, name)
 		return nil
 	}
@@ -564,44 +527,5 @@ func TestResolveSelectedRemovalRefsRejectsACollisionBetweenSelectedSidings(t *te
 	}
 	if !strings.Contains(err.Error(), "selected siding") {
 		t.Errorf("error = %v, want it to name the colliding selected siding", err)
-	}
-}
-
-func TestBaseRemovalAcceptsDetachingInsteadOfASuccessor(t *testing.T) {
-	app := state.App{BaseSiding: "one", Sidings: map[string]state.Siding{"one": {Name: "one"}, "two": {Name: "two"}}}
-
-	// Non-interactive: the reserved value says detach without a terminal, which
-	// is what lets a script or cleanup choose it.
-	got, err := prepareBaseRemoval(app, []string{"one"}, detachedBaseChoice, bufio.NewReader(strings.NewReader("")))
-	if err != nil || got != detachedBaseChoice {
-		t.Fatalf("--next-base %s = %q, %v", detachedBaseChoice, got, err)
-	}
-
-	// The error for a bare removal has to name that option, or nobody finds it.
-	// Pin the non-interactive path rather than letting it depend on whether the
-	// test was run from a terminal.
-	original := baseRemovalIsInteractive
-	t.Cleanup(func() { baseRemovalIsInteractive = original })
-	baseRemovalIsInteractive = func() bool { return false }
-
-	_, err = prepareBaseRemoval(app, []string{"one"}, "", bufio.NewReader(strings.NewReader("")))
-	if err == nil || !strings.Contains(err.Error(), detachedBaseChoice) {
-		t.Fatalf("error = %v, want it to name the detach option", err)
-	}
-
-	// And the interactive path: the detach entry sits after the survivors, so
-	// selecting one past them detaches rather than naming a siding.
-	baseRemovalIsInteractive = func() bool { return true }
-	got, err = prepareBaseRemoval(app, []string{"one"}, "", bufio.NewReader(strings.NewReader("2\n")))
-	if err != nil || got != detachedBaseChoice {
-		t.Fatalf("interactive detach selection = %q, %v", got, err)
-	}
-}
-
-func TestDetachedBaseChoiceCannotCollideWithASidingName(t *testing.T) {
-	// The sentinel is only safe because a siding can never be called this. If
-	// that ever stops holding, --next-base becomes ambiguous.
-	if err := siding.ValidateName(detachedBaseChoice); err == nil {
-		t.Fatalf("ValidateName(%q) = nil, want a rejection so the sentinel stays unambiguous", detachedBaseChoice)
 	}
 }
