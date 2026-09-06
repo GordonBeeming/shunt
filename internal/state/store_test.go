@@ -58,7 +58,9 @@ func TestLoadAppProjectsLegacyStateWithoutPublishingMigration(t *testing.T) {
 	if app.Version != 0 {
 		t.Fatalf("read projection changed persisted version marker: %d", app.Version)
 	}
-	if app.ControlRepoPath != filepath.Join(dir, ".control.git") || app.BaseSiding != "one" {
+	// Legacy state no longer has a base projected onto its lone siding: sidings
+	// seed from the repository's default branch instead.
+	if app.ControlRepoPath != filepath.Join(dir, ".control.git") || app.BaseSiding != "" {
 		t.Fatalf("legacy projection = %#v", app)
 	}
 	siding := app.Sidings["one"]

@@ -54,7 +54,9 @@ func TestAppAddReregistrationPreservesLifecycleStateAndClearsLegacyHost(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if app.BaseSiding != "one" || app.BaseCommit != "existing-base" || app.LiveSiding != "" || app.Sidings["one"].MaterializationPhase != state.PhaseParked {
+	// BaseCommit round-trips untouched as legacy state; BaseSiding is no longer
+	// projected onto a lone siding.
+	if app.BaseSiding != "" || app.BaseCommit != "existing-base" || app.LiveSiding != "" || app.Sidings["one"].MaterializationPhase != state.PhaseParked {
 		t.Fatalf("re-registration reset lifecycle state: %#v", app)
 	}
 }

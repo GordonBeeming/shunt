@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/fsclone"
@@ -40,12 +39,8 @@ func ensureControlRepository(ctx context.Context, app *state.App, source, seed s
 	if seed == "" {
 		seed = "HEAD"
 	}
-	commit, err := fsclone.EnsureControlRepo(ctx, app.ControlRepoPath, source, app.RepoOrigin, seed)
-	if err != nil {
+	if _, err := fsclone.EnsureControlRepo(ctx, app.ControlRepoPath, source, app.RepoOrigin, seed); err != nil {
 		return err
-	}
-	if app.BaseCommit == "" {
-		app.BaseCommit = commit
 	}
 	return nil
 }
@@ -57,15 +52,4 @@ func gitText(ctx context.Context, repo string, args ...string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(result.Stdout), nil
-}
-
-func sortedSidingNames(app state.App, exclude map[string]bool) []string {
-	names := make([]string, 0, len(app.Sidings))
-	for name := range app.Sidings {
-		if !exclude[name] {
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
-	return names
 }

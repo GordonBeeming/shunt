@@ -308,8 +308,15 @@ func implicitWorktreeBase(ctx context.Context, repoPath string) (string, error) 
 	return RemoteDefaultBranch(ctx, repoPath)
 }
 
-// RemoteDefaultBranch resolves the branch a new siding starts from: origin/HEAD
-// when the remote publishes one, else origin/main when it verifies.
+// defaultBranchCandidates are tried in order when origin/HEAD is unset, stale or
+// malformed. Remote names come first so a clone follows its remote; the local
+// pair covers a project with no remote at all. None of them is the local HEAD,
+// which is the point: an unresolvable default refuses rather than guessing.
+var defaultBranchCandidates = []string{"origin/main", "origin/master", "main", "master"}
+
+// RemoteDefaultBranch resolves the branch a new siding starts from. It prefers
+// whatever origin/HEAD names, then falls through defaultBranchCandidates in
+// order, taking the first that actually resolves to a commit.
 //
 // It deliberately never falls back to the local HEAD. Whatever the checkout
 // happens to be sitting on is not a base anybody chose, and seeding from it
@@ -320,24 +327,20 @@ func RemoteDefaultBranch(ctx context.Context, repoPath string) (string, error) {
 		"symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
 	if err == nil {
 		base := strings.TrimSpace(remoteHead.Stdout)
-		if !strings.HasPrefix(base, "origin/") || base == "origin/" {
-			return "", fmt.Errorf("origin/HEAD resolved to unexpected ref %q", base)
+		// A malformed or stale origin/HEAD is not fatal: it points at a branch the
+		// remote no longer has, which is a stale local ref rather than a missing
+		// default. Fall through to the candidates instead of refusing while a
+		// perfectly good main sits right there.
+		if strings.HasPrefix(base, "origin/") && base != "origin/" {
+			if err := verifyCommit(ctx, repoPath, base); err == nil {
+				return base, nil
+			}
 		}
-		if err := verifyCommit(ctx, repoPath, base); err != nil {
-			return "", fmt.Errorf("resolve GitButler siding base %q: %w", base, err)
-		}
-		return base, nil
-	}
-	if remoteHead.ExitCode != 1 {
+	} else if remoteHead.ExitCode != 1 {
 		return "", fmt.Errorf("resolve origin/HEAD: %w", err)
 	}
 
-	// Clones occasionally lack origin/HEAD, and a project may have no remote at
-	// all. Try the conventional names in order, taking each only when it actually
-	// verifies. None of these is the local HEAD: whatever the checkout happens to
-	// be sitting on is not a base anybody chose, and seeding from it silently
-	// would give the siding work nobody asked for.
-	for _, candidate := range []string{"origin/main", "origin/master", "main", "master"} {
+	for _, candidate := range defaultBranchCandidates {
 		if err := verifyCommit(ctx, repoPath, candidate); err == nil {
 			return candidate, nil
 		}

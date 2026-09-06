@@ -134,9 +134,11 @@ type App struct {
 	// worktrees and preserves the pinned source seed when no siding remains.
 	ControlRepoPath string `json:"controlRepoPath,omitempty"`
 	// BaseSiding and BaseCommit are retained only so state written before sidings
-	// seeded from the remote default branch still loads and round-trips. Nothing
-	// reads them: `new` resolves origin/HEAD (or origin/main) per run, so there is
-	// no designated base siding and no pinned seed to keep alive.
+	// seeded from the repository's default branch still loads and round-trips.
+	// Nothing reads or writes them: `new` resolves the default branch per run, so
+	// there is no designated base siding and no pinned seed to keep alive. They
+	// stay declared rather than deleted so an old file's values survive a
+	// round-trip instead of being silently dropped.
 	BaseSiding  string            `json:"baseSiding,omitempty"`
 	BaseCommit  string            `json:"baseCommit,omitempty"`
 	Runner      string            `json:"runner"`            // aspire | dotnet | node | custom
@@ -313,12 +315,6 @@ func projectCompatibility(app *App) bool {
 	}
 	if app.Sidings == nil {
 		app.Sidings = map[string]Siding{}
-		changed = true
-	}
-	if app.BaseSiding == "" && len(app.Sidings) == 1 {
-		for name := range app.Sidings {
-			app.BaseSiding = name
-		}
 		changed = true
 	}
 	// Stable ordering is not required for the map update itself, but makes this

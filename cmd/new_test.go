@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/gordonbeeming/shunt/internal/config"
-	"github.com/gordonbeeming/shunt/internal/fsclone"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
@@ -31,8 +30,13 @@ func TestNewInitializesWorktreeOnlyStateWithoutContractOrRegistry(t *testing.T) 
 	if app.Name != filepath.Base(repo) || app.RepoPath != repo || app.ConfigDir != configDir {
 		t.Fatalf("worktree-only project identity = %#v", app)
 	}
-	if app.ControlRepoPath != filepath.Join(configDir, ".control.git") || app.BaseCommit != commit || app.BaseSiding != "first" {
-		t.Fatalf("worktree-only source state = control %q, base %q @ %q", app.ControlRepoPath, app.BaseSiding, app.BaseCommit)
+	// No base is recorded: a siding seeds from the repository's default branch,
+	// resolved per run, so there is nothing to pin.
+	if app.ControlRepoPath != filepath.Join(configDir, ".control.git") {
+		t.Fatalf("worktree-only source state = control %q", app.ControlRepoPath)
+	}
+	if app.BaseSiding != "" || app.BaseCommit != "" {
+		t.Fatalf("legacy base fields were written: %q @ %q", app.BaseSiding, app.BaseCommit)
 	}
 	if app.Runner != "" || app.Start != "" || app.Stop != "" || app.Workdir != "" || app.AppHostPath != "" || len(app.FrontDoor) != 0 || len(app.DataVolumes) != 0 || len(app.Env) != 0 || len(app.Mounts) != 0 || len(app.PrebakeImages) != 0 || len(app.PrebakeBuilds) != 0 || len(app.Volumes) != 0 || app.Memory != "" || app.CPUs != "" || app.HealthPort != 0 || app.HealthPath != "" {
 		t.Fatalf("worktree-only state unexpectedly contains runtime configuration: %#v", app)
@@ -239,7 +243,9 @@ func TestAppAddEnrichesWorktreeOnlyStateAndRegisteredNewStillWorks(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if registered.Runner != "node" || registered.Start != "npm start" || registered.ControlRepoPath != before.ControlRepoPath || registered.BaseSiding != before.BaseSiding || registered.BaseCommit != commit {
+	// The legacy base fields are not asserted here: registration no longer has an
+	// opinion about them, so what they hold is whatever the earlier state did.
+	if registered.Runner != "node" || registered.Start != "npm start" || registered.ControlRepoPath != before.ControlRepoPath {
 		t.Fatalf("enriched registration = %#v", registered)
 	}
 	if got, ok := registered.Sidings["shell"]; !ok || got.Branch != before.Sidings["shell"].Branch {
@@ -428,13 +434,16 @@ func TestCreateSidingFencesRemovalFromCurrentState(t *testing.T) {
 // HEAD and refuse outright when that siding had uncommitted or untracked files,
 // so an unrelated worktree someone else was mid-edit in blocked you. A siding
 // now starts from the repository's default branch, which nobody is editing.
+//
+// It creates a real siding rather than only resolving the start point: a
+// regression that restored the rejection inside createSiding would otherwise
+// slip past this test entirely.
 func TestNewSucceedsWhileAnotherSidingIsDirty(t *testing.T) {
 	app := newSourceStateTestApp(t, true)
 
-	first := t.TempDir()
-	_ = first
-	// Dirty every existing siding's worktree. Under the old rule the one that
-	// happened to be the base would have failed the next `new` outright.
+	if len(app.Sidings) == 0 {
+		t.Fatal("fixture has no siding to dirty; the test would prove nothing")
+	}
 	for name := range app.Sidings {
 		src, _, err := siding.Paths(app, name)
 		if err != nil {
@@ -448,11 +457,14 @@ func TestNewSucceedsWhileAnotherSidingIsDirty(t *testing.T) {
 		}
 	}
 
-	start, err := fsclone.RemoteDefaultBranch(context.Background(), app.RepoPath)
+	updated, created, err := createSiding(context.Background(), app.ConfigDir, "fresh", "", "")
 	if err != nil {
-		t.Fatalf("resolving the default branch must not depend on any siding being clean: %v", err)
+		t.Fatalf("createSiding with every other worktree dirty = %v, want success", err)
 	}
-	if start == "HEAD" {
-		t.Fatalf("start = %q, want a named branch: seeding from whatever HEAD points at is not a base anybody chose", start)
+	if _, ok := updated.Sidings["fresh"]; !ok {
+		t.Fatal("siding was not recorded in state")
+	}
+	if created.Branch == "" {
+		t.Fatal("created siding has no branch")
 	}
 }

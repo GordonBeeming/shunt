@@ -40,10 +40,12 @@ func TestSpinCreatesOnlyWorktreeAndChoosesOneBase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.BaseSiding != "one" && got.BaseSiding != "two" {
-		t.Fatalf("base siding = %q", got.BaseSiding)
+	// No siding is designated a base any more: each seeds from the repository's
+	// default branch, so Spin records neither field.
+	if got.BaseSiding != "" {
+		t.Fatalf("base siding = %q, want none recorded", got.BaseSiding)
 	}
-	if got.BaseCommit == "" || len(got.Sidings) != 2 {
+	if len(got.Sidings) != 2 {
 		t.Fatalf("state = %#v", got)
 	}
 	for name, sd := range got.Sidings {
