@@ -59,7 +59,7 @@ func newNewCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&branch, "branch", "", "fork a new siding branch off this explicit start point (branch or commit; default: the clean source base)")
+	c.Flags().StringVar(&branch, "branch", "", "fork a new siding branch off this explicit start point (branch or commit; default: the repository default branch)")
 	c.Flags().StringVar(&from, "from", "", "create the siding ON an existing remote branch (fetched + tracked), so commits push back to it")
 	return c
 }
