@@ -22,13 +22,13 @@ List registry dependency tags in `prebakeImages`, and declare app-owned images i
 
 ## Start small, then materialize only when needed
 
-`{{shunt-command}} new <name>` creates a managed branch and worktree only. It works from any Git repository: when no Shunt state exists, `new` saves only the project identity, independent control repository, source commit, and siding state. It does not need `.shunt.app.json`, inspect a runner, or register the project. The first siding becomes the source base. Later default sidings seed from that base siding's clean committed HEAD; `{{shunt-command}} base set <siding>` changes it, and `{{shunt-command}} base` shows either the current siding or the pinned commit that remains when the project has zero sidings. Use `--branch` or `--from` only as deliberate source overrides.
+`{{shunt-command}} new <name>` creates a managed branch and worktree only. It works from any Git repository: when no Shunt state exists, `new` saves only the project identity, independent control repository, source commit, and siding state. It does not need `.shunt.app.json`, inspect a runner, or register the project. Every siding seeds from the repository's default branch, resolved per run: `origin/HEAD`, else the first of `origin/main`, `origin/master`, `main` or `master` that exists. No siding is the base for another, so a dirty worktree somewhere else never blocks a new one. Use `--branch` or `--from` when you deliberately want a different start point, including stacking on another siding's branch.
 
 Before a worktree-only project can use a guest, add `.shunt.app.json` and run `{{shunt-command}} app add`. Registration fills in the runtime settings and registry entry without replacing existing sidings. Then `{{shunt-command}} up <name>` grows the durable state from `worktree` to `data` to `guest`, creating `out`, cloning the selected data baseline, loading dependency images, and starting the app. `kill` stops but retains the guest. `park` removes a non-live guest while preserving the worktree, data, and output; the next `up` recreates it. Persisted phase is not runtime observation: the dashboard reports `running`, `stopped`, `missing`, or `runtime-unavailable` independently, and an unavailable Apple runtime is never guessed to mean stopped.
 
 {{shunt-nightly-migration}}
 
-Existing registrations load legacy `state.json` without rewriting it during read-only commands. Legacy worktrees keep their original Git owner and pre-phase sidings project as materialized guests. A sole siding becomes the source base; with several and no existing selection, an interactive source operation asks and non-interactive use must run `{{shunt-command}} base set <siding>`. The next state publication atomically renames `state-v2.json` into place; after that v2 is authoritative and later writes to the legacy file are ignored. A file from an unsupported future version is rejected rather than guessed or overwritten.
+Existing registrations load legacy `state.json` without rewriting it during read-only commands. Legacy worktrees keep their original Git owner and pre-phase sidings project as materialized guests. Any base siding recorded in legacy state is ignored; sidings seed from the repository's default branch. The next state publication atomically renames `state-v2.json` into place; after that v2 is authoritative and later writes to the legacy file are ignored. A file from an unsupported future version is rejected rather than guessed or overwritten.
 
 ## Data baseline workflow
 
@@ -98,7 +98,7 @@ Run `{{shunt-command}} cleanup` from the registered repo when several sidings ar
 
 For an AI coding client, that confirmation belongs to the user. Stop and name every protected siding and its reason, then ask whether those changes should be discarded. Once confirmed, Shunt journals exact target OIDs and creates operation recovery refs before destructive stages. Before journal clear, one atomic handoff verifies recovery OIDs and the synthetic witness archive tip, then deletes the recovery refs. Preserved targets advance the single archive with accepted commits as parents; explicit-discard targets add no archive parent. A crash after handoff resumes from the exact archive state. Do not downgrade Shunt during an active removal. Only answer yes or rerun with `{{shunt-command}} cleanup --force` after the user explicitly approves it. Force also permits cleanup of the live siding; without force, switch away first. `{{shunt-command}} rm <name>` uses the same checks when only one siding needs removal.
 
-The source base has an additional hand-off rule. If it is selected while another siding survives, interactive cleanup prompts for the successor, with detaching offered as the last choice, and automation must pass `--next-base <siding>` or `--next-base -` for the detached form. Detaching pins the removed siding's commit as the seed and leaves no siding as the base, so nothing is held open merely to carry it; `rm --promote-data` does the same for a siding kept only for its data. The old base is removed last. If the final siding is removed, Shunt first pins its committed HEAD so the next `new` works with zero sidings. A complete materialized volume set is promoted as the durable APFS copy-on-write baseline before deletion; a worktree-only final siding has no data to promote and leaves the existing baseline alone. The operation is journalled so a retry does not duplicate an already-committed generation. While that journal is active, source, guest/data lifecycle, Git-sync/guest-command, and trim mutations refuse to race the removal; let the original removal command resume it.
+There is no base hand-off rule: sidings seed from the repository's default branch, so no siding is a base for another and removal order does not matter. `rm --promote-data` makes a removed siding's volumes the durable baseline, which is the one reason a siding otherwise gets kept alive. If the final siding is removed, a complete materialized volume set is promoted as the durable APFS copy-on-write baseline before deletion; a worktree-only final siding has no data to promote and leaves the existing baseline alone. The operation is journalled so a retry does not duplicate an already-committed generation. While that journal is active, source, guest/data lifecycle, Git-sync/guest-command, and trim mutations refuse to race the removal; let the original removal command resume it.
 
 ## Measure before reclaiming space
 
@@ -150,9 +150,9 @@ Use `--json` for that decision: it exits successfully whenever discovery succeed
 ## Pulling the default branch into a siding — `{{shunt-command}} sync`
 
 A siding has its own branch in Shunt's independent control repository. Default
-`{{shunt-command}} new` starts from the clean source base siding's committed HEAD, or the pinned
-base commit when no sidings remain. `--branch <ref>` explicitly chooses another
-starting point; `--from <branch>` fetches and continues an existing remote branch.
+`{{shunt-command}} new` starts from the same default branch `sync` pulls, resolved from
+`origin/HEAD`. `--branch <ref>` explicitly chooses another starting point;
+`--from <branch>` fetches and continues an existing remote branch.
 When the siding has drifted behind, pull the latest default branch into it:
 
 - `{{shunt-command}} sync` — `fetch origin` then **merge** `origin/<default-branch>` (auto-detected from

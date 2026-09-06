@@ -35,12 +35,6 @@ func newNewCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if branch == "" && from == "" {
-				if err := ensureBaseSelected(ctx, &app); err != nil {
-					return err
-				}
-			}
-
 			if from != "" {
 				fmt.Printf("• creating worktree from existing branch %q for %q…\n", from, name)
 			} else {
@@ -206,20 +200,27 @@ func createSidingWithOps(ctx context.Context, configDir, name, branch, from stri
 		}
 
 		source := app.RepoPath
-		if base, ok := app.Sidings[app.BaseSiding]; ok {
-			source = state.WorktreeOwner(app, base)
-		}
 		start := branch
 		if branch == "" && from == "" {
-			start, err = validateCleanBase(ctx, &app)
+			// A siding starts from the remote default branch. It deliberately does
+			// not inherit another siding's work: doing so made `new` fail whenever
+			// an unrelated siding happened to be dirty, and made the starting point
+			// depend on which siding someone had last designated. Stacking on
+			// another siding is still available, but only by asking for it with
+			// --branch or --from.
+			start, err = fsclone.RemoteDefaultBranch(ctx, source)
+			if err != nil {
+				return err
+			}
+			if err := ensureControlRepository(ctx, &app, source, start); err != nil {
+				return err
+			}
+			start, err = fsclone.ResolveStartPoint(ctx, app.ControlRepoPath, source, start)
 			if err != nil {
 				return err
 			}
 		} else {
-			seed := app.BaseCommit
-			if branch != "" {
-				seed = branch
-			}
+			seed := branch
 			if err := ensureControlRepository(ctx, &app, source, seed); err != nil {
 				return err
 			}
@@ -253,18 +254,6 @@ func createSidingWithOps(ctx context.Context, configDir, name, branch, from stri
 			Container:            config.ContainerName(app.Name, name),
 			CreatedAt:            time.Now().Format(time.RFC3339),
 			Bridges:              map[string]int{},
-		}
-		if app.BaseSiding == "" && len(app.Sidings) == 0 {
-			commit, err := gitText(ctx, src, "rev-parse", "--verify", "HEAD^{commit}")
-			if err != nil {
-				return errors.Join(err, cleanupCreatedSiding(ctx, app, created, src))
-			}
-			pinned, err := fsclone.PinBaseCommit(ctx, app.ControlRepoPath, app.ControlRepoPath, commit)
-			if err != nil {
-				return errors.Join(err, cleanupCreatedSiding(ctx, app, created, src))
-			}
-			app.BaseSiding = name
-			app.BaseCommit = pinned
 		}
 		app.Sidings[name] = created
 		if err := ops.saveApp(app); err != nil {

@@ -253,7 +253,7 @@ func sidingReclaimable(ctx context.Context, app state.App, name string, guest co
 	// list. A running guest holds work that leaves no trace in the worktree, and
 	// an unavailable one means the inspection itself failed, which must not be
 	// read as stopped: the guest may well still be up.
-	if app.LiveSiding == name || app.BaseSiding == name || guest.State != container.GuestAbsent {
+	if app.LiveSiding == name || guest.State != container.GuestAbsent {
 		no := false
 		return &no
 	}

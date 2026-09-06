@@ -132,19 +132,25 @@ type App struct {
 	RepoPath   string `json:"repoPath"` // legacy checkout reference; never an execution target
 	// ControlRepoPath is Shunt's independent bare repository. It owns managed
 	// worktrees and preserves the pinned source seed when no siding remains.
-	ControlRepoPath string            `json:"controlRepoPath,omitempty"`
-	BaseSiding      string            `json:"baseSiding,omitempty"`
-	BaseCommit      string            `json:"baseCommit,omitempty"`
-	Runner          string            `json:"runner"`            // aspire | dotnet | node | custom
-	Start           string            `json:"start,omitempty"`   // start command (non-aspire)
-	Stop            string            `json:"stop,omitempty"`    // optional clean-stop command; force-kill is the fallback
-	Workdir         string            `json:"workdir,omitempty"` // dir to run Start/Stop in (non-aspire)
-	AppHostPath     string            `json:"appHostPath"`       // aspire: rel path to the AppHost project
-	ConfigDir       string            `json:"configDir"`         // <repos>/.shunt[-ch]/<project>
-	FrontDoor       []Route           `json:"frontDoor"`
-	DataVolumes     []DataVolume      `json:"dataVolumes"`
-	Env             map[string]string `json:"env"`    // extra guest env (Aspire parameters, secrets)
-	Mounts          []MountSpec       `json:"mounts"` // explicit extra host->guest mounts
+	ControlRepoPath string `json:"controlRepoPath,omitempty"`
+	// BaseSiding and BaseCommit are retained only so state written before sidings
+	// seeded from the repository's default branch still loads and round-trips.
+	// Nothing reads or writes them: `new` resolves the default branch per run, so
+	// there is no designated base siding and no pinned seed to keep alive. They
+	// stay declared rather than deleted so an old file's values survive a
+	// round-trip instead of being silently dropped.
+	BaseSiding  string            `json:"baseSiding,omitempty"`
+	BaseCommit  string            `json:"baseCommit,omitempty"`
+	Runner      string            `json:"runner"`            // aspire | dotnet | node | custom
+	Start       string            `json:"start,omitempty"`   // start command (non-aspire)
+	Stop        string            `json:"stop,omitempty"`    // optional clean-stop command; force-kill is the fallback
+	Workdir     string            `json:"workdir,omitempty"` // dir to run Start/Stop in (non-aspire)
+	AppHostPath string            `json:"appHostPath"`       // aspire: rel path to the AppHost project
+	ConfigDir   string            `json:"configDir"`         // <repos>/.shunt[-ch]/<project>
+	FrontDoor   []Route           `json:"frontDoor"`
+	DataVolumes []DataVolume      `json:"dataVolumes"`
+	Env         map[string]string `json:"env"`    // extra guest env (Aspire parameters, secrets)
+	Mounts      []MountSpec       `json:"mounts"` // explicit extra host->guest mounts
 	// Registry dependency images kept in shunt's daemon-free host cache and
 	// loaded into sidings so guests never pull from the network (see `shunt warm`).
 	PrebakeImages []string `json:"prebakeImages,omitempty"`
@@ -289,25 +295,6 @@ func EnsureV2(app *App) bool {
 	return changed
 }
 
-// NeedsBaseSelection reports the only migration decision state cannot infer:
-// several existing sidings with no source base that anyone chose.
-//
-// An empty BaseSiding alone does not mean that. It is also the deliberate
-// detached base, where the seed is a pinned commit and no siding is held open
-// merely to carry it. BaseCommit is what tells the two apart: legacy state that
-// predates the base concept has none, so it still asks, while a detached base
-// always has one because pinning is what detaching does.
-func NeedsBaseSelection(app App) bool {
-	if len(app.Sidings) == 0 {
-		return false
-	}
-	if app.BaseSiding == "" {
-		return app.BaseCommit == "" && len(app.Sidings) > 1
-	}
-	_, exists := app.Sidings[app.BaseSiding]
-	return !exists
-}
-
 // WorktreeOwner returns the repository that owns a siding's linked worktree.
 // The original repository is the compatibility owner for legacy state.
 func WorktreeOwner(app App, siding Siding) string {
@@ -328,12 +315,6 @@ func projectCompatibility(app *App) bool {
 	}
 	if app.Sidings == nil {
 		app.Sidings = map[string]Siding{}
-		changed = true
-	}
-	if app.BaseSiding == "" && len(app.Sidings) == 1 {
-		for name := range app.Sidings {
-			app.BaseSiding = name
-		}
 		changed = true
 	}
 	// Stable ordering is not required for the map update itself, but makes this

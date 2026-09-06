@@ -25,7 +25,6 @@ import (
 	"github.com/gordonbeeming/shunt/internal/fsclone"
 	"github.com/gordonbeeming/shunt/internal/image"
 	"github.com/gordonbeeming/shunt/internal/imagecache"
-	"github.com/gordonbeeming/shunt/internal/proc"
 	"github.com/gordonbeeming/shunt/internal/runner"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/gordonbeeming/shunt/internal/ui"
@@ -165,21 +164,6 @@ func Spin(ctx context.Context, app state.App, name, branch, fromBranch string) (
 			return errors.Join(err, cleanupFailedSpin(app, name, created.Container, created.Branch, fromBranch != ""))
 		}
 		created.CreatedAt = time.Now().Format(time.RFC3339)
-		if app.BaseSiding == "" && len(app.Sidings) == 0 {
-			src, _, pathErr := Paths(app, name)
-			if pathErr != nil {
-				return pathErr
-			}
-			commit, commitErr := proc.Run(ctx, "git", "-C", src, "rev-parse", "--verify", "HEAD^{commit}")
-			if commitErr != nil {
-				return commitErr
-			}
-			pinned, pinErr := fsclone.PinBaseCommit(ctx, app.ControlRepoPath, created.WorktreeRepoPath, strings.TrimSpace(commit.Stdout))
-			if pinErr != nil {
-				return pinErr
-			}
-			app.BaseSiding, app.BaseCommit = name, pinned
-		}
 		app.Sidings[name] = created
 		if err := state.SaveApp(app); err != nil {
 			if isCommittedStatePublication(err) {

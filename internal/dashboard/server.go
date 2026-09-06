@@ -147,7 +147,6 @@ type sidingView struct {
 	// deliberately released: Live stays true (a later claim needs somewhere to
 	// point), but nothing is bound, so the page must not badge it as serving.
 	Released      bool     `json:"released,omitempty"`
-	Base          bool     `json:"base"`
 	Phase         string   `json:"phase"`   // persisted: worktree | data | guest | parked
 	Runtime       string   `json:"runtime"` // observed: running | stopped | missing | runtime-unavailable
 	RuntimeDetail string   `json:"runtimeDetail,omitempty"`
@@ -262,7 +261,6 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 				Name:          sn,
 				Live:          live == sn,
 				Released:      live == sn && app.FrontDoorReleased,
-				Base:          app.BaseSiding == sn,
 				Phase:         string(phase),
 				Runtime:       runtimeState,
 				RuntimeDetail: runtimeDetail,

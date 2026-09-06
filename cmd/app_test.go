@@ -41,7 +41,7 @@ func TestAppAddReregistrationPreservesLifecycleStateAndClearsLegacyHost(t *testi
 	restore := stubAppAddDependencies(t)
 	defer restore()
 	existing := state.App{Version: state.StateVersion, Name: filepath.Base(repo), RepoPath: repo, ConfigDir: configDir,
-		ControlRepoPath: filepath.Join(configDir, ".control.git"), BaseSiding: "one", BaseCommit: "existing-base", LiveSiding: state.HostTarget,
+		ControlRepoPath: filepath.Join(configDir, ".control.git"), BaseCommit: "existing-base", LiveSiding: state.HostTarget,
 		Sidings: map[string]state.Siding{"one": {Name: "one", Branch: "feature", MaterializationPhase: state.PhaseParked}}}
 	if err := state.SaveApp(existing); err != nil {
 		t.Fatal(err)
@@ -54,7 +54,9 @@ func TestAppAddReregistrationPreservesLifecycleStateAndClearsLegacyHost(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if app.BaseSiding != "one" || app.BaseCommit != "existing-base" || app.LiveSiding != "" || app.Sidings["one"].MaterializationPhase != state.PhaseParked {
+	// BaseCommit round-trips untouched as legacy state; BaseSiding is no longer
+	// projected onto a lone siding.
+	if app.BaseSiding != "" || app.BaseCommit != "existing-base" || app.LiveSiding != "" || app.Sidings["one"].MaterializationPhase != state.PhaseParked {
 		t.Fatalf("re-registration reset lifecycle state: %#v", app)
 	}
 }
@@ -168,7 +170,7 @@ func TestAppAddRestoresExistingStateWhenRegistryPublicationFails(t *testing.T) {
 	restore := stubAppAddDependencies(t)
 	defer restore()
 	existing := state.App{Version: state.StateVersion, Name: filepath.Base(repo), RepoPath: repo, ConfigDir: configDir,
-		ControlRepoPath: filepath.Join(configDir, ".control.git"), BaseSiding: "one", BaseCommit: "original-base", Memory: "3g",
+		ControlRepoPath: filepath.Join(configDir, ".control.git"), BaseCommit: "original-base", Memory: "3g",
 		Sidings: map[string]state.Siding{"one": {Name: "one", MaterializationPhase: state.PhaseParked}}}
 	if err := state.SaveApp(existing); err != nil {
 		t.Fatal(err)

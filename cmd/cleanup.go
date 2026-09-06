@@ -40,7 +40,6 @@ var (
 
 func newCleanupCmd() *cobra.Command {
 	var force bool
-	var nextBase string
 	c := &cobra.Command{
 		Use:   "cleanup",
 		Short: "Select and permanently remove one or more sidings",
@@ -53,7 +52,7 @@ func newCleanupCmd() *cobra.Command {
 				return err
 			}
 			if app.Removal != nil {
-				return commandRemoveSiding(ctx, &app, app.Removal.Siding, force, "")
+				return commandRemoveSiding(ctx, &app, app.Removal.Siding, force)
 			}
 			if len(app.Sidings) == 0 {
 				fmt.Println("no sidings to clean up")
@@ -106,22 +105,12 @@ func newCleanupCmd() *cobra.Command {
 					}
 				}
 			}
-			removedBase := app.BaseSiding
-			successor, err := prepareBaseRemoval(app, selected, nextBase, in)
-			if err != nil {
-				return err
-			}
-			selected = orderBaseLast(selected, removedBase)
 			for _, name := range selected {
-				next := ""
-				if name == removedBase {
-					next = successor
-				}
 				var expected *removalSafety
 				if safety != nil {
 					expected = safety[name]
 				}
-				if err := commandRemoveSiding(ctx, &app, name, force, next, expected); err != nil {
+				if err := commandRemoveSiding(ctx, &app, name, force, expected); err != nil {
 					return fmt.Errorf("clean up siding %q: %w", name, err)
 				}
 			}
@@ -129,7 +118,6 @@ func newCleanupCmd() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVarP(&force, "force", "f", false, "skip live-siding and uncommitted-change safety checks")
-	c.Flags().StringVar(&nextBase, "next-base", "", "successor source base when the current base is selected, or `-` to keep the commit and leave no siding as base")
 	return c
 }
 

@@ -752,3 +752,59 @@ func assertWorktreeRegistration(t *testing.T, repo, path string, want bool) {
 		t.Fatalf("worktree registration for %q = %t, %v; want %t", path, registered, err, want)
 	}
 }
+
+func TestRemoteDefaultBranchRefusesRatherThanGuessing(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		if _, err := proc.Run(context.Background(), "git", append([]string{"-C", repo}, args...)...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("init", "-b", "wip")
+	if err := os.WriteFile(filepath.Join(repo, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "f")
+	run("-c", "user.name=T", "-c", "user.email=t@e", "-c", "commit.gpgsign=false", "commit", "-m", "c")
+
+	// No origin, and the only local branch is "wip" — not a conventional default.
+	// Seeding from HEAD here would hand the siding whatever this checkout was
+	// sitting on, which is the silent wrong answer this refusal exists to avoid.
+	_, err := RemoteDefaultBranch(context.Background(), repo)
+	if err == nil {
+		t.Fatal("RemoteDefaultBranch() = nil error, want a refusal rather than a guess at HEAD")
+	}
+	if !strings.Contains(err.Error(), "--branch") {
+		t.Errorf("error = %v, want it to name --branch as the way through", err)
+	}
+}
+
+func TestRemoteDefaultBranchFallsThroughAStaleOriginHead(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		if _, err := proc.Run(context.Background(), "git", append([]string{"-C", repo}, args...)...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "f")
+	run("-c", "user.name=T", "-c", "user.email=t@e", "-c", "commit.gpgsign=false", "commit", "-m", "c")
+
+	// origin/HEAD names a branch the remote no longer has. That is a stale local
+	// ref, not a missing default, so refusing while a perfectly good main sits
+	// right there would be the wrong answer.
+	run("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone")
+
+	got, err := RemoteDefaultBranch(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("RemoteDefaultBranch() = %v, want a fall through to a resolvable candidate", err)
+	}
+	if got != "main" {
+		t.Fatalf("RemoteDefaultBranch() = %q, want \"main\"", got)
+	}
+}

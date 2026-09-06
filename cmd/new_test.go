@@ -30,8 +30,13 @@ func TestNewInitializesWorktreeOnlyStateWithoutContractOrRegistry(t *testing.T) 
 	if app.Name != filepath.Base(repo) || app.RepoPath != repo || app.ConfigDir != configDir {
 		t.Fatalf("worktree-only project identity = %#v", app)
 	}
-	if app.ControlRepoPath != filepath.Join(configDir, ".control.git") || app.BaseCommit != commit || app.BaseSiding != "first" {
-		t.Fatalf("worktree-only source state = control %q, base %q @ %q", app.ControlRepoPath, app.BaseSiding, app.BaseCommit)
+	// No base is recorded: a siding seeds from the repository's default branch,
+	// resolved per run, so there is nothing to pin.
+	if app.ControlRepoPath != filepath.Join(configDir, ".control.git") {
+		t.Fatalf("worktree-only source state = control %q", app.ControlRepoPath)
+	}
+	if app.BaseSiding != "" || app.BaseCommit != "" {
+		t.Fatalf("legacy base fields were written: %q @ %q", app.BaseSiding, app.BaseCommit)
 	}
 	if app.Runner != "" || app.Start != "" || app.Stop != "" || app.Workdir != "" || app.AppHostPath != "" || len(app.FrontDoor) != 0 || len(app.DataVolumes) != 0 || len(app.Env) != 0 || len(app.Mounts) != 0 || len(app.PrebakeImages) != 0 || len(app.PrebakeBuilds) != 0 || len(app.Volumes) != 0 || app.Memory != "" || app.CPUs != "" || app.HealthPort != 0 || app.HealthPath != "" {
 		t.Fatalf("worktree-only state unexpectedly contains runtime configuration: %#v", app)
@@ -238,7 +243,9 @@ func TestAppAddEnrichesWorktreeOnlyStateAndRegisteredNewStillWorks(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if registered.Runner != "node" || registered.Start != "npm start" || registered.ControlRepoPath != before.ControlRepoPath || registered.BaseSiding != before.BaseSiding || registered.BaseCommit != commit {
+	// The legacy base fields are not asserted here: registration no longer has an
+	// opinion about them, so what they hold is whatever the earlier state did.
+	if registered.Runner != "node" || registered.Start != "npm start" || registered.ControlRepoPath != before.ControlRepoPath {
 		t.Fatalf("enriched registration = %#v", registered)
 	}
 	if got, ok := registered.Sidings["shell"]; !ok || got.Branch != before.Sidings["shell"].Branch {
@@ -334,72 +341,6 @@ func initializeCommandRepoAt(t *testing.T, repo string) string {
 	return sourceGitOutput(t, repo, "rev-parse", "HEAD")
 }
 
-func TestCreateSidingPinsLatestCleanBaseCommit(t *testing.T) {
-	app := newSourceStateTestApp(t, true)
-	baseSource, _, err := siding.Paths(app, app.BaseSiding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(baseSource, "source.txt"), []byte("new base\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	sourceGitOutput(t, baseSource, "add", "source.txt")
-	sourceGitOutput(t, baseSource, "commit", "-m", "advance base")
-	want := sourceGitOutput(t, baseSource, "rev-parse", "HEAD")
-	if want == app.BaseCommit {
-		t.Fatal("test setup did not advance the selected base")
-	}
-
-	app, _, err = createSiding(context.Background(), app.ConfigDir, "next", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	nextSource, _, err := siding.Paths(app, "next")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if head := sourceGitOutput(t, nextSource, "rev-parse", "HEAD"); head != want || app.BaseCommit != want {
-		t.Fatalf("new siding HEAD = %q, BaseCommit = %q, want %q", head, app.BaseCommit, want)
-	}
-	loaded, err := state.LoadApp(app.ConfigDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loaded.BaseCommit != want {
-		t.Fatalf("persisted BaseCommit = %q, want %q", loaded.BaseCommit, want)
-	}
-}
-
-func TestCreateSidingRejectsDirtyBaseBeforeCreatingWorktree(t *testing.T) {
-	app := newSourceStateTestApp(t, true)
-	baseSource, _, err := siding.Paths(app, app.BaseSiding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(baseSource, "untracked.txt"), []byte("dirty\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, _, err = createSiding(context.Background(), app.ConfigDir, "blocked", "", "")
-	if err == nil || !strings.Contains(err.Error(), "uncommitted or untracked") {
-		t.Fatalf("createSiding() error = %v", err)
-	}
-	blockedSource, _, pathErr := siding.Paths(app, "blocked")
-	if pathErr != nil {
-		t.Fatal(pathErr)
-	}
-	if _, statErr := os.Stat(blockedSource); !os.IsNotExist(statErr) {
-		t.Fatalf("dirty-base creation left worktree %q: %v", blockedSource, statErr)
-	}
-	loaded, loadErr := state.LoadApp(app.ConfigDir)
-	if loadErr != nil {
-		t.Fatal(loadErr)
-	}
-	if _, exists := loaded.Sidings["blocked"]; exists {
-		t.Fatal("dirty-base creation published siding state")
-	}
-}
-
 func TestCreateSidingDoesNotCompensateCommittedDurabilityError(t *testing.T) {
 	app := newSourceStateTestApp(t, true)
 	sentinel := errors.New("directory sync denied")
@@ -456,17 +397,6 @@ func TestCreateSidingCleansUpUnpublishedStateFailure(t *testing.T) {
 	}
 }
 
-func TestCreateFirstSidingSelectsItAsBase(t *testing.T) {
-	app := newSourceStateTestApp(t, false)
-	app, created, err := createSiding(context.Background(), app.ConfigDir, "first", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if app.BaseSiding != "first" || app.BaseCommit == "" || created.MaterializationPhase != state.PhaseWorktree {
-		t.Fatalf("first siding state = %#v, app base = %q @ %q", created, app.BaseSiding, app.BaseCommit)
-	}
-}
-
 func TestCreateSidingFencesRemovalFromCurrentState(t *testing.T) {
 	app := newSourceStateTestApp(t, true)
 	blockedControl := filepath.Join(app.ConfigDir, "blocked-control.git")
@@ -496,5 +426,45 @@ func TestCreateSidingFencesRemovalFromCurrentState(t *testing.T) {
 	}
 	if _, exists := loaded.Sidings["blocked"]; exists {
 		t.Fatal("removal-fenced create changed siding state")
+	}
+}
+
+// TestNewSucceedsWhileAnotherSidingIsDirty is the whole change stated as
+// behaviour. Creating a siding used to seed from a designated base siding's
+// HEAD and refuse outright when that siding had uncommitted or untracked files,
+// so an unrelated worktree someone else was mid-edit in blocked you. A siding
+// now starts from the repository's default branch, which nobody is editing.
+//
+// It creates a real siding rather than only resolving the start point: a
+// regression that restored the rejection inside createSiding would otherwise
+// slip past this test entirely.
+func TestNewSucceedsWhileAnotherSidingIsDirty(t *testing.T) {
+	app := newSourceStateTestApp(t, true)
+
+	if len(app.Sidings) == 0 {
+		t.Fatal("fixture has no siding to dirty; the test would prove nothing")
+	}
+	for name := range app.Sidings {
+		src, _, err := siding.Paths(app, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(src, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(src, "uncommitted.txt"), []byte("in flight"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	updated, created, err := createSiding(context.Background(), app.ConfigDir, "fresh", "", "")
+	if err != nil {
+		t.Fatalf("createSiding with every other worktree dirty = %v, want success", err)
+	}
+	if _, ok := updated.Sidings["fresh"]; !ok {
+		t.Fatal("siding was not recorded in state")
+	}
+	if created.Branch == "" {
+		t.Fatal("created siding has no branch")
 	}
 }
