@@ -21,6 +21,9 @@ func withHostReachSeams(t *testing.T) (published *[]string, deleted *[]string) {
 		resolveHostReach, hostReachPrepare = origResolve, origPrepare
 		hostReachPutServer, hostReachDeleteServer, execGuest = origPut, origDelete, origExec
 	})
+	origProbeSeam := probeBridge
+	t.Cleanup(func() { probeBridge = origProbeSeam })
+	probeBridge = func(context.Context, *caddy.Admin, string, string, string, string) error { return nil }
 	put, del := []string{}, []string{}
 	hostReachPrepare = func(context.Context) (*caddy.Admin, error) { return nil, nil }
 	hostReachPutServer = func(_ context.Context, _ *caddy.Admin, path string, _ []byte) error {
@@ -199,5 +202,48 @@ func TestUpSurfacesAGuestAddressFailureForHostReach(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no network address") {
 		t.Errorf("error = %v, want the underlying cause named", err)
+	}
+}
+
+// TestApplyHostReachWritesNoNamesWhenTheGuestCannotReachTheHost covers the
+// failure that is worse than not working: the macOS firewall drops the guest's
+// connection to the bridge without refusing it, so writing the hosts entries
+// anyway leaves every declared name resolving and then hanging, which reads as
+// the dependency being down rather than as shunt being blocked.
+func TestApplyHostReachWritesNoNamesWhenTheGuestCannotReachTheHost(t *testing.T) {
+	published, deleted := withHostReachSeams(t)
+	resolveHostReach = func(context.Context, []state.HostReach) ([]hostreach.Resolved, error) {
+		return []hostreach.Resolved{{Name: "vm-sql-dev", Port: 1433, Address: "10.0.0.4"}}, nil
+	}
+	origProbe := probeBridge
+	t.Cleanup(func() { probeBridge = origProbe })
+	probeBridge = func(context.Context, *caddy.Admin, string, string, string, string) error {
+		return errors.New("the firewall blocks incoming connections on the bridge")
+	}
+	var wroteHosts bool
+	execGuest = func(context.Context, string, ...string) (string, error) {
+		wroteHosts = true
+		return "", nil
+	}
+
+	app := state.App{Name: "alpha", HostReach: []state.HostReach{{Name: "vm-sql-dev", Port: 1433}}}
+	sd := state.Siding{Name: "one", Container: "guest", LastIP: "192.168.64.8"}
+
+	err := applyHostReach(context.Background(), app, sd)
+	if err == nil {
+		t.Fatal("applyHostReach() = nil error, want the blocked hop reported")
+	}
+	if !strings.Contains(err.Error(), "firewall") {
+		t.Errorf("error = %v, want the firewall named as the cause", err)
+	}
+	if wroteHosts {
+		t.Error("wrote guest hosts entries for a relay the guest cannot reach")
+	}
+	// The listener is published before the probe can run, so a failure has to take
+	// it back down rather than leave it holding a bridge port for nothing. Publish
+	// deletes first as well, so what matters is that the last delete is the
+	// listener that was published, not how many deletes there were.
+	if len(*published) == 0 || len(*deleted) == 0 || (*deleted)[len(*deleted)-1] != (*published)[0] {
+		t.Errorf("published %v but the cleanup removed %v", *published, *deleted)
 	}
 }

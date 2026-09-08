@@ -411,3 +411,13 @@ func lastIndexByte(s string, b byte) int {
 	}
 	return -1
 }
+
+// HostReachProbeServerName names the listener used to check that the bridge can
+// carry traffic.
+//
+// Namespaced per siding because sidings run concurrently: WithSidingOperation
+// takes the project lock shared, so two sidings can be starting at once, and one
+// probe's teardown must never remove the other's listener.
+func HostReachProbeServerName(app, siding string) string {
+	return fmt.Sprintf("reachprobe_%s_%s", app, siding)
+}
