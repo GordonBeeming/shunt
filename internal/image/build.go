@@ -15,6 +15,7 @@ import (
 
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/dockerdpolicy"
+	"github.com/gordonbeeming/shunt/internal/hostreach"
 	"github.com/gordonbeeming/shunt/internal/proc"
 )
 
@@ -70,10 +71,15 @@ func Tag() string {
 func GuestCapabilityCheck() []string {
 	return []string{
 		"sh", "-c",
-		`test -x "$1" && test -x "$2" && test -r "$3" && test "$(cat "$3")" = "$4"`,
+		// Every program the image is supposed to provide is named here. The version
+		// marker alone is not enough: it proves the assets that built the image,
+		// not that the build actually installed what they describe, which is how a
+		// binary went missing from a rebuilt image with the marker still correct.
+		`test -x "$1" && test -x "$2" && test -x "$3" && test -r "$4" && test "$(cat "$4")" = "$5"`,
 		"shunt-base-capability",
 		dockerdpolicy.EnsureCommand,
 		"/usr/local/bin/shunt-docker-api-admission",
+		hostreach.RelayProgram,
 		contentVersionMarker,
 		ContentVersion(),
 	}

@@ -93,6 +93,7 @@ var (
 	upStartApp         = StartApp
 	upWaitReady        = WaitReady
 	upActivate         = Activate
+	upApplyHostReach   = applyHostReach
 	upGuestIP          = container.IP
 	upClearAppLog      = func(ctx context.Context, guest string) {
 		_, _ = container.Exec(ctx, guest, "sh", "-c", "> "+appLogPath)
@@ -377,10 +378,18 @@ func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		}
 	}
 
+	// The relay is about the guest reaching out, and the front door is about the
+	// host reaching in. They are independent, so this runs before the bridge
+	// decision: an app started with --no-bridge still needs its dependencies.
+	// Hooking it into bridging is what made it silently never run.
+	if ip, e := upGuestIP(ctx, sd.Container); e == nil {
+		sd.LastIP = ip
+	}
+	if err := upApplyHostReach(ctx, app, sd); err != nil {
+		return sd, err
+	}
+
 	if !bridge {
-		if ip, e := upGuestIP(ctx, sd.Container); e == nil {
-			sd.LastIP = ip
-		}
 		return sd, nil
 	}
 	fmt.Fprintln(progress, "• bridging the declared routes to the host…")
@@ -1099,11 +1108,6 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 			return err
 		}
 		sd.Bridges[r.Key] = r.ListenPort
-	}
-	// Relay the endpoints only the host can reach. This runs after the guest has
-	// an address, because both ends of the relay are derived from it.
-	if err := applyHostReach(ctx, app, *sd); err != nil {
-		return err
 	}
 	return nil
 }

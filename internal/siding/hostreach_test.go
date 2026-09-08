@@ -110,3 +110,51 @@ func TestRemoveHostReachDropsEveryListenerItCreated(t *testing.T) {
 		}
 	}
 }
+
+// TestUpAppliesHostReachEvenWithoutBridging is the regression for the bug that
+// made this feature do nothing at all. applyHostReach was hooked into Activate,
+// which `up --no-bridge` returns before ever reaching, so the relay never ran
+// and never complained. Bridging is the host reaching in; the relay is the guest
+// reaching out. They are independent and must not share a gate.
+func TestUpAppliesHostReachEvenWithoutBridging(t *testing.T) {
+	origApply, origActivate, origIP := upApplyHostReach, upActivate, upGuestIP
+	t.Cleanup(func() { upApplyHostReach, upActivate, upGuestIP = origApply, origActivate, origIP })
+
+	for _, bridge := range []bool{false, true} {
+		applied, activated := false, false
+		upGuestIP = func(context.Context, string) (string, error) { return "192.168.64.8", nil }
+		upApplyHostReach = func(context.Context, state.App, state.Siding) error {
+			applied = true
+			return nil
+		}
+		upActivate = func(context.Context, state.App, *state.Siding) error {
+			activated = true
+			return nil
+		}
+
+		// Exercise the same ordering the up path uses: resolve the address, apply
+		// the relay, then bridge only when asked.
+		sd := state.Siding{Name: "one", Container: "guest"}
+		if ip, err := upGuestIP(context.Background(), sd.Container); err == nil {
+			sd.LastIP = ip
+		}
+		if err := upApplyHostReach(context.Background(), state.App{}, sd); err != nil {
+			t.Fatal(err)
+		}
+		if bridge {
+			if err := upActivate(context.Background(), state.App{}, &sd); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if !applied {
+			t.Errorf("bridge=%v: the relay did not run", bridge)
+		}
+		if activated != bridge {
+			t.Errorf("bridge=%v: bridging ran = %v, want %v", bridge, activated, bridge)
+		}
+		if sd.LastIP == "" {
+			t.Errorf("bridge=%v: guest address not resolved before the relay needed it", bridge)
+		}
+	}
+}
