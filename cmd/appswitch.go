@@ -153,6 +153,12 @@ func releaseAppFrontDoor(ctx context.Context, app state.App) error {
 		fmt.Printf("%s released %s front door\n", tick(), current.Name)
 		fmt.Printf("  freed %s\n", freedPortList(current.FrontDoor))
 		fmt.Println("  sidings and guests keep running")
+		// Naming what the ports reach now is the point. While released they
+		// answer from whatever is started on the host, and the same connection
+		// string reaches a different service before and after a reclaim with
+		// nothing on screen to mark the change.
+		fmt.Printf("  until reclaimed, %s reach whatever runs on the host, not %s's siding\n",
+			freedPortList(current.FrontDoor), current.Name)
 		fmt.Printf("  reclaim with `%s app switch %s`\n", bin(), current.Name)
 		return nil
 	})
@@ -245,6 +251,12 @@ func claimAppFrontDoor(ctx context.Context, app state.App, target string) error 
 		fmt.Printf("  (no live siding yet — `%s up <siding>` in %s to bring it up)\n", bin(), target)
 	}
 	fmt.Printf("%s %s is now active on its front-door ports\n", tick(), target)
+	// The other half of the release message. A port that reached a host process a
+	// moment ago now reaches a guest, and saying so is what stops the same command
+	// being run twice against two different things.
+	if app.LiveSiding != "" {
+		fmt.Printf("  %s now reach siding %s in its guest\n", freedPortList(app.FrontDoor), app.LiveSiding)
+	}
 	return nil
 }
 
