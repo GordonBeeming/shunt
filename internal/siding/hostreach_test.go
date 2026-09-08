@@ -23,7 +23,7 @@ func withHostReachSeams(t *testing.T) (published *[]string, deleted *[]string) {
 	})
 	origProbeSeam := probeBridge
 	t.Cleanup(func() { probeBridge = origProbeSeam })
-	probeBridge = func(context.Context, *caddy.Admin, string) error { return nil }
+	probeBridge = func(context.Context, *caddy.Admin, string, string, string) error { return nil }
 	put, del := []string{}, []string{}
 	hostReachPrepare = func(context.Context) (*caddy.Admin, error) { return nil, nil }
 	hostReachPutServer = func(_ context.Context, _ *caddy.Admin, path string, _ []byte) error {
@@ -217,7 +217,7 @@ func TestApplyHostReachWritesNoNamesWhenTheGuestCannotReachTheHost(t *testing.T)
 	}
 	origProbe := probeBridge
 	t.Cleanup(func() { probeBridge = origProbe })
-	probeBridge = func(context.Context, *caddy.Admin, string) error {
+	probeBridge = func(context.Context, *caddy.Admin, string, string, string) error {
 		return errors.New("the firewall blocks incoming connections on the bridge")
 	}
 	var wroteHosts bool

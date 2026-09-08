@@ -91,7 +91,7 @@ func applyHostReach(ctx context.Context, app state.App, sd state.Siding) error {
 	// worst version of the failure, where every declared name resolves and then
 	// hangs, which reads as the dependency being down.
 	if len(relays) > 0 {
-		if err := probeBridge(ctx, admin, bridge); err != nil {
+		if err := probeBridge(ctx, admin, app.Name, sd.Name, bridge); err != nil {
 			for _, r := range relays {
 				name := caddy.HostReachServerName(app.Name, sd.Name, r.Name, r.Port)
 				_ = hostReachDeleteServer(ctx, admin, "/config/apps/layer4/servers/"+name)
@@ -128,7 +128,7 @@ func applyHostReach(ctx context.Context, app state.App, sd state.Siding) error {
 //
 // The listener under test belongs to Caddy rather than to shunt, because the
 // firewall decides per program and Caddy is what holds the real entries.
-func probeBridgeReachable(ctx context.Context, admin *caddy.Admin, bridgeAddress string) error {
+func probeBridgeReachable(ctx context.Context, admin *caddy.Admin, app, siding, bridgeAddress string) error {
 	nonce := fmt.Sprintf("shunt-host-reach-probe-%d", time.Now().UnixNano())
 	echo, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -148,7 +148,7 @@ func probeBridgeReachable(ctx context.Context, admin *caddy.Admin, bridgeAddress
 		_, _ = conn.Write(buf)
 	}()
 
-	path, body, err := caddy.ServerForHostReach(caddy.HostReachProbeServerName(), bridgeAddress, hostreach.ProbePort, echo.Addr().String())
+	path, body, err := caddy.ServerForHostReach(caddy.HostReachProbeServerName(app, siding), bridgeAddress, hostreach.ProbePort(app, siding), echo.Addr().String())
 	if err != nil {
 		return err
 	}
@@ -158,7 +158,7 @@ func probeBridgeReachable(ctx context.Context, admin *caddy.Admin, bridgeAddress
 	}
 	defer func() { _ = hostReachDeleteServer(ctx, admin, path) }()
 
-	target := net.JoinHostPort(bridgeAddress, strconv.Itoa(hostreach.ProbePort))
+	target := net.JoinHostPort(bridgeAddress, strconv.Itoa(hostreach.ProbePort(app, siding)))
 	if err := exchangeNonce(target, nonce); err != nil {
 		return fmt.Errorf(`shunt cannot carry traffic on the container bridge at %s, so host-reach would resolve every declared name and then hang.
 

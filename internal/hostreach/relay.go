@@ -2,6 +2,7 @@ package hostreach
 
 import (
 	"fmt"
+	"hash/fnv"
 	"net"
 	"sort"
 )
@@ -20,9 +21,26 @@ const loopbackBase = 10
 // app: the real port is preserved at both ends of the chain.
 const bridgePortBase = 47000
 
-// ProbePort carries the reachability check. It sits below the entry ports so a
-// plan can never allocate it, and it is only bound for the length of one check.
-const ProbePort = bridgePortBase - 1
+// The reachability check binds a port below the entry ports, so a plan can never
+// allocate one, and holds it only for the length of one check.
+const (
+	probePortBase  = 46000
+	probePortCount = bridgePortBase - probePortBase
+)
+
+// ProbePort gives a siding its own port for the check. Sidings start
+// concurrently, and two probes on one port would make the second start fail for
+// a reason that has nothing to do with the siding.
+//
+// Derived from the name rather than allocated, so nothing has to track it. Two
+// sidings can still land on the same port, which is why the check sends a value
+// and requires that same value back: a crossed probe fails rather than passing
+// on someone else's answer.
+func ProbePort(app, siding string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(app + "\x00" + siding))
+	return probePortBase + int(h.Sum32()%uint32(probePortCount))
+}
 
 // Relay is one resolved endpoint with both ends of its chain assigned:
 //
