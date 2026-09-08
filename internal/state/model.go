@@ -185,6 +185,22 @@ type App struct {
 	Removal           *RemovalOperation `json:"removal,omitempty"`
 }
 
+// HostReach declares a name the app resolves that only the host can reach —
+// typically a private endpoint behind a VPN. shunt relays it: the guest gets a
+// hosts entry and a local listener, and the host end dials the real address over
+// whatever interface holds its route.
+//
+// Address is deliberately optional and normally empty. These addresses come from
+// private DNS and move when an endpoint is recreated, so a committed one is a
+// second copy of a snapshot with nothing to refresh it. Resolving on the host at
+// guest start inherits whatever the host currently believes instead. Set Address
+// only for a name the host has no record for at all.
+type HostReach struct {
+	Name    string `json:"name"`
+	Port    int    `json:"port"`
+	Address string `json:"address,omitempty"`
+}
+
 // PrebakeBuild declares one local image build that feeds shunt's shared,
 // daemon-free host cache.
 type PrebakeBuild struct {

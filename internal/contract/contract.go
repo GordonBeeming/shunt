@@ -33,6 +33,10 @@ type Contract struct {
 	FrontDoor []FrontDoorRoute  `json:"frontDoor"` // stable front-door routes
 	Env       map[string]string `json:"env"`       // extra guest env (Aspire parameters, secrets)
 	Mounts    []state.MountSpec `json:"mounts"`    // explicit extra host->guest mounts (e.g. user-secrets)
+	// HostReach names endpoints only the host can reach, such as a private
+	// address behind a VPN. shunt relays each one into the guest; see
+	// state.HostReach for why an address is not normally declared here.
+	HostReach []state.HostReach `json:"hostReach"`
 	// Registry dependency-image tags incorporated into an immutable,
 	// content-addressed cache generation. Per-image Docker archives are derived
 	// exports loaded into each guest; `shunt warm` refreshes every tag.
