@@ -20,6 +20,10 @@ const loopbackBase = 10
 // app: the real port is preserved at both ends of the chain.
 const bridgePortBase = 47000
 
+// ProbePort carries the reachability check. It sits below the entry ports so a
+// plan can never allocate it, and it is only bound for the length of one check.
+const ProbePort = bridgePortBase - 1
+
 // Relay is one resolved endpoint with both ends of its chain assigned:
 //
 //	guest: GuestAddress:Port  ->  bridge: BridgeAddress:BridgePort  ->  Address:Port

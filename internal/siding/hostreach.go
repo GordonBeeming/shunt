@@ -3,14 +3,21 @@ package siding
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/hostreach"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
+
+// probeTimeout bounds the reachability check. Both ends are on this machine, so
+// a slow answer means the connection is not being carried rather than that the
+// network is far away.
+const probeTimeout = 3 * time.Second
 
 // Seams so the relay can be tested without a guest or a running Caddy.
 var (
@@ -22,6 +29,7 @@ var (
 	hostReachDeleteServer = func(ctx context.Context, a *caddy.Admin, path string) error {
 		return a.DeleteIfExists(ctx, path)
 	}
+	probeBridge = probeBridgeReachable
 )
 
 // applyHostReach relays the endpoints only the host can reach into a running
@@ -75,6 +83,23 @@ func applyHostReach(ctx context.Context, app state.App, sd state.Siding) error {
 		fmt.Fprintf(os.Stdout, "• reaching %s\n", r)
 	}
 
+	// Prove the guest can actually reach the host end before writing any names.
+	// This hop fails silently: the macOS application firewall drops inbound
+	// connections to an unapproved binary on a non-loopback address without
+	// refusing them, so the guest gets a hanging connect and the host end never
+	// sees the attempt. Writing the hosts entries first would turn that into the
+	// worst version of the failure, where every declared name resolves and then
+	// hangs, which reads as the dependency being down.
+	if len(relays) > 0 {
+		if err := probeBridge(ctx, admin, bridge); err != nil {
+			for _, r := range relays {
+				name := caddy.HostReachServerName(app.Name, sd.Name, r.Name, r.Port)
+				_ = hostReachDeleteServer(ctx, admin, "/config/apps/layer4/servers/"+name)
+			}
+			return err
+		}
+	}
+
 	config, err := hostreach.RelayConfig(relays)
 	if err != nil {
 		return err
@@ -86,6 +111,91 @@ func applyHostReach(ctx context.Context, app state.App, sd state.Siding) error {
 	script := hostreach.GuestScript(string(config), hostreach.MergeHosts(existing, relays))
 	if _, err := execGuest(ctx, sd.Container, "sh", "-c", script); err != nil {
 		return fmt.Errorf("start the guest host-reach relay: %w", err)
+	}
+	return nil
+}
+
+// probeBridge proves the host end can accept a connection on the container
+// bridge and carry bytes through it, by moving a nonce through a listener Caddy
+// holds for the length of the check.
+//
+// A connect is not enough to prove it. The macOS application firewall blocks
+// inbound connections to an unapproved program on any address other than
+// loopback, and it blocks them after the handshake: the kernel completes the
+// connection, the program never accepts it, and the caller sees a connect that
+// succeeds and then a read that never returns. A check that only dials would
+// pass on exactly the machines where this is broken.
+//
+// The listener under test belongs to Caddy rather than to shunt, because the
+// firewall decides per program and Caddy is what holds the real entries.
+func probeBridgeReachable(ctx context.Context, admin *caddy.Admin, bridgeAddress string) error {
+	nonce := fmt.Sprintf("shunt-host-reach-probe-%d", time.Now().UnixNano())
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("start the host-reach probe listener: %w", err)
+	}
+	defer echo.Close()
+	go func() {
+		conn, err := echo.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, len(nonce))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return
+		}
+		_, _ = conn.Write(buf)
+	}()
+
+	path, body, err := caddy.ServerForHostReach(caddy.HostReachProbeServerName(), bridgeAddress, hostreach.ProbePort, echo.Addr().String())
+	if err != nil {
+		return err
+	}
+	_ = hostReachDeleteServer(ctx, admin, path)
+	if err := hostReachPutServer(ctx, admin, path, body); err != nil {
+		return fmt.Errorf("publish the host-reach probe listener: %w", err)
+	}
+	defer func() { _ = hostReachDeleteServer(ctx, admin, path) }()
+
+	target := net.JoinHostPort(bridgeAddress, strconv.Itoa(hostreach.ProbePort))
+	if err := exchangeNonce(target, nonce); err != nil {
+		return fmt.Errorf(`shunt cannot carry traffic on the container bridge at %s, so host-reach would resolve every declared name and then hang.
+
+The macOS application firewall blocks incoming connections to programs it has
+not been told to allow, on every address except loopback, and it blocks them
+without refusing. shunt's front door is unaffected because it listens on
+loopback only. hostReach is the one part of shunt that binds the bridge.
+
+Firewall state:
+  /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
+
+Underlying failure: %w`, target, err)
+	}
+	return nil
+}
+
+// exchangeNonce sends a value through the bridge listener and requires the same
+// value back. Reading the echo rather than trusting the dial is the whole point:
+// a blocked listener still completes the handshake.
+func exchangeNonce(target, nonce string) error {
+	conn, err := net.DialTimeout("tcp", target, probeTimeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(probeTimeout)); err != nil {
+		return err
+	}
+	if _, err := conn.Write([]byte(nonce)); err != nil {
+		return err
+	}
+	buf := make([]byte, len(nonce))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+	if string(buf) != nonce {
+		return fmt.Errorf("the bridge listener answered with something other than the probe value")
 	}
 	return nil
 }

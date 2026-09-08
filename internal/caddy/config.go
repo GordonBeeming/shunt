@@ -411,3 +411,11 @@ func lastIndexByte(s string, b byte) int {
 	}
 	return -1
 }
+
+// HostReachProbeServerName names the listener used to check that the bridge can
+// carry traffic. One fixed name: the check is never concurrent with itself for a
+// given front door, and a stable name means an interrupted run leaves one known
+// server to replace rather than an accumulating set.
+func HostReachProbeServerName() string {
+	return "reach_probe"
+}
