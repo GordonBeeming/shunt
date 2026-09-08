@@ -3,6 +3,7 @@ package hostreach
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 
@@ -201,5 +202,48 @@ func TestRelayConfigOmitsTheRealAddress(t *testing.T) {
 	}
 	if !strings.Contains(string(config), "192.168.64.1") {
 		t.Errorf("relay config is missing its bridge target:\n%s", config)
+	}
+}
+
+func TestResolveRejectsUnusableEntriesAlongsideResolutionFailures(t *testing.T) {
+	// Port 0 is the one worth naming: it binds an ephemeral port rather than
+	// failing, so the relay would come up listening where nothing connects.
+	_, err := resolve(context.Background(), []state.HostReach{
+		{Name: "", Port: 443},
+		{Name: "bad-port", Port: 0},
+		{Name: "huge-port", Port: 70000},
+		{Name: "unresolvable", Port: 443},
+	}, stubLookup(nil), noInterface)
+	if err == nil {
+		t.Fatal("resolve() = nil error, want every unusable entry reported")
+	}
+	for _, want := range []string{"no name", "bad-port", "huge-port", "unresolvable"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error is missing %q:\n%s", want, err)
+		}
+	}
+}
+
+func TestPlanRefusesRatherThanBuildingAnInvalidAddress(t *testing.T) {
+	// The arithmetic used to run the third octet past 255, producing something
+	// like 127.0.267.4 — which reads as an address and only fails at bind time.
+	if _, err := loopbackAddress(maxEntries); err == nil {
+		t.Error("loopbackAddress() accepted an index past the usable space")
+	}
+	last, err := loopbackAddress(maxEntries - 1)
+	if err != nil {
+		t.Fatalf("last usable index rejected: %v", err)
+	}
+	if net.ParseIP(last) == nil {
+		t.Errorf("last usable address %q is not a valid IP", last)
+	}
+	for _, i := range []int{0, 1, perThirdOctet - 1, perThirdOctet, maxEntries - 1} {
+		addr, err := loopbackAddress(i)
+		if err != nil {
+			t.Fatalf("index %d: %v", i, err)
+		}
+		if net.ParseIP(addr) == nil {
+			t.Errorf("index %d produced %q, which is not a valid IP", i, addr)
+		}
 	}
 }

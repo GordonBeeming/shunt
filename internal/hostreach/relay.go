@@ -63,26 +63,37 @@ func Plan(bridgeAddress string, resolved []Resolved) ([]Relay, error) {
 		if err != nil {
 			return nil, err
 		}
+		bridgePort := bridgePortBase + i
+		if bridgePort > 65535 {
+			return nil, fmt.Errorf("too many hostReach entries: bridge port %d is above the maximum", bridgePort)
+		}
 		relays = append(relays, Relay{
 			Resolved:      entry,
 			GuestAddress:  guestAddress,
 			BridgeAddress: bridgeAddress,
-			BridgePort:    bridgePortBase + i,
+			BridgePort:    bridgePort,
 		})
 	}
 	return relays, nil
 }
 
+// perThirdOctet is how many addresses each 127.0.N.x block contributes: the
+// range from loopbackBase to 254, leaving .255 alone as the broadcast-shaped
+// address.
+const perThirdOctet = 255 - loopbackBase
+
+// maxEntries is the whole usable space, 127.0.0.10 through 127.0.255.254.
+const maxEntries = 256 * perThirdOctet
+
 // loopbackAddress numbers entries through 127.0.0.x, then 127.0.1.x and beyond.
-// 127/8 is a /8, so the space is effectively unbounded; the error exists to fail
-// loudly rather than wrap around and hand two names the same address.
+// Both octets are bounded so an out-of-range index fails here with a clear
+// message rather than producing something like 127.0.267.4, which reads as an
+// address and only fails much later at bind time.
 func loopbackAddress(index int) (string, error) {
-	if index < 0 || index > 0xFFFF {
-		return "", fmt.Errorf("too many hostReach entries (%d)", index)
+	if index < 0 || index >= maxEntries {
+		return "", fmt.Errorf("too many hostReach entries: %d exceeds the %d addresses available in 127.0.0.0/16", index+1, maxEntries)
 	}
-	third := index / 245
-	fourth := loopbackBase + index%245
-	return fmt.Sprintf("127.0.%d.%d", third, fourth), nil
+	return fmt.Sprintf("127.0.%d.%d", index/perThirdOctet, loopbackBase+index%perThirdOctet), nil
 }
 
 // BridgeAddressFor derives the host's address on the container bridge from a

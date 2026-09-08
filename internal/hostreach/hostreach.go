@@ -59,6 +59,20 @@ func resolve(ctx context.Context, entries []state.HostReach, lookup lookupFunc, 
 	resolved := make([]Resolved, 0, len(entries))
 	var failures []string
 	for _, entry := range entries {
+		// Validate before resolving, and collect rather than return: a contract
+		// with several bad entries should report them together, like the
+		// resolution failures below.
+		if entry.Name == "" {
+			failures = append(failures, "an entry has no name")
+			continue
+		}
+		if entry.Port < 1 || entry.Port > 65535 {
+			// Port 0 is the trap worth naming: it binds an ephemeral port in the
+			// guest rather than failing, so the relay would come up listening
+			// somewhere nothing connects to.
+			failures = append(failures, fmt.Sprintf("%s: port %d is not a usable port", entry.Name, entry.Port))
+			continue
+		}
 		address := entry.Address
 		if address == "" {
 			lookupCtx, cancel := context.WithTimeout(ctx, resolveTimeout)
@@ -71,6 +85,10 @@ func resolve(ctx context.Context, entries []state.HostReach, lookup lookupFunc, 
 				continue
 			}
 			address = addrs[0]
+		}
+		if net.ParseIP(address) == nil {
+			failures = append(failures, fmt.Sprintf("%s: %q is not an address", entry.Name, address))
+			continue
 		}
 		resolved = append(resolved, Resolved{
 			Name:      entry.Name,

@@ -3,6 +3,8 @@ package hostreach
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 )
 
@@ -40,7 +42,7 @@ func RelayConfig(relays []Relay) ([]byte, error) {
 			Name:         r.Name,
 			GuestAddress: r.GuestAddress,
 			Port:         r.Port,
-			BridgeTarget: fmt.Sprintf("%s:%d", r.BridgeAddress, r.BridgePort),
+			BridgeTarget: net.JoinHostPort(r.BridgeAddress, strconv.Itoa(r.BridgePort)),
 		})
 	}
 	return json.Marshal(entries)
@@ -98,9 +100,13 @@ func GuestScript(config, hosts string) string {
 		"if [ -f /run/shunt/host-reach.pid ]; then kill \"$(cat /run/shunt/host-reach.pid)\" 2>/dev/null || true; fi",
 		"sleep 0.2",
 		fmt.Sprintf("cat > %s <<'SHUNT_RELAY_CONFIG'\n%s\nSHUNT_RELAY_CONFIG", ConfigPath, config),
-		"cat > /run/shunt/hosts.new <<'SHUNT_HOSTS'\n" + hosts + "\nSHUNT_HOSTS",
-		"cp /run/shunt/hosts.new /etc/hosts",
-		"rm -f /run/shunt/hosts.new",
+		// Write beside /etc/hosts and rename over it. A copy that is interrupted
+		// leaves the file half-written, and the half that goes missing is whatever
+		// else put entries there. Rename is atomic, so the file is either the old
+		// one or the new one and never part of both. The temp file has to be on
+		// the same filesystem for that, which is why it is not under /run.
+		"cat > /etc/hosts.shunt.tmp <<'SHUNT_HOSTS'\n" + hosts + "\nSHUNT_HOSTS",
+		"mv /etc/hosts.shunt.tmp /etc/hosts",
 		fmt.Sprintf("%s --config %s >>/var/log/shunt-host-reach.log 2>&1 &", RelayProgram, ConfigPath),
 		"echo $! > /run/shunt/host-reach.pid",
 	}, "\n")

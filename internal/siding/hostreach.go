@@ -3,7 +3,9 @@ package siding
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 
 	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/hostreach"
@@ -60,7 +62,7 @@ func applyHostReach(ctx context.Context, app state.App, sd state.Siding) error {
 	}
 	for _, r := range relays {
 		name := caddy.HostReachServerName(app.Name, sd.Name, r.Name, r.Port)
-		path, body, err := caddy.ServerForHostReach(name, r.BridgeAddress, r.BridgePort, fmt.Sprintf("%s:%d", r.Address, r.Port))
+		path, body, err := caddy.ServerForHostReach(name, r.BridgeAddress, r.BridgePort, net.JoinHostPort(r.Address, strconv.Itoa(r.Port)))
 		if err != nil {
 			return err
 		}
