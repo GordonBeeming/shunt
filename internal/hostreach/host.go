@@ -55,6 +55,29 @@ type HostConfig struct {
 	Upstreams    map[string]string `json:"upstreams"`
 }
 
+// maxLine bounds a control line. bufio's ReadString grows until it finds a
+// newline, so a peer that never sends one would make this side allocate without
+// limit. Every line in this protocol is short.
+const maxLine = 512
+
+// readLine reads one line and refuses anything longer than maxLine. It reads
+// through the connection's shared reader, so bytes that arrive with the line are
+// kept for whatever reads next.
+func readLine(r *bufio.Reader) (string, error) {
+	var b strings.Builder
+	for i := 0; i < maxLine; i++ {
+		c, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if c == '\n' {
+			return b.String(), nil
+		}
+		b.WriteByte(c)
+	}
+	return "", errors.New("the peer sent an over-long line")
+}
+
 // UpstreamKey names an endpoint in the host config.
 func UpstreamKey(name string, port int) string {
 	return name + ":" + strconv.Itoa(port)
@@ -155,7 +178,7 @@ func serveOne(ctx context.Context, target string, cfg HostConfig) error {
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return err
 	}
-	line, err := reader.ReadString('\n')
+	line, err := readLine(reader)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			// The guest closed an idle connection, most likely because its relay
@@ -174,7 +197,7 @@ func greet(conn net.Conn, reader *bufio.Reader, token string) error {
 	if _, err := fmt.Fprintf(conn, "SHUNT1 %s\n", token); err != nil {
 		return fmt.Errorf("greet the guest: %w", err)
 	}
-	line, err := reader.ReadString('\n')
+	line, err := readLine(reader)
 	if err != nil {
 		return fmt.Errorf("read the guest's answer: %w", err)
 	}
@@ -224,7 +247,9 @@ func handle(ctx context.Context, conn net.Conn, reader *bufio.Reader, cfg HostCo
 	dialer := net.Dialer{Timeout: dialTimeout}
 	target, err := dialer.DialContext(ctx, "tcp", upstream)
 	if err != nil {
-		_, _ = fmt.Fprintf(conn, "FAIL %v\n", err)
+		// Named, not described. The dial error carries the private address, and
+		// the guest is deliberately never told it; the detail is logged here.
+		_, _ = fmt.Fprintf(conn, "FAIL could not reach %s\n", name)
 		return fmt.Errorf("dial %s for %s: %w", upstream, name, err)
 	}
 	defer target.Close()
@@ -269,5 +294,9 @@ func splice(conn net.Conn, reader *bufio.Reader, target net.Conn) {
 		}
 		done <- struct{}{}
 	}()
+	// Both directions. Each half closes the peer's write side when it ends, so
+	// the other sees EOF and finishes; returning after the first would let the
+	// deferred closes truncate a response the client is still owed.
+	<-done
 	<-done
 }

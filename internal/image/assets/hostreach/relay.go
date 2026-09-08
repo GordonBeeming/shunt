@@ -58,11 +58,39 @@ const handshakeTimeout = 5 * time.Second
 // dialWait is how long an app connection waits for a pooled host connection when
 // the pool is momentarily empty. The host refills continuously, so this covers a
 // burst rather than an outage.
-const dialWait = 10 * time.Second
+const dialWait = 30 * time.Second
+
+// requestTimeout bounds the wait for the host's answer to a DIAL. It has to
+// exceed the host's own dial timeout: an upstream across a VPN can take seconds
+// to connect, and a shorter wait here discards a connection the host is about to
+// answer on, then retries into the same wall.
+const requestTimeout = 20 * time.Second
 
 // idleDepth caps the pooled connections. A host that over-supplies cannot grow
 // this without bound.
 const idleDepth = 64
+
+// maxLine bounds a control line. bufio's ReadString grows until it finds a
+// newline, so a peer that never sends one would make this side allocate without
+// limit. Every line in this protocol is short.
+const maxLine = 512
+
+// readLine reads one line and refuses anything longer than maxLine, through the
+// connection's shared reader so bytes arriving with the line are kept.
+func readLine(r *bufio.Reader) (string, error) {
+	var b strings.Builder
+	for i := 0; i < maxLine; i++ {
+		c, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if c == '\n' {
+			return b.String(), nil
+		}
+		b.WriteByte(c)
+	}
+	return "", errors.New("the peer sent an over-long line")
+}
 
 // entry is one relayed endpoint, written by shunt after the guest starts.
 type entry struct {
@@ -199,7 +227,7 @@ func authenticate(conn net.Conn, reader *bufio.Reader, token string) error {
 	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
 		return err
 	}
-	line, err := reader.ReadString('\n')
+	line, err := readLine(reader)
 	if err != nil {
 		return fmt.Errorf("read the greeting: %w", err)
 	}
@@ -298,6 +326,10 @@ func forward(e entry, client net.Conn, p *pool) {
 	// that arrived with the READY line.
 	go copyFrom(client, hc.reader, done)
 	go copyStream(hc.conn, client, done)
+	// Both directions. Each half closes the peer's write side when it ends, so
+	// the other sees EOF and finishes; returning after the first would let the
+	// deferred closes truncate a response the application is still owed.
+	<-done
 	<-done
 }
 
@@ -327,13 +359,13 @@ func reserve(e entry, p *pool) (*hostConn, error) {
 }
 
 func request(hc *hostConn, e entry) error {
-	if err := hc.conn.SetDeadline(time.Now().Add(checkTimeout)); err != nil {
+	if err := hc.conn.SetDeadline(time.Now().Add(requestTimeout)); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(hc.conn, "DIAL %s %d\n", e.Name, e.Port); err != nil {
 		return fmt.Errorf("ask the host for %s: %w", e.Name, err)
 	}
-	line, err := hc.reader.ReadString('\n')
+	line, err := readLine(hc.reader)
 	if err != nil {
 		return fmt.Errorf("no answer from the host for %s: %w", e.Name, err)
 	}

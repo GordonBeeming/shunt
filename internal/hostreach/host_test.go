@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -126,7 +127,7 @@ func TestHostRefusesAnEndpointTheContractNeverDeclared(t *testing.T) {
 	if _, err := conn.Write([]byte("DIAL undeclared 443\n")); err != nil {
 		t.Fatal(err)
 	}
-	answer := readLine(t, conn)
+	answer := readLineFrom(t, conn)
 	if !strings.HasPrefix(answer, "FAIL") {
 		t.Errorf("answer = %q, want a refusal for an undeclared endpoint", answer)
 	}
@@ -146,7 +147,7 @@ func TestHostAnswersTheProbeItselfWithoutDiallingOut(t *testing.T) {
 	if _, err := conn.Write([]byte("DIAL " + ProbeName + " 1\n")); err != nil {
 		t.Fatal(err)
 	}
-	if answer := readLine(t, conn); answer != "READY" {
+	if answer := readLineFrom(t, conn); answer != "READY" {
 		t.Fatalf("answer = %q, want READY", answer)
 	}
 	if _, err := conn.Write([]byte("a-nonce")); err != nil {
@@ -190,7 +191,7 @@ func TestHostCarriesBytesToADeclaredUpstream(t *testing.T) {
 	if _, err := conn.Write([]byte("DIAL vm-sql-dev 1433\n")); err != nil {
 		t.Fatal(err)
 	}
-	if answer := readLine(t, conn); answer != "READY" {
+	if answer := readLineFrom(t, conn); answer != "READY" {
 		t.Fatalf("answer = %q, want READY", answer)
 	}
 	if _, err := conn.Write([]byte("hello")); err != nil {
@@ -238,13 +239,125 @@ func waitForConn(t *testing.T, g *fakeGuest) net.Conn {
 	}
 }
 
-func readLine(t *testing.T, conn net.Conn) string {
-	t.Helper()
-	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	line, err := bufio.NewReader(io.LimitReader(conn, 512)).ReadString('\n')
+func TestHostDoesNotTellTheGuestWhyAnUpstreamFailed(t *testing.T) {
+	// The whole point of keeping addresses on this side is that the guest never
+	// carries a copy of the host's private network. A dial error names the
+	// address, so it must not be handed back.
+	g := newFakeGuest(t, "tok")
+	cfg := HostConfig{
+		GuestAddress: "127.0.0.1", Token: "tok", ProbeName: ProbeName,
+		// A closed port on loopback, so the dial is refused at once. An
+		// unroutable address would hang for the full dial timeout instead.
+		Upstreams: map[string]string{UpstreamKey("vm-sql-dev", 1433): "127.0.0.1:1"},
+	}
+	serveAgainst(t, g, cfg)
+
+	conn := waitForConn(t, g)
+	if _, err := conn.Write([]byte("DIAL vm-sql-dev 1433\n")); err != nil {
+		t.Fatal(err)
+	}
+	answer := readLineFrom(t, conn)
+	if !strings.HasPrefix(answer, "FAIL") {
+		t.Fatalf("answer = %q, want a failure", answer)
+	}
+	if strings.Contains(answer, "127.0.0.1") || strings.Contains(answer, "connect") {
+		t.Errorf("the guest was told where the endpoint is, or why: %q", answer)
+	}
+	if !strings.Contains(answer, "vm-sql-dev") {
+		t.Errorf("answer = %q, want the endpoint named so the failure is actionable", answer)
+	}
+}
+
+func TestHostCarriesTheWholeResponseAfterTheClientHalfCloses(t *testing.T) {
+	// A client that finishes sending and half-closes must still receive the rest
+	// of the response. Returning as soon as either direction ends truncates it.
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("no answer from the host: %v", err)
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = upstream.Close() })
+	body := strings.Repeat("payload-", 4096)
+	go func() {
+		conn, err := upstream.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn)
+		_, _ = conn.Write([]byte(body))
+	}()
+
+	g := newFakeGuest(t, "tok")
+	cfg := HostConfig{
+		GuestAddress: "127.0.0.1", Token: "tok", ProbeName: ProbeName,
+		Upstreams: map[string]string{UpstreamKey("vm-sql-dev", 1433): upstream.Addr().String()},
+	}
+	serveAgainst(t, g, cfg)
+
+	conn := waitForConn(t, g)
+	if _, err := conn.Write([]byte("DIAL vm-sql-dev 1433\n")); err != nil {
+		t.Fatal(err)
+	}
+	if answer := readLineFrom(t, conn); answer != "READY" {
+		t.Fatalf("answer = %q, want READY", answer)
+	}
+	if _, err := conn.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	// Half-close, which is what makes the upstream send and what used to end the
+	// splice before the response arrived.
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		if err := tcp.CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("reading the response: %v", err)
+	}
+	if len(got) != len(body) {
+		t.Errorf("got %d bytes of a %d byte response; it was truncated", len(got), len(body))
+	}
+}
+
+func TestHostRefusesAnOverLongControlLine(t *testing.T) {
+	// bufio grows until it finds a newline, so a peer that never sends one would
+	// make this side allocate without limit.
+	g := newFakeGuest(t, "tok")
+	cfg := HostConfig{GuestAddress: "127.0.0.1", Token: "tok", ProbeName: ProbeName}
+	serveAgainst(t, g, cfg)
+
+	conn := waitForConn(t, g)
+	flood := strings.Repeat("A", 4096)
+	if _, err := conn.Write([]byte(flood)); err != nil {
+		t.Fatal(err)
+	}
+	// The host drops the connection rather than buffering, so the read ends. How
+	// it ends is not the point and varies between a clean close and a reset; a
+	// timeout is the failure, because that is the host still holding the bytes.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err := io.ReadAll(conn)
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		t.Error("the host kept buffering an over-long line instead of dropping it")
+	}
+}
+
+func readLineFrom(t *testing.T, conn net.Conn) string {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var b strings.Builder
+	buf := make([]byte, 1)
+	for i := 0; i < 512; i++ {
+		if _, err := conn.Read(buf); err != nil {
+			t.Fatalf("no answer from the host: %v", err)
+		}
+		if buf[0] == '\n' {
+			break
+		}
+		b.WriteByte(buf[0])
 	}
 	_ = conn.SetReadDeadline(time.Time{})
-	return strings.TrimSpace(line)
+	return strings.TrimSpace(b.String())
 }

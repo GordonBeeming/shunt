@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 )
 
 // loopbackBase is where per-entry guest addresses start. Each entry gets its own
@@ -105,7 +106,7 @@ func GuestControlAddress(guestIP string) (string, error) {
 	if net.ParseIP(guestIP) == nil {
 		return "", fmt.Errorf("invalid guest address %q", guestIP)
 	}
-	return fmt.Sprintf("%s:%d", guestIP, ControlPort), nil
+	return net.JoinHostPort(guestIP, strconv.Itoa(ControlPort)), nil
 }
 
 // NewToken generates a siding's shared secret.
