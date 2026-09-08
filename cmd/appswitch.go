@@ -107,8 +107,8 @@ func resolveAppSwitchTarget(args []string) (app state.App, target string, err er
 // place: a run on the host whose containers are still up after its app was
 // stopped, because stopping an orchestrator does not stop what it started.
 //
-// The original error is returned unchanged when it is not a bind conflict, or
-// when nothing can be found holding the port.
+// A failure that is not a bind conflict comes back untouched. One that is
+// always gains the port, and gains the holder too when it can be found.
 func describePortConflict(ctx context.Context, err error) error {
 	port, conflict := caddy.PortInUse(err)
 	if !conflict || port == 0 {
@@ -116,11 +116,15 @@ func describePortConflict(ctx context.Context, err error) error {
 	}
 	holder := portcheck.Holder(ctx, port)
 	if holder == "" {
-		return fmt.Errorf("%w\n\nSomething else is listening on port %d. If the front door was released to run on the host, that run's containers keep their ports after its app is stopped.", err, port)
+		return fmt.Errorf("%w\n\nSomething else is listening on port %d.\nA front door released to run on the host is reclaimed against that run's\ncontainers, which keep their ports after its app is stopped", err, port)
 	}
-	return fmt.Errorf("%w\n\nPort %d is held by %s. If the front door was released to run on the host, that run's containers keep their ports after its app is stopped.", err, port, holder)
+	return fmt.Errorf("%w\n\nPort %d is held by %s.\nA front door released to run on the host is reclaimed against that run's\ncontainers, which keep their ports after its app is stopped", err, port, holder)
 }
 
+// releaseAppFrontDoor drops every Caddy server app.FrontDoor holds and records
+// the choice in state, so status reporting stops calling app's live siding
+// "live" once nothing actually answers on its ports. The guest, its sidings,
+// and their materialization phases are untouched — only Caddy and the
 // FrontDoorReleased flag move. Releasing an already-released app is a no-op.
 func releaseAppFrontDoor(ctx context.Context, app state.App) error {
 	admin, err := appSwitchPrepareCaddy(ctx)

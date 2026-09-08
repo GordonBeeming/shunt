@@ -86,6 +86,13 @@ If that is not enough, `{{shunt-command}} restart <siding>` reaps the app's own 
 
 Recreating or killing the guest is the last resort, and it costs less than it sounds. The worktree, the data volumes and the output directory all survive: volumes are host bind mounts, so `kill` and `park` retain them and the next `up` picks them straight back up. What you lose is runtime state — the running app, the dependency containers and anything held only in the guest's memory — so the stack has to boot again, which is the real cost.
 
+## An absence is not a pass
+
+`up` returns before the AppHost has registered its resources, so `aspire describe` in the guest answers "No running AppHost found" for a while afterwards. Grep that output for a resource's health and you get no match, which looks exactly like a resource that is not healthy, and an empty result looks exactly like a clean one depending on how you asked. Wait for the AppHost to appear before you read anything into what its resources are doing.
+
+The same shape catches people across the container bridge: a TCP connect to a listener that is blocked or unattended still succeeds, because the kernel completes the handshake and the program never accepts. A successful connection there proves nothing on its own. Require a byte round trip, and prefer a real protocol exchange over a dial when you have one available.
+
+
 ## A guest resolves DNS through the host
 
 A guest's only nameserver is the host side of the container bridge, so it resolves exactly what the host resolves and nothing more. Turning off a VPN's DNS, or losing a split-horizon resolver, takes those names away from every guest at the same time.
