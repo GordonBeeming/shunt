@@ -30,6 +30,11 @@ import (
 // slow dial means the listener is gone rather than the network being far away.
 const dialTimeout = 10 * time.Second
 
+// checkTimeout bounds the reachability check. Both ends are on one machine, so a
+// slow answer means the connection is not being carried rather than that the
+// network is far away.
+const checkTimeout = 3 * time.Second
+
 // entry is one relayed endpoint, written by shunt after the guest starts.
 type entry struct {
 	Name         string `json:"name"`
@@ -40,7 +45,13 @@ type entry struct {
 
 func main() {
 	configPath := flag.String("config", "", "path to the relay configuration shunt wrote")
+	check := flag.String("check", "", "send --nonce to this address, require it back, and exit")
+	nonce := flag.String("nonce", "", "the value --check sends and requires back")
 	flag.Parse()
+	if *check != "" {
+		runCheck(*check, *nonce)
+		return
+	}
 	if *configPath == "" {
 		log.Fatal("host-reach-relay: --config is required")
 	}
@@ -71,6 +82,39 @@ func main() {
 		}(e, listener)
 	}
 	wg.Wait()
+}
+
+// runCheck proves the guest can carry traffic to the host end, not merely open a
+// connection to it. It runs here rather than on the host because this is the
+// path the relay actually uses, and it is the only path nothing else exercises.
+//
+// A dial proves nothing. The macOS application firewall blocks inbound
+// connections to an unapproved program on any address except loopback, and
+// blocks them after the handshake: the kernel completes the connection, the
+// program never accepts, and the caller sees a dial succeed and a read that
+// never returns.
+func runCheck(target, nonce string) {
+	if nonce == "" {
+		log.Fatal("host-reach-relay: --check needs --nonce")
+	}
+	conn, err := net.DialTimeout("tcp", target, checkTimeout)
+	if err != nil {
+		log.Fatalf("host-reach-relay: dial %s: %v", target, err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(checkTimeout)); err != nil {
+		log.Fatalf("host-reach-relay: %v", err)
+	}
+	if _, err := conn.Write([]byte(nonce)); err != nil {
+		log.Fatalf("host-reach-relay: write to %s: %v", target, err)
+	}
+	buf := make([]byte, len(nonce))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		log.Fatalf("host-reach-relay: %s accepted the connection but returned nothing: %v", target, err)
+	}
+	if string(buf) != nonce {
+		log.Fatalf("host-reach-relay: %s answered with something other than the check value", target)
+	}
 }
 
 func readConfig(path string) ([]entry, error) {
