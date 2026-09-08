@@ -1,8 +1,9 @@
 package hostreach
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
-	"hash/fnv"
 	"net"
 	"sort"
 )
@@ -16,54 +17,44 @@ import (
 // on plain localhost.
 const loopbackBase = 10
 
-// bridgePortBase is the first port allocated on the host bridge. These ports
-// exist only on the guest-to-bridge hop, so their values carry no meaning to the
-// app: the real port is preserved at both ends of the chain.
-const bridgePortBase = 47000
+// ControlPort is where a guest accepts the host's connections. It is the same in
+// every guest because each one has its own address on the bridge, so nothing has
+// to be allocated or remembered.
+const ControlPort = 47999
 
-// The reachability check binds a port below the entry ports, so a plan can never
-// allocate one, and holds it only for the length of one check.
+// ProbeName is the endpoint the host end answers itself, with an echo, instead
+// of dialling out. It exercises the loopback listener, the pool, the token and
+// the host process in one pass, which is the whole chain except the last dial.
+//
+// The .invalid TLD is reserved and never resolves, so this can never collide
+// with a declared entry.
+const ProbeName = "shunt-probe.invalid"
+
+// The probe's own listener in the guest. It sits below loopbackBase, so the
+// entry numbering can never reach it, and it is deliberately not in the guest's
+// hosts file: nothing should be able to resolve this name.
 const (
-	probePortBase  = 46000
-	probePortCount = bridgePortBase - probePortBase
+	ProbeGuestAddress = "127.0.0.2"
+	ProbeGuestPort    = 46999
 )
 
-// ProbePort gives a siding its own port for the check. Sidings start
-// concurrently, and two probes on one port would make the second start fail for
-// a reason that has nothing to do with the siding.
+// Relay is one resolved endpoint with its guest address assigned:
 //
-// Derived from the name rather than allocated, so nothing has to track it. Two
-// sidings can still land on the same port, which is why the check sends a value
-// and requires that same value back: a crossed probe fails rather than passing
-// on someone else's answer.
-func ProbePort(app, siding string) int {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(app + "\x00" + siding))
-	return probePortBase + int(h.Sum32()%uint32(probePortCount))
-}
-
-// Relay is one resolved endpoint with both ends of its chain assigned:
-//
-//	guest: GuestAddress:Port  ->  bridge: BridgeAddress:BridgePort  ->  Address:Port
+//	guest: GuestAddress:Port  ->  host end  ->  Address:Port
 //
 // The guest's hosts file maps Name to GuestAddress, so the app connects to the
 // real name on the real port and never sees the hops.
 type Relay struct {
 	Resolved
-	GuestAddress  string
-	BridgeAddress string
-	BridgePort    int
+	GuestAddress string
 }
 
-// Plan assigns addresses and ports to resolved entries.
+// Plan assigns a guest address to each resolved entry.
 //
 // It is deterministic in entry order so a restart reproduces the same layout,
 // which keeps a guest's hosts file valid across a stop and start rather than
 // silently pointing at an address the relay no longer answers on.
-func Plan(bridgeAddress string, resolved []Resolved) ([]Relay, error) {
-	if net.ParseIP(bridgeAddress) == nil {
-		return nil, fmt.Errorf("invalid bridge address %q", bridgeAddress)
-	}
+func Plan(resolved []Resolved) ([]Relay, error) {
 	ordered := append([]Resolved(nil), resolved...)
 	sort.SliceStable(ordered, func(i, j int) bool {
 		if ordered[i].Name != ordered[j].Name {
@@ -85,16 +76,7 @@ func Plan(bridgeAddress string, resolved []Resolved) ([]Relay, error) {
 		if err != nil {
 			return nil, err
 		}
-		bridgePort := bridgePortBase + i
-		if bridgePort > 65535 {
-			return nil, fmt.Errorf("too many hostReach entries: bridge port %d is above the maximum", bridgePort)
-		}
-		relays = append(relays, Relay{
-			Resolved:      entry,
-			GuestAddress:  guestAddress,
-			BridgeAddress: bridgeAddress,
-			BridgePort:    bridgePort,
-		})
+		relays = append(relays, Relay{Resolved: entry, GuestAddress: guestAddress})
 	}
 	return relays, nil
 }
@@ -118,19 +100,24 @@ func loopbackAddress(index int) (string, error) {
 	return fmt.Sprintf("127.0.%d.%d", index/perThirdOctet, loopbackBase+index%perThirdOctet), nil
 }
 
-// BridgeAddressFor derives the host's address on the container bridge from a
-// guest's own address: the runtime puts the host at .1 of the guest's /24.
-//
-// Derived rather than hardcoded so it follows the runtime's subnet instead of
-// assuming the 192.168.64.0/24 this happens to use today.
-func BridgeAddressFor(guestIP string) (string, error) {
-	parsed := net.ParseIP(guestIP)
-	if parsed == nil {
+// GuestControlAddress is where the host end dials to reach a guest's relay.
+func GuestControlAddress(guestIP string) (string, error) {
+	if net.ParseIP(guestIP) == nil {
 		return "", fmt.Errorf("invalid guest address %q", guestIP)
 	}
-	v4 := parsed.To4()
-	if v4 == nil {
-		return "", fmt.Errorf("guest address %q is not IPv4", guestIP)
+	return fmt.Sprintf("%s:%d", guestIP, ControlPort), nil
+}
+
+// NewToken generates a siding's shared secret.
+//
+// Every guest on the bridge can reach every other guest's control port, so an
+// unauthenticated pool would let one siding's guest join another's and be handed
+// its traffic, credentials included. The token is what makes the guest's
+// listener safe to have at all.
+func NewToken() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate the host-reach token: %w", err)
 	}
-	return fmt.Sprintf("%d.%d.%d.1", v4[0], v4[1], v4[2]), nil
+	return hex.EncodeToString(raw), nil
 }

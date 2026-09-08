@@ -3,6 +3,7 @@ package hostreach
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -79,19 +80,16 @@ func TestPlanGivesEveryEntryItsOwnGuestAddress(t *testing.T) {
 	for _, name := range []string{"kv-dev", "appconfig-dev", "acr-dev", "ai-dev"} {
 		entries = append(entries, Resolved{Name: name, Port: 443, Address: "10.0.0.9"})
 	}
-	relays, err := Plan("192.168.64.1", entries)
+	relays, err := Plan(entries)
 	if err != nil {
 		t.Fatal(err)
 	}
-	guestAddresses, bridgePorts := map[string]bool{}, map[int]bool{}
+	guestAddresses := map[string]bool{}
 	for _, r := range relays {
 		if guestAddresses[r.GuestAddress] {
 			t.Errorf("guest address %s reused; entries on the same port would collide", r.GuestAddress)
 		}
-		if bridgePorts[r.BridgePort] {
-			t.Errorf("bridge port %d reused", r.BridgePort)
-		}
-		guestAddresses[r.GuestAddress], bridgePorts[r.BridgePort] = true, true
+		guestAddresses[r.GuestAddress] = true
 		if r.Port != 443 {
 			t.Errorf("%s: port = %d, want the real port preserved", r.Name, r.Port)
 		}
@@ -108,12 +106,12 @@ func TestPlanIsStableAcrossRuns(t *testing.T) {
 		{Name: "b", Port: 443, Address: "10.0.0.2"},
 		{Name: "a", Port: 1433, Address: "10.0.0.1"},
 	}
-	first, err := Plan("192.168.64.1", entries)
+	first, err := Plan(entries)
 	if err != nil {
 		t.Fatal(err)
 	}
 	shuffled := []Resolved{entries[1], entries[0]}
-	second, err := Plan("192.168.64.1", shuffled)
+	second, err := Plan(shuffled)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +123,7 @@ func TestPlanIsStableAcrossRuns(t *testing.T) {
 }
 
 func TestPlanRejectsADuplicateEntry(t *testing.T) {
-	_, err := Plan("192.168.64.1", []Resolved{
+	_, err := Plan([]Resolved{
 		{Name: "same", Port: 443, Address: "10.0.0.1"},
 		{Name: "same", Port: 443, Address: "10.0.0.2"},
 	})
@@ -134,23 +132,23 @@ func TestPlanRejectsADuplicateEntry(t *testing.T) {
 	}
 }
 
-func TestBridgeAddressIsDerivedFromTheGuestSubnet(t *testing.T) {
-	// Derived rather than hardcoded, so it follows the runtime's subnet instead
-	// of assuming the one this machine happens to use.
-	got, err := BridgeAddressFor("192.168.64.8")
-	if err != nil || got != "192.168.64.1" {
-		t.Fatalf("BridgeAddressFor() = %q, %v", got, err)
+func TestGuestControlAddressUsesTheGuestsOwnAddress(t *testing.T) {
+	// The host dials the guest, so the address it needs is the guest's, not the
+	// bridge's. A malformed one has to fail here rather than at dial time.
+	got, err := GuestControlAddress("192.168.64.8")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if other, err := BridgeAddressFor("10.42.7.3"); err != nil || other != "10.42.7.1" {
-		t.Fatalf("BridgeAddressFor() on another subnet = %q, %v", other, err)
+	if want := fmt.Sprintf("192.168.64.8:%d", ControlPort); got != want {
+		t.Errorf("GuestControlAddress() = %s, want %s", got, want)
 	}
-	if _, err := BridgeAddressFor("not-an-ip"); err == nil {
-		t.Error("BridgeAddressFor() accepted a non-address")
+	if _, err := GuestControlAddress("not-an-address"); err == nil {
+		t.Error("GuestControlAddress() accepted something that is not an address")
 	}
 }
 
 func TestMergeHostsReplacesShuntsBlockAndKeepsTheRest(t *testing.T) {
-	relays, err := Plan("192.168.64.1", []Resolved{{Name: "vm-sql-dev", Port: 1433, Address: "10.0.0.4"}})
+	relays, err := Plan([]Resolved{{Name: "vm-sql-dev", Port: 1433, Address: "10.0.0.4"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,21 +185,74 @@ func TestMergeHostsReplacesShuntsBlockAndKeepsTheRest(t *testing.T) {
 }
 
 func TestRelayConfigOmitsTheRealAddress(t *testing.T) {
-	relays, err := Plan("192.168.64.1", []Resolved{{Name: "vm-sql-dev", Port: 1433, Address: "10.0.0.4"}})
+	relays, err := Plan([]Resolved{{Name: "vm-sql-dev", Port: 1433, Address: "10.0.0.4"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	config, err := RelayConfig(relays)
+	config, err := RelayConfig(relays, "a-token")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The guest has no use for the private address and should not carry a copy of
-	// the host's network layout. It dials the bridge; the host end knows the rest.
+	// the host's network layout. It names the endpoint; the host end knows where
+	// that is.
 	if strings.Contains(string(config), "10.0.0.4") {
 		t.Errorf("relay config leaked the private address into the guest:\n%s", config)
 	}
-	if !strings.Contains(string(config), "192.168.64.1") {
-		t.Errorf("relay config is missing its bridge target:\n%s", config)
+	if !strings.Contains(string(config), "vm-sql-dev") {
+		t.Errorf("relay config is missing the endpoint name:\n%s", config)
+	}
+}
+
+func TestRelayConfigCarriesTheProbeButTheHostsBlockDoesNot(t *testing.T) {
+	relays, err := Plan([]Resolved{{Name: "vm-sql-dev", Port: 1433, Address: "10.0.0.4"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := RelayConfig(relays, "a-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The probe needs a listener so a check travels the same path an application
+	// does. It must not be resolvable, or an app could reach an endpoint that
+	// only ever echoes.
+	if !strings.Contains(string(config), ProbeName) {
+		t.Errorf("relay config has no probe listener:\n%s", config)
+	}
+	if strings.Contains(HostsBlock(relays), ProbeName) {
+		t.Errorf("the probe name is resolvable in the guest:\n%s", HostsBlock(relays))
+	}
+	if strings.Contains(HostsBlock(relays), ProbeGuestAddress) {
+		t.Errorf("the probe address is in the hosts block:\n%s", HostsBlock(relays))
+	}
+}
+
+func TestRelayConfigCarriesTheToken(t *testing.T) {
+	// Without it the guest would pool any connection from any guest on the
+	// bridge, and hand one of them an application's traffic.
+	config, err := RelayConfig(nil, "the-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(config), "the-secret") {
+		t.Errorf("relay config has no token:\n%s", config)
+	}
+}
+
+func TestNewTokenIsUnpredictable(t *testing.T) {
+	first, err := NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Error("two tokens matched; the guest's listener would be open to any siding")
+	}
+	if len(first) < 32 {
+		t.Errorf("token is %d characters, too short to be worth checking", len(first))
 	}
 }
 

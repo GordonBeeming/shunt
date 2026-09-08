@@ -3,8 +3,6 @@ package hostreach
 import (
 	"encoding/json"
 	"fmt"
-	"net"
-	"strconv"
 	"strings"
 )
 
@@ -24,28 +22,51 @@ const (
 	hostsEnd   = "# <<< shunt host-reach <<<"
 )
 
-// guestEntry is the relay's on-disk shape. It is deliberately not state.HostReach:
-// the relay has no use for the real address, and not sending it keeps the guest
-// from carrying a copy of the host's private-network layout.
+// guestEntry is one endpoint as the relay sees it. It is deliberately not
+// state.HostReach: the relay has no use for the real address, and not sending it
+// keeps the guest from carrying a copy of the host's private-network layout.
 type guestEntry struct {
 	Name         string `json:"name"`
 	GuestAddress string `json:"guestAddress"`
 	Port         int    `json:"port"`
-	BridgeTarget string `json:"bridgeTarget"`
+}
+
+// GuestConfig is the relay's whole on-disk configuration.
+//
+// ControlPort and ProbeName travel in the config rather than being constants on
+// both sides, so the two ends of the protocol share as little duplicated
+// knowledge as possible. Only the verbs are repeated.
+type GuestConfig struct {
+	ControlPort int          `json:"controlPort"`
+	Token       string       `json:"token"`
+	ProbeName   string       `json:"probeName"`
+	Entries     []guestEntry `json:"entries"`
 }
 
 // RelayConfig renders the configuration for the in-guest relay.
-func RelayConfig(relays []Relay) ([]byte, error) {
+func RelayConfig(relays []Relay, token string) ([]byte, error) {
 	entries := make([]guestEntry, 0, len(relays))
 	for _, r := range relays {
 		entries = append(entries, guestEntry{
 			Name:         r.Name,
 			GuestAddress: r.GuestAddress,
 			Port:         r.Port,
-			BridgeTarget: net.JoinHostPort(r.BridgeAddress, strconv.Itoa(r.BridgePort)),
 		})
 	}
-	return json.Marshal(entries)
+	// The probe gets a listener of its own, so a check travels the same path an
+	// application does: loopback listener, pool, token, host process. It is left
+	// out of the hosts block, so the name it uses resolves nowhere.
+	entries = append(entries, guestEntry{
+		Name:         ProbeName,
+		GuestAddress: ProbeGuestAddress,
+		Port:         ProbeGuestPort,
+	})
+	return json.Marshal(GuestConfig{
+		ControlPort: ControlPort,
+		Token:       token,
+		ProbeName:   ProbeName,
+		Entries:     entries,
+	})
 }
 
 // HostsBlock renders the fenced section for the guest's /etc/hosts.
@@ -95,10 +116,14 @@ func GuestScript(config, hosts string) string {
 	return strings.Join([]string{
 		"set -eu",
 		"mkdir -p /run/shunt",
-		// A previous relay holds the loopback addresses this one needs, so it has
-		// to be gone before the new one binds rather than merely signalled.
+		// A previous relay holds the loopback addresses and the control port this
+		// one needs, so it has to be gone before the new one binds rather than
+		// merely signalled.
 		"if [ -f /run/shunt/host-reach.pid ]; then kill \"$(cat /run/shunt/host-reach.pid)\" 2>/dev/null || true; fi",
 		"sleep 0.2",
+		// The config carries the token, so it is readable only by root, which is
+		// who the relay runs as.
+		fmt.Sprintf("touch %s && chmod 0600 %s", ConfigPath, ConfigPath),
 		fmt.Sprintf("cat > %s <<'SHUNT_RELAY_CONFIG'\n%s\nSHUNT_RELAY_CONFIG", ConfigPath, config),
 		// Write beside /etc/hosts and rename over it. A copy that is interrupted
 		// leaves the file half-written, and the half that goes missing is whatever
