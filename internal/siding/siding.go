@@ -1100,6 +1100,11 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 		}
 		sd.Bridges[r.Key] = r.ListenPort
 	}
+	// Relay the endpoints only the host can reach. This runs after the guest has
+	// an address, because both ends of the relay are derived from it.
+	if err := applyHostReach(ctx, app, *sd); err != nil {
+		return err
+	}
 	return nil
 }
 

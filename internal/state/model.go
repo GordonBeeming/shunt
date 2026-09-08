@@ -151,6 +151,9 @@ type App struct {
 	DataVolumes []DataVolume      `json:"dataVolumes"`
 	Env         map[string]string `json:"env"`    // extra guest env (Aspire parameters, secrets)
 	Mounts      []MountSpec       `json:"mounts"` // explicit extra host->guest mounts
+	// HostReach names endpoints only the host can reach, such as a private
+	// address behind a VPN. shunt relays each into the guest on every start.
+	HostReach []HostReach `json:"hostReach,omitempty"`
 	// Registry dependency images kept in shunt's daemon-free host cache and
 	// loaded into sidings so guests never pull from the network (see `shunt warm`).
 	PrebakeImages []string `json:"prebakeImages,omitempty"`
