@@ -382,14 +382,24 @@ func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 	// host reaching in. They are independent, so this runs before the bridge
 	// decision: an app started with --no-bridge still needs its dependencies.
 	// Hooking it into bridging is what made it silently never run.
-	if ip, e := upGuestIP(ctx, sd.Container); e == nil {
+	if len(app.HostReach) > 0 {
+		// Only look the address up when something needs it, and report a failure
+		// rather than swallowing it: applyHostReach would otherwise refuse with
+		// "activate the siding first", which names the wrong cause entirely.
+		ip, err := upGuestIP(ctx, sd.Container)
+		if err != nil {
+			return sd, fmt.Errorf("resolve the guest address for host-reach: %w", err)
+		}
 		sd.LastIP = ip
-	}
-	if err := upApplyHostReach(ctx, app, sd); err != nil {
-		return sd, err
+		if err := upApplyHostReach(ctx, app, sd); err != nil {
+			return sd, err
+		}
 	}
 
 	if !bridge {
+		if ip, e := upGuestIP(ctx, sd.Container); e == nil {
+			sd.LastIP = ip
+		}
 		return sd, nil
 	}
 	fmt.Fprintln(progress, "• bridging the declared routes to the host…")

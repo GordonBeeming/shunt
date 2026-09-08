@@ -3,8 +3,10 @@ package siding
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/hostreach"
@@ -111,20 +113,55 @@ func TestRemoveHostReachDropsEveryListenerItCreated(t *testing.T) {
 	}
 }
 
-// TestUpAppliesHostReachEvenWithoutBridging is the regression for the bug that
-// made this feature do nothing at all. applyHostReach was hooked into Activate,
-// which `up --no-bridge` returns before ever reaching, so the relay never ran
-// and never complained. Bridging is the host reaching in; the relay is the guest
-// reaching out. They are independent and must not share a gate.
-func TestUpAppliesHostReachEvenWithoutBridging(t *testing.T) {
-	origApply, origActivate, origIP := upApplyHostReach, upActivate, upGuestIP
-	t.Cleanup(func() { upApplyHostReach, upActivate, upGuestIP = origApply, origActivate, origIP })
+// stubUpExternals neutralises everything up() reaches outside itself, so a test
+// can drive its real control flow without a guest. The relay seams are left to
+// each test: they are what the tests are about.
+func stubUpExternals(t *testing.T) {
+	t.Helper()
+	origRuntime, origMat, origLive := ensureGuestRuntime, upMaterialize, upEnsureGuestLive
+	origFD, origProbe, origExec := upResolveFrontDoor, upProbeAppRunning, execGuest
+	origPrep, origStop, origStart, origWait := upPrepareGuest, upStopApp, upStartApp, upWaitReady
+	t.Cleanup(func() {
+		ensureGuestRuntime, upMaterialize, upEnsureGuestLive = origRuntime, origMat, origLive
+		upResolveFrontDoor, upProbeAppRunning, execGuest = origFD, origProbe, origExec
+		upPrepareGuest, upStopApp, upStartApp, upWaitReady = origPrep, origStop, origStart, origWait
+	})
+	ensureGuestRuntime = func(context.Context) error { return nil }
+	upMaterialize = func(_ context.Context, _ state.App, sd state.Siding, _ io.Writer) (state.Siding, error) {
+		return sd, nil
+	}
+	upEnsureGuestLive = func(context.Context, state.Siding) error { return nil }
+	upResolveFrontDoor = func(state.App, state.Siding) ([]state.Route, error) { return nil, nil }
+	upProbeAppRunning = func(context.Context, state.App, state.Siding) (bool, error) { return false, nil }
+	execGuest = func(context.Context, string, ...string) (string, error) { return "", nil }
+	upPrepareGuest = func(context.Context, state.App, state.Siding) error { return nil }
+	upStopApp = func(context.Context, state.App, state.Siding) error { return nil }
+	upStartApp = func(context.Context, state.App, state.Siding) error { return nil }
+	upWaitReady = func(context.Context, state.App, state.Siding, time.Duration) error { return nil }
+}
 
+// TestUpAppliesHostReachEvenWithoutBridging is the regression for the bug that
+// made this feature do nothing at all: applyHostReach was hooked into Activate,
+// which `up --no-bridge` returns before ever reaching, so the relay never ran
+// and never complained.
+//
+// It drives the real up() rather than calling the seams in sequence. Calling
+// them directly would pass even if up stopped invoking the relay again, which is
+// the exact failure this exists to catch.
+func TestUpAppliesHostReachEvenWithoutBridging(t *testing.T) {
+	stubUpExternals(t)
+	origIP, origApply, origActivate := upGuestIP, upApplyHostReach, upActivate
+	t.Cleanup(func() { upGuestIP, upApplyHostReach, upActivate = origIP, origApply, origActivate })
+
+	app := state.App{Name: "alpha", HostReach: []state.HostReach{{Name: "vm-sql-dev", Port: 1433}}}
 	for _, bridge := range []bool{false, true} {
 		applied, activated := false, false
 		upGuestIP = func(context.Context, string) (string, error) { return "192.168.64.8", nil }
-		upApplyHostReach = func(context.Context, state.App, state.Siding) error {
+		upApplyHostReach = func(_ context.Context, _ state.App, sd state.Siding) error {
 			applied = true
+			if sd.LastIP == "" {
+				t.Error("relay ran before the guest address was resolved")
+			}
 			return nil
 		}
 		upActivate = func(context.Context, state.App, *state.Siding) error {
@@ -132,29 +169,35 @@ func TestUpAppliesHostReachEvenWithoutBridging(t *testing.T) {
 			return nil
 		}
 
-		// Exercise the same ordering the up path uses: resolve the address, apply
-		// the relay, then bridge only when asked.
-		sd := state.Siding{Name: "one", Container: "guest"}
-		if ip, err := upGuestIP(context.Background(), sd.Container); err == nil {
-			sd.LastIP = ip
+		if _, err := up(context.Background(), app, state.Siding{Name: "one", Container: "guest"}, bridge, io.Discard); err != nil {
+			t.Fatalf("bridge=%v: up() = %v", bridge, err)
 		}
-		if err := upApplyHostReach(context.Background(), state.App{}, sd); err != nil {
-			t.Fatal(err)
-		}
-		if bridge {
-			if err := upActivate(context.Background(), state.App{}, &sd); err != nil {
-				t.Fatal(err)
-			}
-		}
-
 		if !applied {
-			t.Errorf("bridge=%v: the relay did not run", bridge)
+			t.Errorf("bridge=%v: up did not run the relay", bridge)
 		}
 		if activated != bridge {
 			t.Errorf("bridge=%v: bridging ran = %v, want %v", bridge, activated, bridge)
 		}
-		if sd.LastIP == "" {
-			t.Errorf("bridge=%v: guest address not resolved before the relay needed it", bridge)
-		}
+	}
+}
+
+// TestUpSurfacesAGuestAddressFailureForHostReach checks the error names its real
+// cause. Swallowing it left applyHostReach refusing with "activate the siding
+// first", which points at the wrong thing entirely.
+func TestUpSurfacesAGuestAddressFailureForHostReach(t *testing.T) {
+	stubUpExternals(t)
+	origIP := upGuestIP
+	t.Cleanup(func() { upGuestIP = origIP })
+	upGuestIP = func(context.Context, string) (string, error) {
+		return "", errors.New("guest has no network address yet")
+	}
+
+	app := state.App{Name: "alpha", HostReach: []state.HostReach{{Name: "vm-sql-dev", Port: 1433}}}
+	_, err := up(context.Background(), app, state.Siding{Name: "one", Container: "guest"}, false, io.Discard)
+	if err == nil {
+		t.Fatal("up() = nil error, want the guest address failure surfaced")
+	}
+	if !strings.Contains(err.Error(), "no network address") {
+		t.Errorf("error = %v, want the underlying cause named", err)
 	}
 }
