@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/caddy"
+	"github.com/gordonbeeming/shunt/internal/portcheck"
 	"github.com/gordonbeeming/shunt/internal/siding"
 	"github.com/gordonbeeming/shunt/internal/state"
 	"github.com/spf13/cobra"
@@ -98,6 +99,28 @@ func resolveAppSwitchTarget(args []string) (app state.App, target string, err er
 // the choice in state, so status reporting stops calling app's live siding
 // "live" once nothing actually answers on its ports. The guest, its sidings,
 // and their materialization phases are untouched — only Caddy and the
+// describePortConflict adds what is holding a port to a bind failure.
+//
+// A claim that cannot bind reports the port and nothing about what has it, which
+// is the wrong half of the answer when someone is trying to get their front door
+// back. The most common cause is the reason the ports were released in the first
+// place: a run on the host whose containers are still up after its app was
+// stopped, because stopping an orchestrator does not stop what it started.
+//
+// The original error is returned unchanged when it is not a bind conflict, or
+// when nothing can be found holding the port.
+func describePortConflict(ctx context.Context, err error) error {
+	port, conflict := caddy.PortInUse(err)
+	if !conflict || port == 0 {
+		return err
+	}
+	holder := portcheck.Holder(ctx, port)
+	if holder == "" {
+		return fmt.Errorf("%w\n\nSomething else is listening on port %d. If the front door was released to run on the host, that run's containers keep their ports after its app is stopped.", err, port)
+	}
+	return fmt.Errorf("%w\n\nPort %d is held by %s. If the front door was released to run on the host, that run's containers keep their ports after its app is stopped.", err, port, holder)
+}
+
 // FrontDoorReleased flag move. Releasing an already-released app is a no-op.
 func releaseAppFrontDoor(ctx context.Context, app state.App) error {
 	admin, err := appSwitchPrepareCaddy(ctx)
@@ -187,7 +210,7 @@ func claimAppFrontDoor(ctx context.Context, app state.App, target string) error 
 		}
 		_ = appSwitchDeleteRoute(ctx, admin, path)
 		if err := appSwitchPutRoute(ctx, admin, path, body); err != nil {
-			return fmt.Errorf("claim %s/%s: %w", target, r.Key, err)
+			return fmt.Errorf("claim %s/%s: %w", target, r.Key, describePortConflict(ctx, err))
 		}
 	}
 
