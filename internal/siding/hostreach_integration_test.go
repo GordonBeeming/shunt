@@ -4,22 +4,129 @@ package siding
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/gordonbeeming/shunt/internal/caddy"
+	"github.com/gordonbeeming/shunt/internal/hostreach"
+	"github.com/gordonbeeming/shunt/internal/state"
 )
 
-// TestProbeBridgeRemovesItsListener checks that the reachability check takes its
-// own listener back down, whatever verdict it reaches.
+// TestHostReachCarriesTrafficEndToEnd drives the real chain against a real
+// guest: applyHostReach starts both ends, and an application inside the guest
+// then reaches a host-only endpoint by the name the contract declared.
 //
-// The verdict itself is a property of the machine rather than of the code: on a
-// host with the firewall on it is a failure, and on one where shunt is allowed
-// it is a success. Both are correct, so the test asserts the part that is always
-// true. A listener left behind holds a bridge port, which is the exposure this
-// design keeps narrow.
-func TestProbeBridgeRemovesItsListener(t *testing.T) {
+// The endpoint is a listener on the host's loopback, which no guest can reach on
+// its own. That is the whole property under test, and it needs no VPN and no
+// shared dependency to demonstrate.
+func TestHostReachCarriesTrafficEndToEnd(t *testing.T) {
+	container := requireGuest(t)
+	useRealShuntBinary(t)
+
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			conn, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			// A plain echo, so the guest end of the test can be the relay's own
+			// --check, which requires exactly what it sent back.
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(conn)
+		}
+	}()
+	_, portText, _ := net.SplitHostPort(echo.Addr().String())
+	port := 0
+	if _, err := fmt.Sscanf(portText, "%d", &port); err != nil {
+		t.Fatal(err)
+	}
+
+	app, sd := sidingForGuest(t, container, state.HostReach{
+		// An explicit address, because this endpoint exists only for the test and
+		// the host has no record of the name. Declared entries normally carry no
+		// address at all.
+		Name: "echo-endpoint.invalid", Port: port, Address: "127.0.0.1",
+	})
+
+	if err := applyHostReach(context.Background(), app, sd); err != nil {
+		reportEnds(t, app, sd)
+		t.Fatalf("applyHostReach: %v", err)
+	}
+	t.Cleanup(func() { removeHostReach(context.Background(), app, sd) })
+
+	if out, err := guestConnect(t, container, "echo-endpoint.invalid", port); err != nil {
+		reportEnds(t, app, sd)
+		t.Fatalf("the guest could not reach the endpoint: %v (%s)", err, out)
+	}
+}
+
+// TestHostReachProbeFailsWhenTheHostEndIsGone proves the check can fail. A check
+// that cannot fail is how this feature shipped broken twice.
+func TestHostReachProbeFailsWhenTheHostEndIsGone(t *testing.T) {
+	container := requireGuest(t)
+	useRealShuntBinary(t)
+	app, sd := sidingForGuest(t, container, state.HostReach{
+		Name: "echo-endpoint.invalid", Port: 9, Address: "127.0.0.1",
+	})
+
+	if err := applyHostReach(context.Background(), app, sd); err != nil {
+		reportEnds(t, app, sd)
+		t.Fatalf("applyHostReach: %v", err)
+	}
+	t.Cleanup(func() { removeHostReach(context.Background(), app, sd) })
+
+	// With the host end stopped, the guest's relay still listens and still
+	// accepts, so only a byte round trip can tell the difference.
+	stopHostReachProcess(app, sd)
+	if err := probeHostReachChain(context.Background(), sd); err == nil {
+		t.Fatal("the probe passed with no host end running")
+	}
+}
+
+// useRealShuntBinary points the host end at the installed shunt binary. Under
+// `go test`, os.Executable names the test runner, which has no host-reach
+// command, so the process would start and immediately fail.
+func useRealShuntBinary(t *testing.T) {
+	t.Helper()
+	path := os.Getenv("SHUNT_BINARY")
+	if path == "" {
+		t.Skip("set SHUNT_BINARY to the shunt binary that runs the host end")
+	}
+	orig := hostReachBinary
+	t.Cleanup(func() { hostReachBinary = orig })
+	hostReachBinary = func() (string, error) { return path, nil }
+}
+
+// reportEnds prints both ends' logs. A failure here is a failure of a chain, and
+// which end broke is the first thing worth knowing.
+func reportEnds(t *testing.T, app state.App, sd state.Siding) {
+	t.Helper()
+	if configPath, _, err := hostReachPaths(app, sd.Name); err == nil {
+		if body, err := os.ReadFile(filepath.Join(filepath.Dir(configPath), "host-reach.log")); err == nil {
+			t.Logf("host end log:\n%s", body)
+		} else {
+			t.Logf("no host end log: %v", err)
+		}
+	}
+	if out, err := execGuest(context.Background(), sd.Container, "tail", "-20", "/var/log/shunt-host-reach.log"); err == nil {
+		t.Logf("guest relay log:\n%s", out)
+	}
+}
+
+func requireGuest(t *testing.T) string {
+	t.Helper()
 	if os.Getenv("SHUNT_CONTAINER_INTEGRATION") == "" {
 		t.Skip("needs a guest; set SHUNT_CONTAINER_INTEGRATION=1")
 	}
@@ -27,27 +134,42 @@ func TestProbeBridgeRemovesItsListener(t *testing.T) {
 	if container == "" {
 		t.Skip("set SHUNT_PROBE_GUEST to a running siding guest")
 	}
-	ctx := context.Background()
-	admin := caddy.NewAdmin()
-	if err := admin.Ping(ctx); err != nil {
-		t.Skipf("caddy admin not reachable (%v) — run `shunt init`", err)
+	return container
+}
+
+func sidingForGuest(t *testing.T, container string, entries ...state.HostReach) (state.App, state.Siding) {
+	t.Helper()
+	configDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(configDir, "one"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-
-	const app, siding = "itest", "probe"
-	path := "/config/apps/layer4/servers/" + caddy.HostReachProbeServerName(app, siding)
-	t.Cleanup(func() { _ = admin.DeleteIfExists(context.Background(), path) })
-
-	t.Logf("probe verdict: %v", probeBridgeReachable(ctx, admin, app, siding, container, "192.168.64.1"))
-
-	// Absence is read from the body, not from a status. Caddy answers a missing
-	// config key with 200 and "null", and the probe server sets no "@id" for an
-	// id lookup to miss on, so both of the obvious checks here report absent
-	// whatever the truth is.
-	body, err := admin.Get(ctx, path)
+	ip, err := guestAddress(t, container)
 	if err != nil {
-		t.Fatalf("read the probe listener's config path: %v", err)
+		t.Fatal(err)
 	}
-	if got := strings.TrimSpace(string(body)); got != "null" {
-		t.Errorf("probe listener still present after the check: %s", got)
+	return state.App{Name: "itest", ConfigDir: configDir, HostReach: entries},
+		state.Siding{Name: "one", Container: container, LastIP: ip}
+}
+
+func guestAddress(t *testing.T, container string) (string, error) {
+	t.Helper()
+	// hostname -i rather than `ip`: iproute2 is not in the base image.
+	out, err := execGuest(context.Background(), container, "sh", "-c", "hostname -i | awk '{print $1}'")
+	if err != nil {
+		return "", err
 	}
+	return strings.TrimSpace(out), nil
+}
+
+// guestConnect opens a connection from inside the guest to a declared name and
+// requires a byte round trip, which is what an application in the siding does.
+//
+// It uses the relay's own --check rather than a scripting language. shunt
+// installs the relay deliberately; python3 is in the image only as something
+// another package happened to bring, and the Containerfile never asks for it.
+func guestConnect(t *testing.T, container, name string, port int) (string, error) {
+	t.Helper()
+	nonce := fmt.Sprintf("end-to-end-%d", time.Now().UnixNano())
+	target := fmt.Sprintf("%s:%d", name, port)
+	return execGuest(context.Background(), container, hostreach.RelayProgram, "--check", target, "--nonce", nonce)
 }

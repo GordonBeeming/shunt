@@ -2,54 +2,76 @@ package siding
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
-	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
-	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/hostreach"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
 
-// probeTimeout bounds the reachability check. Both ends are on this machine, so
-// a slow answer means the connection is not being carried rather than that the
+// probeTimeout bounds the reachability check. Every hop is on this machine, so a
+// slow answer means the chain is not carrying traffic rather than that the
 // network is far away.
-const probeTimeout = 3 * time.Second
+const probeTimeout = 20 * time.Second
 
-// Seams so the relay can be tested without a guest or a running Caddy.
-var (
-	resolveHostReach   = hostreach.Resolve
-	hostReachPrepare   = func(ctx context.Context) (*caddy.Admin, error) { a := caddy.NewAdmin(); return a, a.Ping(ctx) }
-	hostReachPutServer = func(ctx context.Context, a *caddy.Admin, path string, body []byte) error {
-		return a.Put(ctx, path, body)
-	}
-	hostReachDeleteServer = func(ctx context.Context, a *caddy.Admin, path string) error {
-		return a.DeleteIfExists(ctx, path)
-	}
-	probeBridge = probeBridgeReachable
+// probeAttemptTimeout bounds one attempt, and probeRetryPause spaces them. One
+// attempt is short so a broken chain is not waited out at full length, and the
+// budget above is what covers a host end still connecting.
+const (
+	probeAttemptTimeout = 5 * time.Second
+	probeRetryPause     = 500 * time.Millisecond
 )
 
-// applyHostReach relays the endpoints only the host can reach into a running
-// guest: a listener per entry on the container bridge, plus the guest's hosts
-// entries and relay process.
+// Seams so the relay can be tested without a guest or a host process.
+var (
+	resolveHostReach     = hostreach.Resolve
+	newHostReachToken    = hostreach.NewToken
+	startHostReachServer = startHostReachProcess
+	stopHostReachServer  = stopHostReachProcess
+	probeHostReach       = probeHostReachChain
+
+	// hostReachBinary is what runs the host end. It is the running shunt binary
+	// in normal use, and a seam because a test binary is not shunt: os.Executable
+	// under `go test` names the test runner, which has no host-reach command.
+	hostReachBinary = os.Executable
+)
+
+// hostReachPaths returns the per-siding files the host end needs: its config and
+// the pid of the process serving it.
+func hostReachPaths(app state.App, siding string) (configPath, pidPath string, err error) {
+	base, err := SidingBase(app, siding)
+	if err != nil {
+		return "", "", err
+	}
+	return filepath.Join(base, "host-reach.json"), filepath.Join(base, "host-reach.pid"), nil
+}
+
+// applyHostReach carries the endpoints only the host can reach into a running
+// guest: the guest's relay listens on a loopback address per entry, and a host
+// process dials the guest and does the outbound connecting on its behalf.
+//
+// The host dials rather than listens. The macOS application firewall blocks
+// incoming connections to programs it has not been told to allow, on every
+// address except loopback, and blocks them without refusing, so a listener on
+// the host completes the handshake and then carries nothing.
 //
 // It runs on every start rather than at guest creation, because the addresses
-// are resolved fresh each time. An endpoint recreated since the last start moves,
-// and a guest carrying the previous address would fail in the one way this
-// feature exists to avoid: confidently, at the wrong place.
+// are resolved fresh each time. An endpoint recreated since the last start
+// moves, and a guest carrying the previous address would fail in the one way
+// this feature exists to avoid: confidently, at the wrong place.
 func applyHostReach(ctx context.Context, app state.App, sd state.Siding) error {
 	if len(app.HostReach) == 0 {
 		return nil
 	}
 	if sd.LastIP == "" {
-		return fmt.Errorf("host-reach needs the guest address; activate the siding first")
-	}
-	bridge, err := hostreach.BridgeAddressFor(sd.LastIP)
-	if err != nil {
-		return err
+		return errors.New("host-reach needs the guest address; start the siding first")
 	}
 
 	// Resolve before touching anything. A name the host cannot answer for is the
@@ -59,52 +81,18 @@ func applyHostReach(ctx context.Context, app state.App, sd state.Siding) error {
 	if err != nil {
 		return err
 	}
-	relays, err := hostreach.Plan(bridge, resolved)
+	relays, err := hostreach.Plan(resolved)
+	if err != nil {
+		return err
+	}
+	token, err := newHostReachToken()
 	if err != nil {
 		return err
 	}
 
-	admin, err := hostReachPrepare(ctx)
-	if err != nil {
-		return fmt.Errorf("caddy admin API not reachable for host-reach: %w", err)
-	}
-	for _, r := range relays {
-		name := caddy.HostReachServerName(app.Name, sd.Name, r.Name, r.Port)
-		path, body, err := caddy.ServerForHostReach(name, r.BridgeAddress, r.BridgePort, net.JoinHostPort(r.Address, strconv.Itoa(r.Port)))
-		if err != nil {
-			return err
-		}
-		// Delete first: a restart re-plans deterministically onto the same ports,
-		// and Caddy rejects a PUT onto a name that already exists.
-		_ = hostReachDeleteServer(ctx, admin, path)
-		if err := hostReachPutServer(ctx, admin, path, body); err != nil {
-			return fmt.Errorf("publish host-reach listener for %s: %w", r.Name, err)
-		}
-		fmt.Fprintf(os.Stdout, "• reaching %s\n", r)
-	}
-
-	// Prove the guest can actually reach the host end before writing any names.
-	// This hop fails silently: the macOS application firewall drops inbound
-	// connections to an unapproved binary on a non-loopback address without
-	// refusing them, so the guest gets a hanging connect and the host end never
-	// sees the attempt. Writing the hosts entries first would turn that into the
-	// worst version of the failure, where every declared name resolves and then
-	// hangs, which reads as the dependency being down.
-	if len(relays) > 0 {
-		if err := probeBridge(ctx, admin, app.Name, sd.Name, sd.Container, bridge); err != nil {
-			for _, r := range relays {
-				name := caddy.HostReachServerName(app.Name, sd.Name, r.Name, r.Port)
-				if e := hostReachDeleteServer(ctx, admin, "/config/apps/layer4/servers/"+name); e != nil {
-					// A listener left holding a bridge port to a private endpoint is the
-					// exposure this whole path exists to keep narrow, so say so.
-					fmt.Fprintf(os.Stdout, "• could not remove the host-reach listener for %s: %v\n", r.Name, e)
-				}
-			}
-			return err
-		}
-	}
-
-	config, err := hostreach.RelayConfig(relays)
+	// The guest is started first: it holds the listener, so the host process has
+	// something to connect to rather than backing off against a closed port.
+	config, err := hostreach.RelayConfig(relays, token)
 	if err != nil {
 		return err
 	}
@@ -116,114 +104,158 @@ func applyHostReach(ctx context.Context, app state.App, sd state.Siding) error {
 	if _, err := execGuest(ctx, sd.Container, "sh", "-c", script); err != nil {
 		return fmt.Errorf("start the guest host-reach relay: %w", err)
 	}
+
+	if err := startHostReachServer(ctx, app, sd, token, relays); err != nil {
+		return err
+	}
+	for _, r := range relays {
+		fmt.Fprintf(os.Stdout, "• reaching %s\n", r)
+	}
+
+	// Prove the chain carries traffic before trusting it. Everything above can
+	// succeed while the chain still carries nothing, which is the failure this
+	// feature has already shipped once.
+	if err := probeHostReach(ctx, sd); err != nil {
+		stopHostReachServer(app, sd)
+		return err
+	}
 	return nil
 }
 
-// probeBridge proves the guest can carry traffic to the host end on the
-// container bridge, by moving a nonce through a listener Caddy holds for the
-// length of the check.
+// startHostReachProcess launches the host end for one siding and records its pid.
 //
-// The exchange runs in the guest because that is the path the relay uses, and it
-// is the only path nothing else exercises. A check made from the host would pass
-// on a guest whose own route to the bridge is broken.
-//
-// A connect is not enough to prove it either way. The macOS application firewall
-// blocks inbound connections to an unapproved program on any address except
-// loopback, and blocks them after the handshake: the kernel completes the
-// connection, the program never accepts it, and the caller sees a dial that
-// succeeds and a read that never returns. A check that only dialled would pass
-// on exactly the machines where this is broken.
-//
-// The listener under test belongs to Caddy rather than to shunt, because the
-// firewall decides per program and Caddy is what holds the real entries.
-func probeBridgeReachable(ctx context.Context, admin *caddy.Admin, app, siding, container, bridgeAddress string) error {
-	nonce := fmt.Sprintf("shunt-host-reach-probe-%d", time.Now().UnixNano())
-	echo, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return fmt.Errorf("start the host-reach probe listener: %w", err)
-	}
-	defer echo.Close()
-
-	// Reported by the host as well as by the guest. The guest's exit status says
-	// it got its nonce back; this says the host end was the one that answered,
-	// which is what rules out something else holding the port.
-	served := make(chan bool, 1)
-	go func() {
-		conn, err := echo.Accept()
-		if err != nil {
-			served <- false
-			return
-		}
-		defer conn.Close()
-		buf := make([]byte, len(nonce))
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			served <- false
-			return
-		}
-		_, _ = conn.Write(buf)
-		served <- string(buf) == nonce
-	}()
-
-	path, body, err := caddy.ServerForHostReach(caddy.HostReachProbeServerName(app, siding), bridgeAddress, hostreach.ProbePort(app, siding), echo.Addr().String())
+// Detached into its own process group so it outlives the CLI invocation that
+// started it. The guest's relay is started the same way, and the symmetry is
+// deliberate: both ends live for as long as the siding, not for as long as a
+// command.
+func startHostReachProcess(ctx context.Context, app state.App, sd state.Siding, token string, relays []hostreach.Relay) error {
+	configPath, pidPath, err := hostReachPaths(app, sd.Name)
 	if err != nil {
 		return err
 	}
-	_ = hostReachDeleteServer(ctx, admin, path)
-	if err := hostReachPutServer(ctx, admin, path, body); err != nil {
-		return fmt.Errorf("publish the host-reach probe listener: %w", err)
+	// Replace any process still serving a previous start of this siding, so the
+	// guest is not fed by two hosts with different tokens. This happens before the
+	// config is written, because stopping also removes the config it used, and
+	// doing it the other way round deletes the file the new process needs.
+	stopHostReachProcess(app, sd)
+
+	body, err := hostreach.HostConfigFor(sd.LastIP, token, relays)
+	if err != nil {
+		return err
 	}
-	defer func() {
-		if err := hostReachDeleteServer(ctx, admin, path); err != nil {
-			// Worth saying rather than swallowing: this listener holds a bridge port,
-			// and one left behind is the exposure the design is meant to avoid.
-			fmt.Fprintf(os.Stdout, "• could not remove the host-reach probe listener %s: %v\n", path, err)
-		}
-	}()
-
-	target := net.JoinHostPort(bridgeAddress, strconv.Itoa(hostreach.ProbePort(app, siding)))
-	checkCtx, cancel := context.WithTimeout(ctx, probeTimeout*2)
-	defer cancel()
-	_, checkErr := execGuest(checkCtx, container, hostreach.RelayProgram, "--check", target, "--nonce", nonce)
-	if checkErr == nil {
-		select {
-		case ok := <-served:
-			if ok {
-				return nil
-			}
-			checkErr = fmt.Errorf("the check reached something other than shunt's own listener")
-		case <-time.After(probeTimeout):
-			checkErr = fmt.Errorf("the check reported success but shunt's listener was never reached")
-		}
+	// 0600: the file holds the siding's token and the private addresses the guest
+	// is deliberately never told.
+	if err := os.WriteFile(configPath, body, 0o600); err != nil {
+		return fmt.Errorf("write the host-reach config: %w", err)
 	}
-	return fmt.Errorf(`the guest cannot carry traffic to shunt on the container bridge at %s, so host-reach would resolve every declared name and then hang.
 
-The macOS application firewall blocks incoming connections to programs it has
-not been told to allow, on every address except loopback, and it blocks them
-without refusing. shunt's front door is unaffected because it listens on
-loopback only. hostReach is the one part of shunt that binds the bridge.
+	self, err := hostReachBinary()
+	if err != nil {
+		return fmt.Errorf("locate the shunt binary for host-reach: %w", err)
+	}
+	logPath := filepath.Join(filepath.Dir(configPath), "host-reach.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("open the host-reach log: %w", err)
+	}
+	defer logFile.Close()
 
-Firewall state:
-  /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
-
-Underlying failure: %w`, target, checkErr)
+	cmd := exec.Command(self, "host-reach", "serve", "--config", configPath)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		// The config holds the token and the addresses the guest is deliberately
+		// never told, so it does not outlive the process it was written for.
+		_ = os.Remove(configPath)
+		return fmt.Errorf("start the host-reach process: %w", err)
+	}
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+		_ = cmd.Process.Kill()
+		_ = os.Remove(configPath)
+		return fmt.Errorf("record the host-reach pid: %w", err)
+	}
+	// Released rather than waited on: this process is meant to outlive the
+	// command, and not reaping it here is what lets that happen.
+	return cmd.Process.Release()
 }
 
-// removeHostReach drops the bridge listeners a siding created. A listener that
-// outlived its guest would keep a path to a private endpoint open on the bridge
-// with nothing using it.
+// stopHostReachProcess ends the host end for one siding.
 //
-// It is best effort by design: it runs on teardown paths that must complete, and
-// a stale listener is a smaller problem than a stop that refuses to finish.
-func removeHostReach(ctx context.Context, app state.App, sd state.Siding) {
-	if len(app.HostReach) == 0 {
-		return
-	}
-	admin, err := hostReachPrepare(ctx)
+// Best effort by design: it runs on teardown paths that have to complete, and a
+// process that has already gone is the normal case rather than an error.
+func stopHostReachProcess(app state.App, sd state.Siding) {
+	configPath, pidPath, err := hostReachPaths(app, sd.Name)
 	if err != nil {
 		return
 	}
-	for _, entry := range app.HostReach {
-		name := caddy.HostReachServerName(app.Name, sd.Name, entry.Name, entry.Port)
-		_ = hostReachDeleteServer(ctx, admin, "/config/apps/layer4/servers/"+name)
+	if raw, err := os.ReadFile(pidPath); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 0 {
+			// Negative pid signals the whole group. The process is started as its
+			// own group leader, so anything it goes on to spawn is included rather
+			// than left behind holding the token.
+			if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
+				_ = syscall.Kill(pid, syscall.SIGTERM)
+			}
+		}
 	}
+	_ = os.Remove(pidPath)
+	// The config carries the token and the private addresses, so it goes with the
+	// process that used it rather than sitting on disk until the next start.
+	_ = os.Remove(configPath)
+}
+
+// probeHostReachChain proves the whole chain carries traffic, by sending a value
+// from the guest and requiring the same value back.
+//
+// It goes through the guest's own relay to a name only the host end answers, so
+// one pass covers the loopback listener, the pool, the token and the host
+// process. Nothing here touches a declared dependency, so a slow or broken
+// endpoint cannot make this fail and a working one cannot make it pass.
+//
+// A dial would prove nothing: an unattended listener still completes the
+// handshake in the kernel, so a connect succeeds and only the read hangs.
+func probeHostReachChain(ctx context.Context, sd state.Siding) error {
+	target := fmt.Sprintf("%s:%d", hostreach.ProbeGuestAddress, hostreach.ProbeGuestPort)
+	deadline := time.Now().Add(probeTimeout)
+	var last error
+	for attempt := 1; ; attempt++ {
+		nonce := fmt.Sprintf("shunt-host-reach-probe-%d", time.Now().UnixNano())
+		attemptCtx, cancel := context.WithTimeout(ctx, probeAttemptTimeout)
+		_, last = execGuest(attemptCtx, sd.Container, hostreach.RelayProgram, "--check", target, "--nonce", nonce)
+		cancel()
+		if last == nil {
+			return nil
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			break
+		}
+		// The host end has just been started and may not have finished connecting.
+		// Retrying is the difference between reporting a broken chain and waiting
+		// out the first second of a working one.
+		select {
+		case <-time.After(probeRetryPause):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return fmt.Errorf(`the host-reach chain is not carrying traffic for siding %q.
+
+The guest's relay is running and shunt's host process is started, but a value
+sent from the guest did not come back. Check both ends:
+
+  guest   /var/log/shunt-host-reach.log inside the guest
+  host    host-reach.log beside this siding's config
+
+Underlying failure: %w`, sd.Name, last)
+}
+
+// removeHostReach ends the host end a siding started. A process that outlived
+// its guest would keep a token and a route to a private endpoint alive with
+// nothing using them.
+func removeHostReach(_ context.Context, app state.App, sd state.Siding) {
+	if len(app.HostReach) == 0 {
+		return
+	}
+	stopHostReachServer(app, sd)
 }

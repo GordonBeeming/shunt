@@ -8,111 +8,136 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gordonbeeming/shunt/internal/caddy"
 	"github.com/gordonbeeming/shunt/internal/hostreach"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
 
-func withHostReachSeams(t *testing.T) (published *[]string, deleted *[]string) {
+type hostReachCalls struct {
+	started int
+	stopped int
+	probed  int
+	scripts []string
+}
+
+func withHostReachSeams(t *testing.T) *hostReachCalls {
 	t.Helper()
-	origResolve, origPrepare := resolveHostReach, hostReachPrepare
-	origPut, origDelete, origExec := hostReachPutServer, hostReachDeleteServer, execGuest
+	origResolve, origToken := resolveHostReach, newHostReachToken
+	origStart, origStop, origProbe := startHostReachServer, stopHostReachServer, probeHostReach
+	origExec := execGuest
 	t.Cleanup(func() {
-		resolveHostReach, hostReachPrepare = origResolve, origPrepare
-		hostReachPutServer, hostReachDeleteServer, execGuest = origPut, origDelete, origExec
+		resolveHostReach, newHostReachToken = origResolve, origToken
+		startHostReachServer, stopHostReachServer, probeHostReach = origStart, origStop, origProbe
+		execGuest = origExec
 	})
-	origProbeSeam := probeBridge
-	t.Cleanup(func() { probeBridge = origProbeSeam })
-	probeBridge = func(context.Context, *caddy.Admin, string, string, string, string) error { return nil }
-	put, del := []string{}, []string{}
-	hostReachPrepare = func(context.Context) (*caddy.Admin, error) { return nil, nil }
-	hostReachPutServer = func(_ context.Context, _ *caddy.Admin, path string, _ []byte) error {
-		put = append(put, path)
+	calls := &hostReachCalls{}
+	resolveHostReach = func(context.Context, []state.HostReach) ([]hostreach.Resolved, error) {
+		return []hostreach.Resolved{{Name: "vm-sql-dev", Port: 1433, Address: "10.0.0.4"}}, nil
+	}
+	newHostReachToken = func() (string, error) { return "a-token", nil }
+	startHostReachServer = func(context.Context, state.App, state.Siding, string, []hostreach.Relay) error {
+		calls.started++
 		return nil
 	}
-	hostReachDeleteServer = func(_ context.Context, _ *caddy.Admin, path string) error {
-		del = append(del, path)
+	stopHostReachServer = func(state.App, state.Siding) { calls.stopped++ }
+	probeHostReach = func(context.Context, state.Siding) error {
+		calls.probed++
 		return nil
 	}
 	execGuest = func(_ context.Context, _ string, args ...string) (string, error) {
 		if len(args) > 0 && args[0] == "cat" {
 			return "127.0.0.1\tlocalhost\n", nil
 		}
+		if len(args) == 3 && args[0] == "sh" && args[1] == "-c" {
+			calls.scripts = append(calls.scripts, args[2])
+		}
 		return "", nil
 	}
-	return &put, &del
+	return calls
 }
 
-func TestApplyHostReachPublishesOneListenerPerEntry(t *testing.T) {
-	published, _ := withHostReachSeams(t)
-	resolveHostReach = func(context.Context, []state.HostReach) ([]hostreach.Resolved, error) {
-		return []hostreach.Resolved{
-			{Name: "kv-dev", Port: 443, Address: "10.0.0.5"},
-			{Name: "vm-sql-dev", Port: 1433, Address: "10.0.0.4"},
-		}, nil
-	}
-	app := state.App{Name: "alpha", HostReach: []state.HostReach{{Name: "kv-dev", Port: 443}, {Name: "vm-sql-dev", Port: 1433}}}
-	sd := state.Siding{Name: "one", Container: "guest", LastIP: "192.168.64.8"}
+func testApp() state.App {
+	return state.App{Name: "alpha", HostReach: []state.HostReach{{Name: "vm-sql-dev", Port: 1433}}}
+}
 
-	if err := applyHostReach(context.Background(), app, sd); err != nil {
+func testSiding() state.Siding {
+	return state.Siding{Name: "one", Container: "guest", LastIP: "192.168.64.8"}
+}
+
+func TestApplyHostReachStartsBothEndsAndProvesTheChain(t *testing.T) {
+	calls := withHostReachSeams(t)
+	if err := applyHostReach(context.Background(), testApp(), testSiding()); err != nil {
 		t.Fatal(err)
 	}
-	if len(*published) != 2 {
-		t.Fatalf("published %d listeners, want one per entry: %v", len(*published), *published)
+	if calls.started != 1 {
+		t.Errorf("host end started %d times, want 1", calls.started)
 	}
-	for _, path := range *published {
-		if !strings.Contains(path, "/layer4/servers/") {
-			t.Errorf("listener %q is not a raw TCP server", path)
-		}
+	if calls.probed != 1 {
+		t.Errorf("chain probed %d times, want 1", calls.probed)
+	}
+	if len(calls.scripts) != 1 {
+		t.Fatalf("guest configured %d times, want 1", len(calls.scripts))
+	}
+	// The guest is configured before the host process starts, so the host has a
+	// listener to connect to rather than backing off against a closed port.
+	if !strings.Contains(calls.scripts[0], hostreach.RelayProgram) {
+		t.Error("the guest script does not start the relay")
+	}
+	if !strings.Contains(calls.scripts[0], "a-token") {
+		t.Error("the guest was not given the token, so it would refuse the host")
 	}
 }
 
-func TestApplyHostReachPublishesNothingWhenAHostNameCannotResolve(t *testing.T) {
-	published, _ := withHostReachSeams(t)
+func TestApplyHostReachStopsTheHostEndWhenTheChainDoesNotCarry(t *testing.T) {
+	// Leaving the host process running after a failed probe would keep a token
+	// and a route to a private endpoint alive with nothing using them.
+	calls := withHostReachSeams(t)
+	probeHostReach = func(context.Context, state.Siding) error {
+		calls.probed++
+		return errors.New("nothing came back")
+	}
+	err := applyHostReach(context.Background(), testApp(), testSiding())
+	if err == nil {
+		t.Fatal("applyHostReach() = nil error, want the broken chain reported")
+	}
+	if calls.stopped == 0 {
+		t.Error("the host end was left running after a failed probe")
+	}
+}
+
+func TestApplyHostReachTouchesNothingWhenAHostNameCannotResolve(t *testing.T) {
+	calls := withHostReachSeams(t)
 	resolveHostReach = func(context.Context, []state.HostReach) ([]hostreach.Resolved, error) {
 		return nil, errors.New("the host cannot resolve it")
 	}
-	app := state.App{Name: "alpha", HostReach: []state.HostReach{{Name: "gone", Port: 443}}}
-	sd := state.Siding{Name: "one", Container: "guest", LastIP: "192.168.64.8"}
-
-	if err := applyHostReach(context.Background(), app, sd); err == nil {
+	if err := applyHostReach(context.Background(), testApp(), testSiding()); err == nil {
 		t.Fatal("applyHostReach() = nil error, want the resolution failure surfaced")
 	}
-	// Resolution happens before anything is published, so a bad name leaves no
-	// listener and no hosts entry half-applied.
-	if len(*published) != 0 {
-		t.Fatalf("published %v despite a resolution failure", *published)
+	// Resolution happens first, so a bad name leaves no host process and no hosts
+	// entry half-applied.
+	if calls.started != 0 || len(calls.scripts) != 0 {
+		t.Errorf("started %d host processes and wrote %d guest configs despite a resolution failure", calls.started, len(calls.scripts))
 	}
 }
 
 func TestApplyHostReachIsANoOpWithoutDeclaredEntries(t *testing.T) {
-	published, _ := withHostReachSeams(t)
+	calls := withHostReachSeams(t)
 	resolveHostReach = func(context.Context, []state.HostReach) ([]hostreach.Resolved, error) {
 		t.Error("resolved with nothing declared")
 		return nil, nil
 	}
-	if err := applyHostReach(context.Background(), state.App{Name: "alpha"}, state.Siding{Name: "one"}); err != nil {
+	if err := applyHostReach(context.Background(), state.App{Name: "alpha"}, testSiding()); err != nil {
 		t.Fatal(err)
 	}
-	if len(*published) != 0 {
-		t.Fatalf("published %v with nothing declared", *published)
+	if calls.started != 0 {
+		t.Error("started the host end with nothing declared")
 	}
 }
 
-func TestRemoveHostReachDropsEveryListenerItCreated(t *testing.T) {
-	_, deleted := withHostReachSeams(t)
-	app := state.App{Name: "alpha", HostReach: []state.HostReach{
-		{Name: "kv-dev", Port: 443}, {Name: "vm-sql-dev", Port: 1433},
-	}}
-	removeHostReach(context.Background(), app, state.Siding{Name: "one"})
-	if len(*deleted) != 2 {
-		t.Fatalf("deleted %d listeners, want one per entry: %v", len(*deleted), *deleted)
-	}
-	// Namespaced by app and siding so a teardown cannot reach another siding's.
-	for _, path := range *deleted {
-		if !strings.Contains(path, "alpha") || !strings.Contains(path, "one") {
-			t.Errorf("listener name %q is not scoped to this app and siding", path)
-		}
+func TestRemoveHostReachStopsTheHostEnd(t *testing.T) {
+	calls := withHostReachSeams(t)
+	removeHostReach(context.Background(), testApp(), testSiding())
+	if calls.stopped != 1 {
+		t.Errorf("host end stopped %d times, want 1", calls.stopped)
 	}
 }
 
@@ -149,21 +174,21 @@ func stubUpExternals(t *testing.T) {
 // and never complained.
 //
 // It drives the real up() rather than calling the seams in sequence. Calling
-// them directly would pass even if up stopped invoking the relay again, which is
-// the exact failure this exists to catch.
+// them directly would pass even if up stopped invoking host-reach again, which
+// is the exact failure this exists to catch.
 func TestUpAppliesHostReachEvenWithoutBridging(t *testing.T) {
 	stubUpExternals(t)
 	origIP, origApply, origActivate := upGuestIP, upApplyHostReach, upActivate
 	t.Cleanup(func() { upGuestIP, upApplyHostReach, upActivate = origIP, origApply, origActivate })
 
-	app := state.App{Name: "alpha", HostReach: []state.HostReach{{Name: "vm-sql-dev", Port: 1433}}}
+	app := testApp()
 	for _, bridge := range []bool{false, true} {
 		applied, activated := false, false
 		upGuestIP = func(context.Context, string) (string, error) { return "192.168.64.8", nil }
 		upApplyHostReach = func(_ context.Context, _ state.App, sd state.Siding) error {
 			applied = true
 			if sd.LastIP == "" {
-				t.Error("relay ran before the guest address was resolved")
+				t.Error("host-reach ran before the guest address was resolved")
 			}
 			return nil
 		}
@@ -176,7 +201,7 @@ func TestUpAppliesHostReachEvenWithoutBridging(t *testing.T) {
 			t.Fatalf("bridge=%v: up() = %v", bridge, err)
 		}
 		if !applied {
-			t.Errorf("bridge=%v: up did not run the relay", bridge)
+			t.Errorf("bridge=%v: up did not apply host-reach", bridge)
 		}
 		if activated != bridge {
 			t.Errorf("bridge=%v: bridging ran = %v, want %v", bridge, activated, bridge)
@@ -185,7 +210,7 @@ func TestUpAppliesHostReachEvenWithoutBridging(t *testing.T) {
 }
 
 // TestUpSurfacesAGuestAddressFailureForHostReach checks the error names its real
-// cause. Swallowing it left applyHostReach refusing with "activate the siding
+// cause. Swallowing it left applyHostReach refusing with "start the siding
 // first", which points at the wrong thing entirely.
 func TestUpSurfacesAGuestAddressFailureForHostReach(t *testing.T) {
 	stubUpExternals(t)
@@ -195,55 +220,11 @@ func TestUpSurfacesAGuestAddressFailureForHostReach(t *testing.T) {
 		return "", errors.New("guest has no network address yet")
 	}
 
-	app := state.App{Name: "alpha", HostReach: []state.HostReach{{Name: "vm-sql-dev", Port: 1433}}}
-	_, err := up(context.Background(), app, state.Siding{Name: "one", Container: "guest"}, false, io.Discard)
+	_, err := up(context.Background(), testApp(), state.Siding{Name: "one", Container: "guest"}, false, io.Discard)
 	if err == nil {
 		t.Fatal("up() = nil error, want the guest address failure surfaced")
 	}
 	if !strings.Contains(err.Error(), "no network address") {
 		t.Errorf("error = %v, want the underlying cause named", err)
-	}
-}
-
-// TestApplyHostReachWritesNoNamesWhenTheGuestCannotReachTheHost covers the
-// failure that is worse than not working: the macOS firewall drops the guest's
-// connection to the bridge without refusing it, so writing the hosts entries
-// anyway leaves every declared name resolving and then hanging, which reads as
-// the dependency being down rather than as shunt being blocked.
-func TestApplyHostReachWritesNoNamesWhenTheGuestCannotReachTheHost(t *testing.T) {
-	published, deleted := withHostReachSeams(t)
-	resolveHostReach = func(context.Context, []state.HostReach) ([]hostreach.Resolved, error) {
-		return []hostreach.Resolved{{Name: "vm-sql-dev", Port: 1433, Address: "10.0.0.4"}}, nil
-	}
-	origProbe := probeBridge
-	t.Cleanup(func() { probeBridge = origProbe })
-	probeBridge = func(context.Context, *caddy.Admin, string, string, string, string) error {
-		return errors.New("the firewall blocks incoming connections on the bridge")
-	}
-	var wroteHosts bool
-	execGuest = func(context.Context, string, ...string) (string, error) {
-		wroteHosts = true
-		return "", nil
-	}
-
-	app := state.App{Name: "alpha", HostReach: []state.HostReach{{Name: "vm-sql-dev", Port: 1433}}}
-	sd := state.Siding{Name: "one", Container: "guest", LastIP: "192.168.64.8"}
-
-	err := applyHostReach(context.Background(), app, sd)
-	if err == nil {
-		t.Fatal("applyHostReach() = nil error, want the blocked hop reported")
-	}
-	if !strings.Contains(err.Error(), "firewall") {
-		t.Errorf("error = %v, want the firewall named as the cause", err)
-	}
-	if wroteHosts {
-		t.Error("wrote guest hosts entries for a relay the guest cannot reach")
-	}
-	// The listener is published before the probe can run, so a failure has to take
-	// it back down rather than leave it holding a bridge port for nothing. Publish
-	// deletes first as well, so what matters is that the last delete is the
-	// listener that was published, not how many deletes there were.
-	if len(*published) == 0 || len(*deleted) == 0 || (*deleted)[len(*deleted)-1] != (*published)[0] {
-		t.Errorf("published %v but the cleanup removed %v", *published, *deleted)
 	}
 }
