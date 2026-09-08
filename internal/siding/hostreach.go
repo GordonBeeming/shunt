@@ -165,10 +165,14 @@ func startHostReachProcess(ctx context.Context, app state.App, sd state.Siding, 
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
+		// The config holds the token and the addresses the guest is deliberately
+		// never told, so it does not outlive the process it was written for.
+		_ = os.Remove(configPath)
 		return fmt.Errorf("start the host-reach process: %w", err)
 	}
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
 		_ = cmd.Process.Kill()
+		_ = os.Remove(configPath)
 		return fmt.Errorf("record the host-reach pid: %w", err)
 	}
 	// Released rather than waited on: this process is meant to outlive the
@@ -187,7 +191,12 @@ func stopHostReachProcess(app state.App, sd state.Siding) {
 	}
 	if raw, err := os.ReadFile(pidPath); err == nil {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 0 {
-			_ = syscall.Kill(pid, syscall.SIGTERM)
+			// Negative pid signals the whole group. The process is started as its
+			// own group leader, so anything it goes on to spawn is included rather
+			// than left behind holding the token.
+			if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
+				_ = syscall.Kill(pid, syscall.SIGTERM)
+			}
 		}
 	}
 	_ = os.Remove(pidPath)

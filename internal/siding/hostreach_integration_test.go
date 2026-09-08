@@ -5,12 +5,15 @@ package siding
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gordonbeeming/shunt/internal/hostreach"
 	"github.com/gordonbeeming/shunt/internal/state"
 )
 
@@ -36,11 +39,11 @@ func TestHostReachCarriesTrafficEndToEnd(t *testing.T) {
 			if err != nil {
 				return
 			}
+			// A plain echo, so the guest end of the test can be the relay's own
+			// --check, which requires exactly what it sent back.
 			go func(conn net.Conn) {
 				defer conn.Close()
-				buf := make([]byte, 64)
-				n, _ := conn.Read(buf)
-				_, _ = conn.Write(append([]byte("HOST:"), buf[:n]...))
+				_, _ = io.Copy(conn, conn)
 			}(conn)
 		}
 	}()
@@ -63,12 +66,9 @@ func TestHostReachCarriesTrafficEndToEnd(t *testing.T) {
 	}
 	t.Cleanup(func() { removeHostReach(context.Background(), app, sd) })
 
-	out, err := guestConnect(t, container, "echo-endpoint.invalid", port, "ping")
-	if err != nil {
+	if out, err := guestConnect(t, container, "echo-endpoint.invalid", port); err != nil {
+		reportEnds(t, app, sd)
 		t.Fatalf("the guest could not reach the endpoint: %v (%s)", err, out)
-	}
-	if !strings.Contains(out, "HOST:ping") {
-		t.Errorf("guest got %q, want the host's answer", out)
 	}
 }
 
@@ -161,16 +161,15 @@ func guestAddress(t *testing.T, container string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-// guestConnect runs a connection from inside the guest to a declared name, which
-// is what an application in the siding does.
-func guestConnect(t *testing.T, container, name string, port int, payload string) (string, error) {
+// guestConnect opens a connection from inside the guest to a declared name and
+// requires a byte round trip, which is what an application in the siding does.
+//
+// It uses the relay's own --check rather than a scripting language. shunt
+// installs the relay deliberately; python3 is in the image only as something
+// another package happened to bring, and the Containerfile never asks for it.
+func guestConnect(t *testing.T, container, name string, port int) (string, error) {
 	t.Helper()
-	script := fmt.Sprintf(`python3 - <<'PY'
-import socket
-s = socket.socket(); s.settimeout(10)
-s.connect((%q, %d))
-s.sendall(%q.encode())
-print(s.recv(128).decode())
-PY`, name, port, payload)
-	return execGuest(context.Background(), container, "sh", "-c", script)
+	nonce := fmt.Sprintf("end-to-end-%d", time.Now().UnixNano())
+	target := fmt.Sprintf("%s:%d", name, port)
+	return execGuest(context.Background(), container, hostreach.RelayProgram, "--check", target, "--nonce", nonce)
 }
