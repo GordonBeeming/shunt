@@ -93,6 +93,7 @@ var (
 	upStartApp         = StartApp
 	upWaitReady        = WaitReady
 	upActivate         = Activate
+	upApplyHostReach   = applyHostReach
 	upGuestIP          = container.IP
 	upClearAppLog      = func(ctx context.Context, guest string) {
 		_, _ = container.Exec(ctx, guest, "sh", "-c", "> "+appLogPath)
@@ -374,6 +375,24 @@ func up(ctx context.Context, app state.App, sd state.Siding, bridge bool, progre
 		// like a slow build for as long as it did.
 		if err := upWaitReady(ctx, app, sd, 45*time.Second); err != nil {
 			fmt.Fprintf(progress, "  (still starting — `%s logs %s` shows how it's going)\n", config.Current().BinaryName, sd.Name)
+		}
+	}
+
+	// The relay is about the guest reaching out, and the front door is about the
+	// host reaching in. They are independent, so this runs before the bridge
+	// decision: an app started with --no-bridge still needs its dependencies.
+	// Hooking it into bridging is what made it silently never run.
+	if len(app.HostReach) > 0 {
+		// Only look the address up when something needs it, and report a failure
+		// rather than swallowing it: applyHostReach would otherwise refuse with
+		// "activate the siding first", which names the wrong cause entirely.
+		ip, err := upGuestIP(ctx, sd.Container)
+		if err != nil {
+			return sd, fmt.Errorf("resolve the guest address for host-reach: %w", err)
+		}
+		sd.LastIP = ip
+		if err := upApplyHostReach(ctx, app, sd); err != nil {
+			return sd, err
 		}
 	}
 
@@ -1099,11 +1118,6 @@ func Activate(ctx context.Context, app state.App, sd *state.Siding) error {
 			return err
 		}
 		sd.Bridges[r.Key] = r.ListenPort
-	}
-	// Relay the endpoints only the host can reach. This runs after the guest has
-	// an address, because both ends of the relay are derived from it.
-	if err := applyHostReach(ctx, app, *sd); err != nil {
-		return err
 	}
 	return nil
 }

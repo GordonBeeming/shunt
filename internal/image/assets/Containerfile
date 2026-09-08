@@ -146,10 +146,12 @@ EOF
 
 ARG SHUNT_BASE_CONTENT_VERSION
 COPY --from=shunt-tools /out/shunt-docker-api-admission /usr/local/bin/shunt-docker-api-admission
+COPY --from=shunt-tools /out/shunt-host-reach-relay /usr/local/bin/shunt-host-reach-relay
 COPY shunt-entrypoint.sh /usr/local/bin/shunt-entrypoint.sh
 RUN test -n "$SHUNT_BASE_CONTENT_VERSION" \
  && printf '%s\n' "$SHUNT_BASE_CONTENT_VERSION" > /usr/local/share/shunt-base-content-version \
  && chmod 0555 /usr/local/bin/shunt-docker-api-admission \
+ && chmod 0555 /usr/local/bin/shunt-host-reach-relay \
  && chmod +x /usr/local/bin/shunt-entrypoint.sh \
  && ln -s /usr/local/bin/shunt-entrypoint.sh /usr/local/bin/shunt-dockerd-offline
 
