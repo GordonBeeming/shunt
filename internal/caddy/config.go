@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/gordonbeeming/shunt/internal/config"
 	"github.com/gordonbeeming/shunt/internal/proc"
@@ -378,4 +381,50 @@ func lastIndexByte(s string, b byte) int {
 		}
 	}
 	return -1
+}
+
+// addressInUse reports the address a bind failure was for.
+//
+// Caddy answers a claim it cannot bind with "loading new config: layer4 app
+// module: start: listen tcp 127.0.0.1:2100: bind: address already in use". The
+// port is in there, and pulling it out is what lets the caller say what holds
+// it.
+func addressInUse(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	text := err.Error()
+	if !strings.Contains(text, "address already in use") {
+		return "", false
+	}
+	// The address sits between "listen tcp " and the colon before "bind".
+	start := strings.LastIndex(text, "listen tcp ")
+	if start < 0 {
+		return "", true
+	}
+	rest := text[start+len("listen tcp "):]
+	if end := strings.Index(rest, ":"); end >= 0 {
+		if stop := strings.Index(rest, " "); stop >= 0 {
+			return strings.TrimSuffix(rest[:stop], ":"), true
+		}
+	}
+	return "", true
+}
+
+// PortInUse reports the port a bind failure was for, and whether the failure was
+// a bind conflict at all.
+func PortInUse(err error) (int, bool) {
+	address, conflict := addressInUse(err)
+	if !conflict {
+		return 0, false
+	}
+	_, portText, splitErr := net.SplitHostPort(address)
+	if splitErr != nil {
+		return 0, true
+	}
+	port, convErr := strconv.Atoi(portText)
+	if convErr != nil {
+		return 0, true
+	}
+	return port, true
 }

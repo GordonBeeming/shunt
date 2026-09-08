@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -245,5 +246,26 @@ func TestBootstrapHasApps(t *testing.T) {
 	}
 	if doc.Apps.HTTP == nil || doc.Apps.Layer4 == nil {
 		t.Error("bootstrap must define both http and layer4 apps")
+	}
+}
+
+func TestPortInUseReadsCaddysBindFailure(t *testing.T) {
+	// The exact text Caddy answers a claim it cannot bind with.
+	err := errors.New("loading new config: layer4 app module: start: listen tcp 127.0.0.1:2100: bind: address already in use")
+	port, conflict := PortInUse(err)
+	if !conflict {
+		t.Fatal("PortInUse() did not recognise a bind conflict")
+	}
+	if port != 2100 {
+		t.Errorf("port = %d, want 2100", port)
+	}
+}
+
+func TestPortInUseLeavesOtherFailuresAlone(t *testing.T) {
+	if _, conflict := PortInUse(errors.New("connection refused")); conflict {
+		t.Error("PortInUse() treated an unrelated failure as a bind conflict")
+	}
+	if _, conflict := PortInUse(nil); conflict {
+		t.Error("PortInUse() treated no error as a bind conflict")
 	}
 }
