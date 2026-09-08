@@ -23,6 +23,11 @@ RUN go mod download
 COPY docker-api-admission.go docker-build-admission.go ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/shunt-docker-api-admission .
 
+# The host-reach relay is a separate program: it has its own main and runs for
+# the guest's whole life, unlike the admission gate which fronts a socket.
+COPY hostreach/relay.go ./hostreach/
+RUN cd hostreach && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/shunt-host-reach-relay .
+
 FROM mcr.microsoft.com/dotnet/sdk:10.0
 
 # Docker engine (dockerd + CLI + containerd) via Docker's official install

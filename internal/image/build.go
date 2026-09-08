@@ -18,7 +18,7 @@ import (
 	"github.com/gordonbeeming/shunt/internal/proc"
 )
 
-//go:embed assets/Containerfile assets/shunt-entrypoint.sh assets/docker-api-admission.go assets/docker-build-admission.go assets/docker-api-admission.mod assets/docker-api-admission.sum
+//go:embed assets/Containerfile assets/shunt-entrypoint.sh assets/docker-api-admission.go assets/docker-build-admission.go assets/docker-api-admission.mod assets/docker-api-admission.sum assets/hostreach/relay.go
 var assets embed.FS
 
 // assetFiles are written verbatim into the temp build context.
@@ -27,6 +27,7 @@ var assetFiles = []string{
 	"shunt-entrypoint.sh",
 	"docker-api-admission.go",
 	"docker-build-admission.go",
+	"hostreach/relay.go",
 	"docker-api-admission.mod",
 	"docker-api-admission.sum",
 }
@@ -95,7 +96,13 @@ func EnsureBuilt(ctx context.Context, force bool) error {
 		if err != nil {
 			return fmt.Errorf("read embedded %s: %w", name, err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+		target := filepath.Join(dir, name)
+		// An asset may sit in a subdirectory (a second program needs its own
+		// package), so create the parent rather than assuming a flat context.
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return fmt.Errorf("create build context dir for %s: %w", name, err)
+		}
+		if err := os.WriteFile(target, data, 0o644); err != nil {
 			return fmt.Errorf("write %s to build context: %w", name, err)
 		}
 	}

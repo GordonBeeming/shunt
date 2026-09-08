@@ -42,6 +42,10 @@ func Stop(ctx context.Context, app state.App, name string) (StopResult, error) {
 		if err := RequireGuest(sd); err != nil {
 			return err
 		}
+		// Drop the bridge listeners before the guest goes. One left behind would
+		// hold a path to a private endpoint open on the bridge with nothing using
+		// it, which is the part of this feature worth being tidy about.
+		removeHostReach(ctx, current, sd)
 		result.WasLive = current.LiveSiding == name
 		result.Forced, err = stopOrForce(ctx, sd.Container)
 		if err != nil {

@@ -151,6 +151,9 @@ type App struct {
 	DataVolumes []DataVolume      `json:"dataVolumes"`
 	Env         map[string]string `json:"env"`    // extra guest env (Aspire parameters, secrets)
 	Mounts      []MountSpec       `json:"mounts"` // explicit extra host->guest mounts
+	// HostReach names endpoints only the host can reach, such as a private
+	// address behind a VPN. shunt relays each into the guest on every start.
+	HostReach []HostReach `json:"hostReach,omitempty"`
 	// Registry dependency images kept in shunt's daemon-free host cache and
 	// loaded into sidings so guests never pull from the network (see `shunt warm`).
 	PrebakeImages []string `json:"prebakeImages,omitempty"`
@@ -183,6 +186,22 @@ type App struct {
 	// existed, which reads back as false: a front door that was never released.
 	FrontDoorReleased bool              `json:"frontDoorReleased,omitempty"`
 	Removal           *RemovalOperation `json:"removal,omitempty"`
+}
+
+// HostReach declares a name the app resolves that only the host can reach —
+// typically a private endpoint behind a VPN. shunt relays it: the guest gets a
+// hosts entry and a local listener, and the host end dials the real address over
+// whatever interface holds its route.
+//
+// Address is deliberately optional and normally empty. These addresses come from
+// private DNS and move when an endpoint is recreated, so a committed one is a
+// second copy of a snapshot with nothing to refresh it. Resolving on the host at
+// guest start inherits whatever the host currently believes instead. Set Address
+// only for a name the host has no record for at all.
+type HostReach struct {
+	Name    string `json:"name"`
+	Port    int    `json:"port"`
+	Address string `json:"address,omitempty"`
 }
 
 // PrebakeBuild declares one local image build that feeds shunt's shared,

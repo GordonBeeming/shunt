@@ -114,6 +114,39 @@ func Bootstrap() ([]byte, error) {
 // goes live. The handler carries the route's @id for live PATCHing.
 //
 // Returns the admin config path to PUT it at and the JSON body.
+// HostReachServerName names the bridge listener for one relayed endpoint. It is
+// namespaced away from front-door servers so a teardown can find exactly the
+// listeners a siding created and leave the rest alone.
+func HostReachServerName(app, siding, name string, port int) string {
+	return fmt.Sprintf("reach_%s_%s_%s_%d", app, siding, name, port)
+}
+
+// ServerForHostReach builds the host end of a relay: a raw TCP listener on the
+// container bridge that dials an address only the host can reach.
+//
+// It binds the bridge address specifically rather than 0.0.0.0. The bridge is a
+// host-only network, so the reachable set is other guests on it; binding
+// everywhere would put a route to a private VPN endpoint on every interface this
+// machine has, which is a different and much larger thing.
+//
+// Unlike a front-door route the upstream is known up front, so there is no
+// placeholder dial to repoint later: the address was resolved on the host
+// moments before this was built.
+func ServerForHostReach(name, bridgeAddress string, bridgePort int, upstream string) (path string, body []byte, err error) {
+	if bridgeAddress == "" || bridgeAddress == "0.0.0.0" {
+		return "", nil, fmt.Errorf("host-reach listener needs a specific bridge address, got %q", bridgeAddress)
+	}
+	server := map[string]any{
+		"listen": []string{fmt.Sprintf("%s:%d", bridgeAddress, bridgePort)},
+		"routes": []any{map[string]any{"handle": []any{map[string]any{
+			"handler":   "proxy",
+			"upstreams": []any{map[string]any{"dial": []string{upstream}}},
+		}}}},
+	}
+	body, err = json.Marshal(server)
+	return "/config/apps/layer4/servers/" + name, body, err
+}
+
 func ServerForRoute(app string, r state.Route, disableCache bool) (path string, body []byte, err error) {
 	handler := map[string]any{"@id": r.CaddyID}
 	server := map[string]any{

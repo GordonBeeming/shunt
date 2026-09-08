@@ -171,6 +171,7 @@ func newAppAddCmd() *cobra.Command {
 					ConfigDir:       loc.ConfigDir,
 					Env:             ct.Env,
 					Mounts:          ct.Mounts,
+					HostReach:       ct.HostReach,
 					PrebakeImages:   ct.PrebakeImages,
 					PrebakeBuilds:   ct.PrebakeBuilds,
 					Volumes:         ct.Volumes,
