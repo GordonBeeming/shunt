@@ -15,6 +15,8 @@
   <img alt="license FSL-1.1-MIT" src="https://img.shields.io/badge/license-FSL--1.1--MIT-30363d">
 </p>
 
+> **Archived.** This was an experiment, and it worked. It also needs more plumbing than the problem deserves, so I'm going after the same goal a simpler way. Nothing here is being developed further, though I learnt a lot building it.
+
 ---
 
 Each experiment is a **siding**: first a small Git worktree, then—only when you ask—its own data, output directory, Apple `container` guest, Docker daemon, and application. A stable Caddy front door switches fixed local ports between running sidings without rebuilding them. There is no executable “host” target; application work happens in sidings.
@@ -29,6 +31,8 @@ brew install gordonbeeming/tap/shunt-nightly
 ```
 
 Later, upgrade with `brew update && brew upgrade gordonbeeming/tap/shunt-nightly`.
+
+The published formula pours a signed arm64 Tahoe bottle, so installing or upgrading it does not need local Xcode or Command Line Tools.
 
 The first `init` needs the .NET SDK and `xcaddy`. Homebrew's `go@1.25` formula is keg-only, so select its binary and put both it and the selected xcaddy bin directory on your `PATH` before running `init`:
 
