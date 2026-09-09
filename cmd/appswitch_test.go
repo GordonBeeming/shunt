@@ -469,3 +469,72 @@ func TestAppSwitchClaimFailsFastWhenCaddyIsUnreachable(t *testing.T) {
 		t.Fatalf("err = %v, want %v", err, sentinel)
 	}
 }
+
+func TestAppSwitchReleaseSaysWhatThePortsReachUntilReclaimed(t *testing.T) {
+	// A released front door is a state with an expiry, and the same connection
+	// string reaches a host process before a reclaim and a guest after it. Saying
+	// nothing is what lets one command be run twice against two different things.
+	appSwitchStateFixture(t)
+	restore := stubAppSwitchDependencies(t)
+	defer restore()
+
+	app := state.App{
+		Version:   state.StateVersion,
+		Name:      "Alpha",
+		ConfigDir: t.TempDir(),
+		FrontDoor: []state.Route{
+			{Key: "db", Kind: state.KindLayer4, ListenPort: 2100, CaddyID: "app_Alpha_layer4_db"},
+		},
+	}
+	registerApp(t, app)
+	appSwitchRemoveFrontDoor = func(context.Context, *caddy.Admin, state.App) error { return nil }
+
+	cmd := newAppSwitchCmd()
+	cmd.SetArgs([]string{"Alpha", "--release"})
+	out, err := captureStdout(t, func() error { return cmd.ExecuteContext(context.Background()) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "runs on the host") {
+		t.Errorf("release output does not say what the ports reach now:\n%s", out)
+	}
+	if !strings.Contains(out, ":2100") {
+		t.Errorf("release output does not name the port:\n%s", out)
+	}
+	if !strings.Contains(out, "reclaim with") {
+		t.Errorf("release output does not say how to undo it:\n%s", out)
+	}
+}
+
+func TestAppSwitchClaimSaysWhichSidingThePortsNowReach(t *testing.T) {
+	// The other half of the release message. Without it, a port that reached a
+	// process on the host a moment ago reaches a guest with nothing on screen to
+	// mark the change, and the same command run twice hits two different things.
+	appSwitchStateFixture(t)
+	restore := stubAppSwitchDependencies(t)
+	defer restore()
+
+	app := state.App{
+		Version:    state.StateVersion,
+		Name:       "Alpha",
+		ConfigDir:  t.TempDir(),
+		FrontDoor:  []state.Route{{Key: "db", Kind: state.KindLayer4, ListenPort: 2100, CaddyID: "app_Alpha_layer4_db"}},
+		LiveSiding: "one",
+		Sidings:    map[string]state.Siding{"one": {Name: "one"}},
+	}
+	registerApp(t, app)
+	appSwitchSwitchTo = func(context.Context, *state.App, string) error { return nil }
+
+	cmd := newAppSwitchCmd()
+	cmd.SetArgs([]string{"Alpha"})
+	out, err := captureStdout(t, func() error { return cmd.ExecuteContext(context.Background()) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "siding one") {
+		t.Errorf("claim output does not name the siding the ports now reach:\n%s", out)
+	}
+	if !strings.Contains(out, ":2100") {
+		t.Errorf("claim output does not name the port:\n%s", out)
+	}
+}
