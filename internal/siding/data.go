@@ -23,6 +23,8 @@ var (
 	dataGuestState      = container.State
 	dataEnsureGuestLive = EnsureGuestLive
 	dataStopGuest       = container.Stop
+	dataActivate        = Activate
+	dataPointCaddy      = PointCaddy
 )
 
 // DataPromotionLifecycle adapts guest and runner operations to the data
@@ -188,7 +190,7 @@ func (l *DataPromotionLifecycle) Restore(ctx context.Context) (databaseline.Rest
 	}
 	if l.wasBridged || l.wasLive {
 		fmt.Fprintln(l.progress, "• restoring host bridges…")
-		if err := Activate(restoreCtx, l.app, &l.sd); err != nil {
+		if err := dataActivate(restoreCtx, l.app, &l.sd); err != nil {
 			restoreErrs = append(restoreErrs, fmt.Errorf("restore bridges: %w", err))
 		} else {
 			details = append(details, "restored host bridges")
@@ -196,7 +198,7 @@ func (l *DataPromotionLifecycle) Restore(ctx context.Context) (databaseline.Rest
 	}
 	if l.hadFrontDoor {
 		fmt.Fprintln(l.progress, "• restoring the live front door…")
-		if err := PointCaddy(restoreCtx, l.app, &l.sd); err != nil {
+		if err := dataPointCaddy(restoreCtx, l.app, &l.sd); err != nil {
 			restoreErrs = append(restoreErrs, fmt.Errorf("restore live route: %w", err))
 		} else {
 			details = append(details, "restored live front door")

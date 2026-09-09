@@ -92,27 +92,52 @@ func TestPromotionSkipsTheFrontDoorItReleasedButKeepsBridges(t *testing.T) {
 	//
 	// The baseline was already committed by that point, so the promotion had
 	// worked and only the report said otherwise.
+	//
+	// This drives Restore rather than reading the computed flags. Asserting the
+	// flags would pass just as well with the front door gated on wasLive again,
+	// which is the bug.
+	activated, pointed := restoreCallRecorder(t)
+
 	app := state.App{LiveSiding: "alpha", FrontDoorReleased: true}
 	sd := state.Siding{Name: "alpha", Bridges: map[string]int{"web": 5000}}
 	l := NewDataPromotionLifecycle(app, sd, io.Discard)
+	if _, err := l.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore() = %v", err)
+	}
 
-	if l.hadFrontDoor {
-		t.Error("promotion would restore a front door that was released")
+	if *pointed {
+		t.Error("promotion repointed a front door that was released")
 	}
 	// Bridges are a separate concern and still have to come back, which is why
 	// this is not one condition.
-	if !l.wasLive || !l.wasBridged {
-		t.Errorf("live and bridged state lost: wasLive=%v wasBridged=%v", l.wasLive, l.wasBridged)
+	if !*activated {
+		t.Error("promotion skipped the host bridges as well")
 	}
 }
 
 func TestPromotionRestoresTheFrontDoorWhenItWasNotReleased(t *testing.T) {
+	_, pointed := restoreCallRecorder(t)
 	l := NewDataPromotionLifecycle(
 		state.App{LiveSiding: "alpha"},
 		state.Siding{Name: "alpha"},
 		io.Discard,
 	)
-	if !l.hadFrontDoor {
-		t.Error("promotion would leave a live front door unrestored")
+	if _, err := l.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore() = %v", err)
 	}
+	if !*pointed {
+		t.Error("promotion left a live front door unrestored")
+	}
+}
+
+// restoreCallRecorder stubs the two restore steps whose conditions this file is
+// about, and reports whether each ran.
+func restoreCallRecorder(t *testing.T) (activated, pointed *bool) {
+	t.Helper()
+	origActivate, origPoint := dataActivate, dataPointCaddy
+	t.Cleanup(func() { dataActivate, dataPointCaddy = origActivate, origPoint })
+	a, p := false, false
+	dataActivate = func(context.Context, state.App, *state.Siding) error { a = true; return nil }
+	dataPointCaddy = func(context.Context, state.App, *state.Siding) error { p = true; return nil }
+	return &a, &p
 }
