@@ -28,11 +28,16 @@ var (
 // DataPromotionLifecycle adapts guest and runner operations to the data
 // generation manager without putting runtime policy in the command package.
 type DataPromotionLifecycle struct {
-	app                   state.App
-	sd                    state.Siding
-	progress              io.Writer
-	wasRunning            bool
-	wasLive               bool
+	app        state.App
+	sd         state.Siding
+	progress   io.Writer
+	wasRunning bool
+	wasLive    bool
+	// hadFrontDoor is separate from wasLive because a live siding can have no
+	// front door to restore: `app switch --release` removes the app's Caddy
+	// servers and leaves the siding live and bridged. Bridges still have to come
+	// back, so the two cannot share one condition.
+	hadFrontDoor          bool
 	wasGuestStopped       bool
 	wasBridged            bool
 	captureStartAttempted bool
@@ -44,11 +49,12 @@ func NewDataPromotionLifecycle(app state.App, sd state.Siding, progress io.Write
 		progress = io.Discard
 	}
 	return &DataPromotionLifecycle{
-		app:        app,
-		sd:         sd,
-		progress:   progress,
-		wasLive:    app.LiveSiding == sd.Name,
-		wasBridged: len(sd.Bridges) > 0,
+		app:          app,
+		sd:           sd,
+		progress:     progress,
+		wasLive:      app.LiveSiding == sd.Name,
+		hadFrontDoor: app.LiveSiding == sd.Name && !app.FrontDoorReleased,
+		wasBridged:   len(sd.Bridges) > 0,
 	}
 }
 
@@ -188,7 +194,7 @@ func (l *DataPromotionLifecycle) Restore(ctx context.Context) (databaseline.Rest
 			details = append(details, "restored host bridges")
 		}
 	}
-	if l.wasLive {
+	if l.hadFrontDoor {
 		fmt.Fprintln(l.progress, "• restoring the live front door…")
 		if err := PointCaddy(restoreCtx, l.app, &l.sd); err != nil {
 			restoreErrs = append(restoreErrs, fmt.Errorf("restore live route: %w", err))

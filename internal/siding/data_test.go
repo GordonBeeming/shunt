@@ -82,3 +82,37 @@ func TestFailedCaptureStartupRestoresOriginallyStoppedGuest(t *testing.T) {
 		t.Fatalf("Restore() result=%#v error=%v stopped=%v siding=%#v", result, err, stopped, lifecycle.Siding())
 	}
 }
+
+func TestPromotionSkipsTheFrontDoorItReleasedButKeepsBridges(t *testing.T) {
+	// `app switch --release` removes an app's Caddy servers and leaves its siding
+	// live and bridged. Promoting then ended in a restore failure against routes
+	// that had been deliberately removed:
+	//
+	//   restore live route: repoint route "aspire-dashboard": unknown object ID
+	//
+	// The baseline was already committed by that point, so the promotion had
+	// worked and only the report said otherwise.
+	app := state.App{LiveSiding: "alpha", FrontDoorReleased: true}
+	sd := state.Siding{Name: "alpha", Bridges: map[string]int{"web": 5000}}
+	l := NewDataPromotionLifecycle(app, sd, io.Discard)
+
+	if l.hadFrontDoor {
+		t.Error("promotion would restore a front door that was released")
+	}
+	// Bridges are a separate concern and still have to come back, which is why
+	// this is not one condition.
+	if !l.wasLive || !l.wasBridged {
+		t.Errorf("live and bridged state lost: wasLive=%v wasBridged=%v", l.wasLive, l.wasBridged)
+	}
+}
+
+func TestPromotionRestoresTheFrontDoorWhenItWasNotReleased(t *testing.T) {
+	l := NewDataPromotionLifecycle(
+		state.App{LiveSiding: "alpha"},
+		state.Siding{Name: "alpha"},
+		io.Discard,
+	)
+	if !l.hadFrontDoor {
+		t.Error("promotion would leave a live front door unrestored")
+	}
+}
